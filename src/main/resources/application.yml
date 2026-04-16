@@ -1,0 +1,18 @@
+server:
+  port: 9091
+  address: 0.0.0.0
+  tomcat:
+    accesslog:
+      enabled: true
+      pattern: "%{X-Forwarded-For}i %l %u %t \"%r\" %s %b %D"
+      directory: logs/access
+      prefix: access_log
+      suffix: .log
+      file-date-format: .yyyy-MM-dd
+
+logging:
+  level:
+    org.springframework.web: DEBUG
+    org.springframework.security.web: DEBUG
+    org.springframework.web.filter.RequestLoggingFilter: DEBUG
+    org.springframework.boot.web.servlet.context: DEBUG
