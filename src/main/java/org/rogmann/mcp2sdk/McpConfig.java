@@ -72,6 +72,7 @@ public class McpConfig {
     // Helper method for tool registration (avoids code duplication)
     private void registerTools(McpSyncServer server) {
         server.addTool(CreateNewFileTool.createSpecification());
+        server.addTool(EditFileTool.createSpecification());
         server.addTool(FindFilesByGlobTool.createSpecification());
         server.addTool(ReadTextFileTool.createSpecification());
 
