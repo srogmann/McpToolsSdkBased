@@ -76,10 +76,10 @@ public class McpConfig {
         server.addTool(FindFilesByGlobTool.createSpecification());
         server.addTool(ReadTextFileTool.createSpecification());
 
-        server.addTool(GlossaryTool.createSpecification());
+        //server.addTool(GlossaryTool.createSpecification());
 
-        server.addTool(VideoPlayerTool.createSpecification());
-        server.addTool(VideoSearchTool.createSpecification());
+        //server.addTool(VideoPlayerTool.createSpecification());
+        //server.addTool(VideoSearchTool.createSpecification());
     }
 
     // Streamable HTTP Server instance

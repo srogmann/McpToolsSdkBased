@@ -1,5 +1,6 @@
 # IntelliJ
 .idea/
+.run/
 
 # Maven
 target/

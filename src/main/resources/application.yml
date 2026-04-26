@@ -16,3 +16,16 @@ logging:
     org.springframework.security.web: DEBUG
     org.springframework.web.filter.RequestLoggingFilter: DEBUG
     org.springframework.boot.web.servlet.context: DEBUG
+    org.rogmann.mcp2sdk.chat: DEBUG
+
+# Web-UI Konfiguration
+webui:
+  public:
+    #path: ...
+  model:
+    #name: Qwen3.6-27B
+    #url: http://...
+  hasVision: false
+  hasAudio: false
+  max:
+    #tokens: 240000
