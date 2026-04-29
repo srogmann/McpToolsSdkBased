@@ -26,7 +26,7 @@ import java.util.Optional;
  * MCP tool implementation for reading text from a file in a project.
  * Refactored to use ToolRegistry pattern with ToolState for statistics.
  * The tool ensures that only allowed projects and safe paths are accessed.
- * It supports limiting the number of lines read from the file.
+ * It supports reading specific line ranges from the file (start_line, end_line).
  */
 public class ReadTextFileTool {
 
@@ -59,10 +59,15 @@ public class ReadTextFileTool {
         pathInProjectProp.put("description", "Path of the file relative to the project directory");
         properties.put("pathInProject", pathInProjectProp);
 
-        Map<String, Object> maxLinesCountProp = new HashMap<>();
-        maxLinesCountProp.put("type", "integer");
-        maxLinesCountProp.put("description", "Optional maximum number of lines to read from the file");
-        properties.put("maxLinesCount", maxLinesCountProp);
+        Map<String, Object> startLineProp = new HashMap<>();
+        startLineProp.put("type", "integer");
+        startLineProp.put("description", "Start line (default is 1)");
+        properties.put("start_line", startLineProp);
+
+        Map<String, Object> endLineProp = new HashMap<>();
+        endLineProp.put("type", "integer");
+        endLineProp.put("description", "1-based end line (default is start_line + 999)");
+        properties.put("end_line", endLineProp);
 
         List<String> requiredFields = List.of("projectName", "pathInProject");
 
@@ -99,7 +104,8 @@ public class ReadTextFileTool {
 
         String projectName = (String) arguments.get("projectName");
         String pathInProject = (String) arguments.get("pathInProject");
-        Integer maxLinesCount = (Integer) arguments.get("maxLinesCount");
+        Integer startLine = (Integer) arguments.get("start_line");
+        Integer endLine = (Integer) arguments.get("end_line");
 
         // Use a temporary map to capture potential error from WorkProject.lookupProject
         Map<String, Object> tempResult = new HashMap<>();
@@ -144,21 +150,33 @@ public class ReadTextFileTool {
                     .build();
         }
 
-        try (BufferedReader reader = Files.newBufferedReader(targetFile, StandardCharsets.UTF_8)) {
+       try (BufferedReader reader = Files.newBufferedReader(targetFile, StandardCharsets.UTF_8)) {
             StringBuilder content = new StringBuilder();
-            int linesRead = 0;
-            int maxLines = Optional.ofNullable(maxLinesCount).orElse(Integer.MAX_VALUE);
+            int start = Optional.ofNullable(startLine).orElse(1);
+            int end = Optional.ofNullable(endLine).orElse(start + 999);
 
-            while (true) {
-                String line = reader.readLine();
-                if (line == null || linesRead >= maxLines) {
+            if (start < 1) {
+                start = 1;
+            }
+            if (end < start) {
+                end = start + 999;
+            }
+
+            int linesRead = 0;
+            int currentLine = 0;
+            String line;
+            while ((line = reader.readLine()) != null) {
+                currentLine++;
+                if (currentLine >= start && currentLine <= end) {
+                    if (linesRead > 0) {
+                        content.append("\n");
+                    }
+                    content.append(line);
+                    linesRead++;
+                }
+                if (currentLine >= end) {
                     break;
                 }
-                if (linesRead > 0) {
-                    content.append("\n");
-                }
-                content.append(line);
-                linesRead++;
             }
 
             // Increment success counter
@@ -166,12 +184,21 @@ public class ReadTextFileTool {
 
             LOGGER.debug("Successfully read " + linesRead + " lines from file: " + targetFile);
 
-            // Prepare structured content for programmatic access if needed
+           // Prepare structured content for programmatic access if needed
             Map<String, Object> structuredContent = new HashMap<>();
             structuredContent.put("status", "success");
             structuredContent.put("text", content.toString());
             structuredContent.put("linesRead", linesRead);
+            structuredContent.put("startLine", start);
+            structuredContent.put("endLine", Math.min(end, currentLine));
             structuredContent.put("message", "Successfully read from file: " + projectBaseDir.relativize(targetFile));
+
+            if (currentLine > end) {
+                structuredContent.put("truncated", true);
+                structuredContent.put("nextStartLine", end + 1);
+            } else {
+                structuredContent.put("truncated", false);
+            }
 
             return CallToolResult.builder()
                     .isError(false)
