@@ -9,6 +9,7 @@ import io.modelcontextprotocol.server.transport.HttpServletSseServerTransportPro
 import io.modelcontextprotocol.spec.McpSchema;
 
 import org.rogmann.mcp2sdk.examples.*;
+import org.rogmann.mcp2sdk.examples.ReadDependencyClassSourceTool;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.web.servlet.ServletRegistrationBean;
@@ -82,6 +83,8 @@ public class McpConfig {
         registry.registerToolDefinition(ReadTextFileTool.createToolInstance());
         registry.registerToolDefinition(EditFileTool.createToolInstance());
         registry.registerToolDefinition(FindFilesByGlobTool.createToolInstance());
+
+        registry.registerToolDefinition(ReadDependencyClassSourceTool.createToolInstance());
 
         registry.registerToolDefinition(GlossaryTool.createToolInstance());
 
