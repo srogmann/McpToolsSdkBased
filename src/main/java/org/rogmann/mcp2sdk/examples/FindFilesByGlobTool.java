@@ -218,9 +218,20 @@ public class FindFilesByGlobTool {
             structuredContent.put("fileCount", matchingFiles.size());
             structuredContent.put("message", "Found " + matchingFiles.size() + " file(s) matching pattern");
 
+            StringBuilder textContentBuilder = new StringBuilder();
+            textContentBuilder.append("Found ").append(matchingFiles.size()).append(" file(s) matching pattern '").append(globPattern).append("':\n");
+            for (Map<String, Object> fileInfo : matchingFiles) {
+                textContentBuilder.append("  - ").append(fileInfo.get("path"));
+                Long size = (Long) fileInfo.get("size");
+                if (size != null && size >= 0) {
+                    textContentBuilder.append(" (").append(size).append(" bytes)");
+                }
+                textContentBuilder.append("\n");
+            }
+
             return CallToolResult.builder()
                 .isError(false)
-                .addTextContent("Found " + matchingFiles.size() + " file(s) matching pattern '" + globPattern + "'")
+                .addTextContent(textContentBuilder.toString())
                 .structuredContent(structuredContent)
                 .build();
 
