@@ -6,7 +6,11 @@ import io.modelcontextprotocol.spec.McpSchema;
 import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
 import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
 import io.modelcontextprotocol.spec.McpSchema.JsonSchema;
+import org.rogmann.mcp2sdk.ToolSpecWithState;
+import org.rogmann.mcp2sdk.ToolState;
 import org.rogmann.mcp2sdk.WorkProject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -15,31 +19,29 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-import java.util.function.BiFunction;
 
 /**
  * MCP tool implementation for editing a file in a project using search-replace.
- * Refactored to use McpServerFeatures.SyncToolSpecification.
  * The tool ensures that only allowed projects and safe paths are handled.
  * It supports replacing all occurrences or just the first occurrence.
  */
 public class EditFileTool {
 
-    private static final Logger LOGGER = Logger.getLogger(EditFileTool.class.getName());
-
+    private static final Logger LOGGER = LoggerFactory.getLogger(EditFileTool.class);
     private static final String NAME = "edit_file";
 
+    /** tool state (active-flag, statistics) */
+    private final ToolState state;
+
     private EditFileTool() {
-        // Prevent instantiation, this class serves as a factory for the tool specification
+        state = new ToolState();
     }
 
     /**
      * Creates the synchronous tool specification for editing file content.
-     * @return a SyncToolSpecification ready to be registered with an MCP server
+     * @return the tool specification and its state
      */
-    public static McpServerFeatures.SyncToolSpecification createSpecification() {
+    public static ToolSpecWithState createToolInstance() {
         // Define Input Schema properties
         Map<String, Object> properties = new HashMap<>();
 
@@ -79,147 +81,155 @@ public class EditFileTool {
             .inputSchema(inputSchema)
             .build();
 
-        BiFunction<McpSyncServerExchange, CallToolRequest, CallToolResult> handler = (exchange, request) -> {
-            Map<String, Object> arguments = request.arguments();
+        EditFileTool toolImpl = new EditFileTool();
 
-            String projectName = (String) arguments.get("projectName");
-            String pathInProject = (String) arguments.get("pathInProject");
-            String oldString = (String) arguments.get("oldString");
-            String newString = (String) arguments.get("newString");
-            Boolean replaceAll = Optional.ofNullable((Boolean) arguments.get("replaceAll")).orElse(false);
+        return new ToolSpecWithState(McpServerFeatures.SyncToolSpecification.builder()
+                    .tool(tool)
+                    .callHandler(toolImpl::call)
+                    .build(),
+                toolImpl.state);
+    }
 
-            Map<String, Object> result = new HashMap<>();
+    McpSchema.CallToolResult call(McpSyncServerExchange exchange, CallToolRequest request) {
+        // Increment call count
+        state.callCount().incrementAndGet();
 
-            // Validate oldString is not empty to prevent infinite loops or unintended behavior
-            if (oldString == null || oldString.isEmpty()) {
-                LOGGER.warning("EditFileTool called with empty oldString");
-                return CallToolResult.builder()
+        Map<String, Object> arguments = request.arguments();
+
+        String projectName = (String) arguments.get("projectName");
+        String pathInProject = (String) arguments.get("pathInProject");
+        String oldString = (String) arguments.get("oldString");
+        String newString = (String) arguments.get("newString");
+        Boolean replaceAll = Optional.ofNullable((Boolean) arguments.get("replaceAll")).orElse(false);
+
+        Map<String, Object> result = new HashMap<>();
+
+        // Validate oldString is not empty to prevent infinite loops or unintended behavior
+        if (oldString == null || oldString.isEmpty()) {
+            LOGGER.warn("EditFileTool called with empty oldString");
+            return CallToolResult.builder()
                     .isError(true)
                     .addTextContent("oldString cannot be empty")
                     .build();
-            }
+        }
 
-            // Use a temporary map to capture potential error from WorkProject.lookupProject
-            Map<String, Object> tempResult = new HashMap<>();
-            WorkProject workProject = WorkProject.lookupProject(projectName, tempResult);
-            
-            if (workProject == null) {
-                String error = (String) tempResult.get("error");
-                return CallToolResult.builder()
+        // Use a temporary map to capture potential error from WorkProject.lookupProject
+        Map<String, Object> tempResult = new HashMap<>();
+        WorkProject workProject = WorkProject.lookupProject(projectName, tempResult);
+
+        if (workProject == null) {
+            String error = (String) tempResult.get("error");
+            return CallToolResult.builder()
                     .isError(true)
                     .addTextContent(error != null ? error : "Project not found: " + projectName)
                     .build();
-            }
+        }
 
-            Path projectDir = workProject.projectDir();
+        Path projectDir = workProject.projectDir();
 
-            Path targetFile = projectDir.resolve(pathInProject).normalize();
-            if (!targetFile.startsWith(projectDir)) {
-                String errorMsg = "Path traversal detected in pathInProject: " + pathInProject;
-                LOGGER.warning("Path traversal attempt detected: " + pathInProject);
-                return CallToolResult.builder()
+        Path targetFile = projectDir.resolve(pathInProject).normalize();
+        if (!targetFile.startsWith(projectDir)) {
+            String errorMsg = "Path traversal detected in pathInProject: " + pathInProject;
+            LOGGER.warn("Path traversal attempt detected: " + pathInProject);
+            return CallToolResult.builder()
                     .isError(true)
                     .addTextContent(errorMsg)
                     .build();
-            }
+        }
 
-            if (!Files.exists(targetFile)) {
-                String errorMsg = "File does not exist in project " + projectName + ": " + projectDir.relativize(targetFile);
-                LOGGER.info("File not found for editing: " + targetFile);
-                return CallToolResult.builder()
+        if (!Files.exists(targetFile)) {
+            String errorMsg = "File does not exist in project " + projectName + ": " + projectDir.relativize(targetFile);
+            LOGGER.info("File not found for editing: " + targetFile);
+            return CallToolResult.builder()
                     .isError(true)
                     .addTextContent(errorMsg)
                     .build();
-            }
+        }
 
-            if (Files.isDirectory(targetFile)) {
-                String errorMsg = "Path refers to a directory, not a file: " + projectDir.relativize(targetFile);
-                LOGGER.info("Cannot edit directory: " + targetFile);
-                return CallToolResult.builder()
+        if (Files.isDirectory(targetFile)) {
+            String errorMsg = "Path refers to a directory, not a file: " + projectDir.relativize(targetFile);
+            LOGGER.info("Cannot edit directory: " + targetFile);
+            return CallToolResult.builder()
                     .isError(true)
                     .addTextContent(errorMsg)
                     .build();
-            }
+        }
 
-            try {
-                String content = Files.readString(targetFile);
-                String newContent;
-                int replacements = 0;
+        try {
+            String content = Files.readString(targetFile);
+            String newContent;
+            int replacements = 0;
 
-                if (replaceAll) {
-                    // Count occurrences
-                    int index = 0;
-                    while ((index = content.indexOf(oldString, index)) != -1) {
-                        replacements++;
-                        index += oldString.length();
-                    }
-                    
-                    if (replacements > 0) {
-                        newContent = content.replace(oldString, newString);
-                    } else {
-                        newContent = content;
-                    }
-                } else {
-                    // Replace first occurrence only
-                    int index = content.indexOf(oldString);
-                    if (index != -1) {
-                        replacements = 1;
-                        newContent = content.substring(0, index) + newString + content.substring(index + oldString.length());
-                    } else {
-                        newContent = content;
-                    }
+            if (replaceAll) {
+                // Count occurrences
+                int index = 0;
+                while ((index = content.indexOf(oldString, index)) != -1) {
+                    replacements++;
+                    index += oldString.length();
                 }
 
                 if (replacements > 0) {
-                    Files.writeString(targetFile, newContent);
-                    String successMsg = "Successfully replaced " + replacements + " occurrence(s) in file: " + projectDir.relativize(targetFile);
-                    LOGGER.info("Successfully edited file: " + targetFile + " (" + replacements + " replacements)");
-                    
-                    Map<String, Object> structuredContent = new HashMap<>();
-                    structuredContent.put("status", "success");
-                    structuredContent.put("replacements", replacements);
-                    structuredContent.put("message", successMsg);
-                    
-                    return CallToolResult.builder()
+                    newContent = content.replace(oldString, newString);
+                } else {
+                    newContent = content;
+                }
+            } else {
+                // Replace first occurrence only
+                int index = content.indexOf(oldString);
+                if (index != -1) {
+                    replacements = 1;
+                    newContent = content.substring(0, index) + newString + content.substring(index + oldString.length());
+                } else {
+                    newContent = content;
+                }
+            }
+
+            if (replacements > 0) {
+                state.callsOk().incrementAndGet();
+
+                Files.writeString(targetFile, newContent);
+                String successMsg = "Successfully replaced " + replacements + " occurrence(s) in file: " + projectDir.relativize(targetFile);
+                LOGGER.info("Successfully edited file: " + targetFile + " (" + replacements + " replacements)");
+
+                Map<String, Object> structuredContent = new HashMap<>();
+                structuredContent.put("status", "success");
+                structuredContent.put("replacements", replacements);
+                structuredContent.put("message", successMsg);
+
+                return CallToolResult.builder()
                         .isError(false)
                         .addTextContent(successMsg)
                         .structuredContent(structuredContent)
                         .build();
-                } else {
-                    // Find longest matching prefix and mismatch details for debugging
-                    Map<String, Object> prefixInfo = findLongestPrefix(projectDir, targetFile, content, oldString);
-                    String noMatchMsg = (String) prefixInfo.get("message");
-                    LOGGER.info("No matches found in file: " + targetFile);
-                    
-                    Map<String, Object> structuredContent = new HashMap<>();
-                    structuredContent.put("status", "success");
-                    structuredContent.put("replacements", 0);
-                    structuredContent.put("message", noMatchMsg);
-                    structuredContent.put("longestPrefixLength", prefixInfo.get("longestPrefixLength"));
-                    structuredContent.put("searchedChar", prefixInfo.get("searchedChar"));
-                    structuredContent.put("actualChar", prefixInfo.get("actualChar"));
-                    
-                    return CallToolResult.builder()
+            } else {
+                // Find longest matching prefix and mismatch details for debugging
+                Map<String, Object> prefixInfo = findLongestPrefix(projectDir, targetFile, content, oldString);
+                String noMatchMsg = (String) prefixInfo.get("message");
+                LOGGER.info("No matches found in file: " + targetFile);
+
+                Map<String, Object> structuredContent = new HashMap<>();
+                structuredContent.put("status", "success");
+                structuredContent.put("replacements", 0);
+                structuredContent.put("message", noMatchMsg);
+                structuredContent.put("longestPrefixLength", prefixInfo.get("longestPrefixLength"));
+                structuredContent.put("searchedChar", prefixInfo.get("searchedChar"));
+                structuredContent.put("actualChar", prefixInfo.get("actualChar"));
+
+                return CallToolResult.builder()
                         .isError(false)
                         .addTextContent(noMatchMsg)
                         .structuredContent(structuredContent)
                         .build();
-                }
+            }
+        } catch (IOException e) {
+            String errorMsg = "Failed to edit file: " + e.getMessage();
+            LOGGER.error("IOException while editing file {}", targetFile, e);
 
-            } catch (IOException e) {
-                String errorMsg = "Failed to edit file: " + e.getMessage();
-                LOGGER.log(Level.SEVERE, "IOException while editing file " + targetFile, e);
-                return CallToolResult.builder()
+            return CallToolResult.builder()
                     .isError(true)
                     .addTextContent(errorMsg)
                     .build();
-            }
-        };
-
-        return McpServerFeatures.SyncToolSpecification.builder()
-            .tool(tool)
-            .callHandler(handler)
-            .build();
+        }
     }
 
     private static Map<String, Object> findLongestPrefix(Path projectDir, Path targetFile, String content, String oldString) {

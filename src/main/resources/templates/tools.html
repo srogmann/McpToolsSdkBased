@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <title>MCP Tools Management</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        table { border-collapse: collapse; width: 100%; max-width: 800px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        tr:nth-child(even) { background-color: #f9f9f9; }
+        .active { color: green; font-weight: bold; }
+        .inactive { color: red; }
+    </style>
+</head>
+<body>
+<h1>Tools</h1>
+<table>
+    <thead>
+    <tr>
+        <th>is active</th>
+        <th>Name</th>
+        <th>Description</th>
+        <th>#Calls</th>
+    </tr>
+    </thead>
+    <tbody>
+    <tr th:each="entry : ${tools}">
+        <td>
+            <form th:action="@{/tools/toggle}" method="post" style="margin:0;">
+                <input type="hidden" name="name" th:value="${entry.key}"/>
+                <input type="checkbox"
+                       th:checked="${entry.value.state().isActive().get()}"
+                       onclick="this.form.submit()"/>
+            </form>
+        </td>
+        <td th:text="${entry.key}">Name</td>
+        <td th:text="${entry.value.spec().tool().description()}">Description</td>
+        <td th:text="${entry.value.state().callCount().get()}">0</td>
+    </tr>
+    </tbody>
+</table>
+</body>
+</html>

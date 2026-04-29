@@ -16,17 +16,24 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.util.concurrent.atomic.AtomicLong;
+
 /**
  * Spring configuration class for the Model Context Protocol (MCP) server.
  * <p>
  * Sets up JSON mapping, HTTP Streamable and SSE transports,
- * and registers tools for the MCP server instances.
+ * and registers tools via the ToolRegistry.
  * </p>
  */
 @Configuration
 public class McpConfig {
     /** Logger */
     private static final Logger LOG = LoggerFactory.getLogger(McpConfig.class);
+
+    @Bean
+    public ToolRegistry toolRegistry() {
+        return new ToolRegistry();
+    }
 
     // JsonMapper Bean for serialization
     @Bean
@@ -69,22 +76,24 @@ public class McpConfig {
         return new ServletRegistrationBean<>(transportProvider, "/mcp/sse/*");
     }
 
-    // Helper method for tool registration (avoids code duplication)
-    private void registerTools(McpSyncServer server) {
-        server.addTool(CreateNewFileTool.createSpecification());
-        server.addTool(EditFileTool.createSpecification());
-        server.addTool(FindFilesByGlobTool.createSpecification());
-        server.addTool(ReadTextFileTool.createSpecification());
+    // Helper method to populate the registry with available tools
+    private void populateToolRegistry(ToolRegistry registry) {
+        registry.registerToolDefinition(CreateNewFileTool.createToolInstance());
+        registry.registerToolDefinition(ReadTextFileTool.createToolInstance());
+        registry.registerToolDefinition(EditFileTool.createToolInstance());
+        registry.registerToolDefinition(FindFilesByGlobTool.createToolInstance());
 
-        //server.addTool(GlossaryTool.createSpecification());
+        registry.registerToolDefinition(GlossaryTool.createToolInstance());
 
-        //server.addTool(VideoPlayerTool.createSpecification());
-        //server.addTool(VideoSearchTool.createSpecification());
+        //registry.registerToolDefinition(VideoPlayerTool.createToolInstance());
+        //registry.registerToolDefinition(VideoSearchTool.createToolInstance());
     }
 
     // Streamable HTTP Server instance
     @Bean
-    public McpSyncServer streamableMcpServer(HttpServletStreamableServerTransportProvider transportProvider) {
+    public McpSyncServer streamableMcpServer(
+            HttpServletStreamableServerTransportProvider transportProvider, 
+            ToolRegistry registry) {
         LOG.info("Building Streamable HTTP MCP Server on /mcp");
 
         var capabilities = McpSchema.ServerCapabilities.builder()
@@ -95,13 +104,25 @@ public class McpConfig {
                 .capabilities(capabilities)
                 .build();
 
-        registerTools(server);
+        // Populate registry if not already done (assuming single context)
+        // In a real scenario, ensure populateToolRegistry is called only once globally.
+        // Here we assume ToolRegistry is a singleton and we might need a flag or PostConstruct there.
+        // For this config, we rely on ToolRegistry's PostConstruct or a separate initializer.
+        // To ensure tools exist before server starts using them:
+        if (registry.getMapTools().isEmpty()) {
+            populateToolRegistry(registry);
+        }
+        
+        registry.registerServer(server);
+        
         return server;
     }
 
     // SSE Server instance (separate instance for SSE clients)
     @Bean
-    public McpSyncServer sseMcpServer(HttpServletSseServerTransportProvider transportProvider) {
+    public McpSyncServer sseMcpServer(
+            HttpServletSseServerTransportProvider transportProvider, 
+            ToolRegistry registry) {
         LOG.info("Building SSE MCP Server on /mcp/sse");
 
         var capabilities = McpSchema.ServerCapabilities.builder()
@@ -112,7 +133,9 @@ public class McpConfig {
                 .capabilities(capabilities)
                 .build();
 
-        registerTools(server);
+        // Register this server with the registry to receive tool updates
+        registry.registerServer(server);
+        
         return server;
     }
 }

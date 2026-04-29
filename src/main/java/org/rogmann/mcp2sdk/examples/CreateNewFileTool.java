@@ -6,7 +6,11 @@ import io.modelcontextprotocol.spec.McpSchema;
 import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
 import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
 import io.modelcontextprotocol.spec.McpSchema.JsonSchema;
+import org.rogmann.mcp2sdk.ToolSpecWithState;
+import org.rogmann.mcp2sdk.ToolState;
 import org.rogmann.mcp2sdk.WorkProject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -16,31 +20,30 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-import java.util.function.BiFunction;
 
 /**
  * MCP tool implementation for creating a new file in a project.
- * Refactored to use McpServerFeatures.SyncToolSpecification.
  * The tool ensures that only allowed projects and safe paths are handled.
  * It supports optional overwriting of existing files.
  */
 public class CreateNewFileTool {
 
-    private static final Logger LOGGER = Logger.getLogger(CreateNewFileTool.class.getName());
+    private static final Logger LOGGER = LoggerFactory.getLogger(CreateNewFileTool.class);
 
     private static final String NAME = "create_new_file";
 
+    /** tool state (active-flag, statistics) */
+    private final ToolState state;
+
     private CreateNewFileTool() {
-        // Prevent instantiation, this class serves as a factory for the tool specification
+        state = new ToolState();
     }
 
     /**
      * Creates the synchronous tool specification for creating a new file.
-     * @return a SyncToolSpecification ready to be registered with an MCP server
+     * @return the tool specification and its state
      */
-    public static McpServerFeatures.SyncToolSpecification createSpecification() {
+    public static ToolSpecWithState createToolInstance() {
         // Define Input Schema properties
         Map<String, Object> properties = new HashMap<>();
 
@@ -75,80 +78,94 @@ public class CreateNewFileTool {
             .inputSchema(inputSchema)
             .build();
 
-        BiFunction<McpSyncServerExchange, CallToolRequest, CallToolResult> handler = (exchange, request) -> {
-            Map<String, Object> arguments = request.arguments();
+        CreateNewFileTool toolImpl = new CreateNewFileTool();
 
-            String projectName = (String) arguments.get("projectName");
-            String pathInProject = (String) arguments.get("pathInProject");
-            String text = (String) arguments.get("text");
-            Boolean overwrite = Optional.ofNullable((Boolean) arguments.get("overwrite")).orElse(false);
+        return new ToolSpecWithState(McpServerFeatures.SyncToolSpecification.builder()
+                    .tool(tool)
+                    .callHandler(toolImpl::call)
+                    .build(),
+                toolImpl.state);
+    }
 
-            // Use a temporary map to capture potential error from WorkProject.lookupProject
-            Map<String, Object> tempResult = new HashMap<>();
-            WorkProject workProject = WorkProject.lookupProject(projectName, tempResult);
+    /**
+     * Handles the tool call request.
+     * @param exchange the server exchange
+     * @param request the tool call request
+     * @return the tool call result
+     */
+    McpSchema.CallToolResult call(McpSyncServerExchange exchange, CallToolRequest request) {
+        // Increment call count
+        state.callCount().incrementAndGet();
 
-            if (workProject == null) {
-                String error = (String) tempResult.get("error");
-                return CallToolResult.builder()
-                    .isError(true)
-                    .addTextContent(error != null ? error : "Project not found: " + projectName)
-                    .build();
-            }
+        Map<String, Object> arguments = request.arguments();
 
-            Path projectBaseDir = workProject.projectBaseDir();
-            Path projectDir = workProject.projectDir();
+        String projectName = (String) arguments.get("projectName");
+        String pathInProject = (String) arguments.get("pathInProject");
+        String text = (String) arguments.get("text");
+        Boolean overwrite = Optional.ofNullable((Boolean) arguments.get("overwrite")).orElse(false);
 
-            Path targetFile = projectDir.resolve(pathInProject).normalize();
-            if (!targetFile.startsWith(projectDir)) {
-                String errorMsg = "Path traversal detected in pathInProject: " + pathInProject;
-                LOGGER.warning("Path traversal attempt detected: " + pathInProject);
-                return CallToolResult.builder()
-                    .isError(true)
-                    .addTextContent(errorMsg)
-                    .build();
-            }
+        // Use a temporary map to capture potential error from WorkProject.lookupProject
+        Map<String, Object> tempResult = new HashMap<>();
+        WorkProject workProject = WorkProject.lookupProject(projectName, tempResult);
 
-            if (Files.exists(targetFile) && !overwrite) {
-                String errorMsg = "File already exists and overwrite is not allowed: " + projectBaseDir.relativize(targetFile);
-                LOGGER.info("File exists, overwrite=false: " + targetFile);
-                return CallToolResult.builder()
-                    .isError(true)
-                    .addTextContent(errorMsg)
-                    .build();
-            }
+        if (workProject == null) {
+            String error = (String) tempResult.get("error");
+            return CallToolResult.builder()
+                .isError(true)
+                .addTextContent(error != null ? error : "Project not found: " + projectName)
+                .build();
+        }
 
-            try {
-                Files.createDirectories(targetFile.getParent());
-                Files.writeString(targetFile, text,
-                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        Path projectBaseDir = workProject.projectBaseDir();
+        Path projectDir = workProject.projectDir();
 
-                LOGGER.info("Successfully created file: " + targetFile);
+        Path targetFile = projectDir.resolve(pathInProject).normalize();
+        if (!targetFile.startsWith(projectDir)) {
+            String errorMsg = "Path traversal detected in pathInProject: " + pathInProject;
+            LOGGER.warn("Path traversal attempt detected: " + pathInProject);
+            return CallToolResult.builder()
+                .isError(true)
+                .addTextContent(errorMsg)
+                .build();
+        }
 
-                // Prepare structured content for programmatic access if needed
-                Map<String, Object> structuredContent = new HashMap<>();
-                structuredContent.put("status", "success");
-                structuredContent.put("path", projectBaseDir.relativize(targetFile).toString());
-                structuredContent.put("message", "File written in project " + projectName + ": " + projectDir.relativize(targetFile));
+        if (Files.exists(targetFile) && !overwrite) {
+            String errorMsg = "File already exists and overwrite is not allowed: " + projectBaseDir.relativize(targetFile);
+            LOGGER.info("File exists, overwrite=false: " + targetFile);
+            return CallToolResult.builder()
+                .isError(true)
+                .addTextContent(errorMsg)
+                .build();
+        }
 
-                return CallToolResult.builder()
-                    .isError(false)
-                    .addTextContent("File created successfully: " + projectDir.relativize(targetFile))
-                    .structuredContent(structuredContent)
-                    .build();
+        try {
+            Files.createDirectories(targetFile.getParent());
+            Files.writeString(targetFile, text,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
 
-            } catch (IOException e) {
-                String errorMsg = "Failed to write file: " + e.getMessage();
-                LOGGER.log(Level.SEVERE, "IOException while writing file " + targetFile, e);
-                return CallToolResult.builder()
-                    .isError(true)
-                    .addTextContent(errorMsg)
-                    .build();
-            }
-        };
+            state.callsOk().incrementAndGet();
 
-        return McpServerFeatures.SyncToolSpecification.builder()
-            .tool(tool)
-            .callHandler(handler)
-            .build();
+            LOGGER.info("Successfully created file: " + targetFile);
+
+            // Prepare structured content for programmatic access if needed
+            Map<String, Object> structuredContent = new HashMap<>();
+            structuredContent.put("status", "success");
+            structuredContent.put("path", projectBaseDir.relativize(targetFile).toString());
+            structuredContent.put("message", "File written in project " + projectName + ": " + projectDir.relativize(targetFile));
+
+            return CallToolResult.builder()
+                .isError(false)
+                .addTextContent("File created successfully: " + projectDir.relativize(targetFile))
+                .structuredContent(structuredContent)
+                .build();
+
+        } catch (IOException e) {
+            String errorMsg = "Failed to write file: " + e.getMessage();
+            LOGGER.error("IOException while writing file " + targetFile, e);
+            return CallToolResult.builder()
+                .isError(true)
+                .addTextContent(errorMsg)
+                .build();
+        }
     }
 }

@@ -6,6 +6,8 @@ import io.modelcontextprotocol.spec.McpSchema;
 import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
 import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
 import io.modelcontextprotocol.spec.McpSchema.JsonSchema;
+import org.rogmann.mcp2sdk.ToolSpecWithState;
+import org.rogmann.mcp2sdk.ToolState;
 
 import java.io.File;
 import java.io.IOException;
@@ -19,11 +21,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.logging.Logger;
-import java.util.function.BiFunction;
 
 /**
  * MCP tool implementation for playing a video file.
- * Refactored to use McpServerFeatures.SyncToolSpecification.
+ * Refactored to use McpServerFeatures.SyncToolSpecification with Tool-Toggle mechanism.
  * The tool validates system properties for video folder, player executable, and arguments.
  * It ensures that only files within the configured video folder can be played.
  */
@@ -39,17 +40,20 @@ public class VideoPlayerTool {
 
     private static final DateTimeFormatter DF_DATE = DateTimeFormatter.BASIC_ISO_DATE;
 
+    /** tool state (active-flag, statistics) */
+    private final ToolState state;
+
     private VideoPlayerTool() {
-        // Prevent instantiation, this class serves as a factory for the tool specification
+        state = new ToolState();
     }
 
     /**
      * Creates the synchronous tool specification for playing videos.
      * Validates required system properties during specification creation.
-     * @return a SyncToolSpecification ready to be registered with an MCP server
+     * @return the tool specification and its state
      * @throws RuntimeException if required system properties are not set or invalid
      */
-    public static McpServerFeatures.SyncToolSpecification createSpecification() {
+    public static ToolSpecWithState createToolInstance() {
         // Validate system properties upfront
         String folderName = System.getProperty(PROP_FOLDER);
         if (folderName == null || folderName.isBlank()) {
@@ -94,104 +98,133 @@ public class VideoPlayerTool {
             .inputSchema(inputSchema)
             .build();
 
-        BiFunction<McpSyncServerExchange, CallToolRequest, CallToolResult> handler = (exchange, request) -> {
-            Map<String, Object> arguments = request.arguments();
+        VideoPlayerTool toolImpl = new VideoPlayerTool();
 
-            String fileName = (String) arguments.get("file_name");
-            if (fileName == null || fileName.isBlank()) {
-                return CallToolResult.builder()
-                    .isError(true)
-                    .addTextContent("Missing file_name in tool call")
-                    .build();
-            }
+        // Store folder and executable info for use in call method
+        toolImpl.folderVideos = folderVideos;
+        toolImpl.fileExecutable = fileExecutable;
+        toolImpl.playerArgs = playerArgs;
 
-            // Security check: prevent path traversal
-            if (fileName.contains(File.separator) || fileName.contains("/") || fileName.contains("\\")) {
-                String errorMsg = "Invalid file name: path separators not allowed";
-                LOGGER.warning("Path traversal attempt detected in file name: " + fileName);
-                return CallToolResult.builder()
-                    .isError(true)
-                    .addTextContent(errorMsg)
-                    .build();
-            }
+        return new ToolSpecWithState(McpServerFeatures.SyncToolSpecification.builder()
+                    .tool(tool)
+                    .callHandler(toolImpl::call)
+                    .build(),
+                toolImpl.state);
+    }
 
-            final File fileVideo = new File(folderVideos, fileName);
+    /** Video folder */
+    private File folderVideos;
 
-            // Additional security check: ensure file is within the configured folder
-            try {
-                String canonicalVideoPath = fileVideo.getCanonicalPath();
-                String canonicalFolderPath = folderVideos.getCanonicalPath();
-                if (!canonicalVideoPath.startsWith(canonicalFolderPath)) {
-                    String errorMsg = "Access denied: file is outside configured video folder";
-                    LOGGER.warning("Attempted access outside video folder: " + fileName);
-                    return CallToolResult.builder()
-                        .isError(true)
-                        .addTextContent(errorMsg)
-                        .build();
-                }
-            } catch (IOException e) {
-                String errorMsg = "Failed to resolve file path: " + e.getMessage();
-                LOGGER.severe("IOException while resolving file path: " + e.getMessage());
-                return CallToolResult.builder()
-                    .isError(true)
-                    .addTextContent(errorMsg)
-                    .build();
-            }
+    /** Player executable */
+    private File fileExecutable;
 
-            if (!fileVideo.isFile()) {
-                String errorMsg = "No such file: " + fileName;
-                LOGGER.info("File not found: " + fileVideo.getAbsolutePath());
-                return CallToolResult.builder()
-                    .isError(true)
-                    .addTextContent(errorMsg)
-                    .build();
-            }
+    /** Player arguments */
+    private String[] playerArgs;
 
-            // Build and execute the player command
-            List<String> cmdArgs = new ArrayList<>();
-            cmdArgs.add(fileExecutable.getAbsolutePath());
-            cmdArgs.addAll(Arrays.asList(playerArgs));
-            cmdArgs.add(fileVideo.getAbsolutePath());
+    /**
+     * Handles the tool call request.
+     * @param exchange the server exchange
+     * @param request the tool call request
+     * @return the tool call result
+     */
+    McpSchema.CallToolResult call(McpSyncServerExchange exchange, CallToolRequest request) {
+        // Increment call count
+        state.callCount().incrementAndGet();
 
-            Process process;
-            try {
-                process = new ProcessBuilder(cmdArgs).start();
-            } catch (IOException e) {
-                String errorMsg = "IO error after starting the player: " + e.getMessage();
-                LOGGER.severe("IOException while starting player with: " + cmdArgs + " - " + e.getMessage());
-                return CallToolResult.builder()
-                    .isError(true)
-                    .addTextContent(errorMsg)
-                    .build();
-            }
+        Map<String, Object> arguments = request.arguments();
 
-            // Gather file metadata for the response
-            Instant tsFile = Instant.ofEpochMilli(fileVideo.lastModified());
-            LocalDateTime ldtFile = LocalDateTime.ofInstant(tsFile, ZoneId.of("Europe/Berlin"));
-            String status = String.format("Started playing file \"%s\" (pid %d, size %d bytes, saved on %s)",
-                    fileName, process.pid(), fileVideo.length(), DF_DATE.format(ldtFile));
-
-            LOGGER.info("Video player started: " + fileName + " (pid " + process.pid() + ")");
-
-            // Prepare structured content for programmatic access
-            Map<String, Object> structuredContent = new HashMap<>();
-            structuredContent.put("status", "success");
-            structuredContent.put("fileName", fileName);
-            structuredContent.put("processId", process.pid());
-            structuredContent.put("fileSize", fileVideo.length());
-            structuredContent.put("lastModified", DF_DATE.format(ldtFile));
-            structuredContent.put("message", status);
-
+        String fileName = (String) arguments.get("file_name");
+        if (fileName == null || fileName.isBlank()) {
             return CallToolResult.builder()
-                .isError(false)
-                .addTextContent(status)
-                .structuredContent(structuredContent)
+                .isError(true)
+                .addTextContent("Missing file_name in tool call")
                 .build();
-        };
+        }
 
-        return McpServerFeatures.SyncToolSpecification.builder()
-            .tool(tool)
-            .callHandler(handler)
+        // Security check: prevent path traversal
+        if (fileName.contains(File.separator) || fileName.contains("/") || fileName.contains("\\")) {
+            String errorMsg = "Invalid file name: path separators not allowed";
+            LOGGER.warning("Path traversal attempt detected in file name: " + fileName);
+            return CallToolResult.builder()
+                .isError(true)
+                .addTextContent(errorMsg)
+                .build();
+        }
+
+        final File fileVideo = new File(folderVideos, fileName);
+
+        // Additional security check: ensure file is within the configured folder
+        try {
+            String canonicalVideoPath = fileVideo.getCanonicalPath();
+            String canonicalFolderPath = folderVideos.getCanonicalPath();
+            if (!canonicalVideoPath.startsWith(canonicalFolderPath)) {
+                String errorMsg = "Access denied: file is outside configured video folder";
+                LOGGER.warning("Attempted access outside video folder: " + fileName);
+                return CallToolResult.builder()
+                    .isError(true)
+                    .addTextContent(errorMsg)
+                    .build();
+            }
+        } catch (IOException e) {
+            String errorMsg = "Failed to resolve file path: " + e.getMessage();
+            LOGGER.severe("IOException while resolving file path: " + e.getMessage());
+            return CallToolResult.builder()
+                .isError(true)
+                .addTextContent(errorMsg)
+                .build();
+        }
+
+        if (!fileVideo.isFile()) {
+            String errorMsg = "No such file: " + fileName;
+            LOGGER.info("File not found: " + fileVideo.getAbsolutePath());
+            return CallToolResult.builder()
+                .isError(true)
+                .addTextContent(errorMsg)
+                .build();
+        }
+
+        // Build and execute the player command
+        List<String> cmdArgs = new ArrayList<>();
+        cmdArgs.add(fileExecutable.getAbsolutePath());
+        cmdArgs.addAll(Arrays.asList(playerArgs));
+        cmdArgs.add(fileVideo.getAbsolutePath());
+
+        Process process;
+        try {
+            process = new ProcessBuilder(cmdArgs).start();
+        } catch (IOException e) {
+            String errorMsg = "IO error after starting the player: " + e.getMessage();
+            LOGGER.severe("IOException while starting player with: " + cmdArgs + " - " + e.getMessage());
+            return CallToolResult.builder()
+                .isError(true)
+                .addTextContent(errorMsg)
+                .build();
+        }
+
+        // Increment success counter
+        state.callsOk().incrementAndGet();
+
+        // Gather file metadata for the response
+        Instant tsFile = Instant.ofEpochMilli(fileVideo.lastModified());
+        LocalDateTime ldtFile = LocalDateTime.ofInstant(tsFile, ZoneId.of("Europe/Berlin"));
+        String status = String.format("Started playing file \"%s\" (pid %d, size %d bytes, saved on %s)",
+                fileName, process.pid(), fileVideo.length(), DF_DATE.format(ldtFile));
+
+        LOGGER.info("Video player started: " + fileName + " (pid " + process.pid() + ")");
+
+        // Prepare structured content for programmatic access
+        Map<String, Object> structuredContent = new HashMap<>();
+        structuredContent.put("status", "success");
+        structuredContent.put("fileName", fileName);
+        structuredContent.put("processId", process.pid());
+        structuredContent.put("fileSize", fileVideo.length());
+        structuredContent.put("lastModified", DF_DATE.format(ldtFile));
+        structuredContent.put("message", status);
+
+        return CallToolResult.builder()
+            .isError(false)
+            .addTextContent(status)
+            .structuredContent(structuredContent)
             .build();
     }
 }

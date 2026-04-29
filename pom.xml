@@ -41,6 +41,12 @@
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
 
+        <!-- Thymeleaf for Web UI -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-thymeleaf</artifactId>
+        </dependency>
+
         <!-- MCP SDK -->
         <dependency>
             <groupId>io.modelcontextprotocol.sdk</groupId>
@@ -50,7 +56,6 @@
             <groupId>io.modelcontextprotocol.sdk</groupId>
             <artifactId>mcp-json-jackson3</artifactId>
         </dependency>
-
 
         <!-- Test -->
         <dependency>

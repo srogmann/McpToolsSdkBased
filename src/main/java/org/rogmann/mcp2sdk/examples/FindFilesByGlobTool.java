@@ -6,6 +6,8 @@ import io.modelcontextprotocol.spec.McpSchema;
 import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
 import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
 import io.modelcontextprotocol.spec.McpSchema.JsonSchema;
+import org.rogmann.mcp2sdk.ToolSpecWithState;
+import org.rogmann.mcp2sdk.ToolState;
 import org.rogmann.mcp2sdk.WorkProject;
 
 import java.io.IOException;
@@ -20,7 +22,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import java.util.function.BiFunction;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
@@ -36,15 +37,18 @@ public class FindFilesByGlobTool {
 
     private static final String NAME = "find_files_by_glob";
 
+    /** tool state (active-flag, statistics) */
+    private final ToolState state;
+
     private FindFilesByGlobTool() {
-        // Prevent instantiation, this class serves as a factory for the tool specification
+        state = new ToolState();
     }
 
     /**
      * Creates the synchronous tool specification for finding files by glob pattern.
-     * @return a SyncToolSpecification ready to be registered with an MCP server
+     * @return the tool specification and its state
      */
-    public static McpServerFeatures.SyncToolSpecification createSpecification() {
+    public static ToolSpecWithState createToolInstance() {
         // Define Input Schema properties
         Map<String, Object> properties = new HashMap<>();
 
@@ -79,135 +83,154 @@ public class FindFilesByGlobTool {
             .inputSchema(inputSchema)
             .build();
 
-        BiFunction<McpSyncServerExchange, CallToolRequest, CallToolResult> handler = (exchange, request) -> {
-            Map<String, Object> arguments = request.arguments();
+        FindFilesByGlobTool toolImpl = new FindFilesByGlobTool();
 
-            String projectName = (String) arguments.get("projectName");
-            String globPattern = (String) arguments.get("globPattern");
-            if (globPattern == null) {
-                globPattern = "**/*.*";
-            }
-            Integer fileCountLimit = (Integer) arguments.get("fileCountLimit");
-            String subDirectoryRelativePath = (String) arguments.get("subDirectoryRelativePath");
+        return new ToolSpecWithState(McpServerFeatures.SyncToolSpecification.builder()
+                    .tool(tool)
+                    .callHandler(toolImpl::call)
+                    .build(),
+                toolImpl.state);
+    }
 
-            // Use a temporary map to capture potential error from WorkProject.lookupProject
-            Map<String, Object> tempResult = new HashMap<>();
-            WorkProject workProject = WorkProject.lookupProject(projectName, tempResult);
+    /**
+     * Handles the tool call request.
+     *
+     * @param exchange the server exchange
+     * @param request the tool call request
+     * @return the tool call result
+     */
+    McpSchema.CallToolResult call(McpSyncServerExchange exchange, CallToolRequest request) {
+        // Increment call count
+        state.callCount().incrementAndGet();
 
-            if (workProject == null) {
-                String error = (String) tempResult.get("error");
-                return CallToolResult.builder()
-                    .isError(true)
-                    .addTextContent(error != null ? error : "Project not found: " + projectName)
-                    .build();
-            }
+        Map<String, Object> arguments = request.arguments();
 
-            Path projectDir = workProject.projectDir();
+        String projectName = (String) arguments.get("projectName");
+        String globPattern = (String) arguments.get("globPattern");
+        if (globPattern == null) {
+            globPattern = "**/*.*";
+        }
+        Integer fileCountLimit = (Integer) arguments.get("fileCountLimit");
+        String subDirectoryRelativePath = (String) arguments.get("subDirectoryRelativePath");
 
-            String projectSubExcludeFilterProp = System.getProperty("IDE_PROJECT_SUB_EXCLUDE_FILTER");
-            Pattern projectSubExcludePattern = null;
-            if (projectSubExcludeFilterProp != null && !projectSubExcludeFilterProp.isBlank()) {
-                try {
-                    projectSubExcludePattern = Pattern.compile(projectSubExcludeFilterProp);
-                } catch (PatternSyntaxException e) {
-                    LOGGER.severe("Invalid regex in IDE_PROJECT_SUB_EXCLUDE_FILTER: " + e.getMessage());
-                    return CallToolResult.builder()
-                        .isError(true)
-                        .addTextContent("Invalid IDE_PROJECT_SUB_EXCLUDE_FILTER: " + e.getMessage())
-                        .build();
-                }
-            }
+        // Use a temporary map to capture potential error from WorkProject.lookupProject
+        Map<String, Object> tempResult = new HashMap<>();
+        WorkProject workProject = WorkProject.lookupProject(projectName, tempResult);
 
-            Path patternRoot = projectDir.resolve(".").normalize();
-            if (!patternRoot.startsWith(projectDir)) {
-                LOGGER.warning("Pattern root path resolves outside project directory: " + patternRoot);
-                return CallToolResult.builder()
-                    .isError(true)
-                    .addTextContent("Invalid pattern root path after resolution of " + projectDir)
-                    .build();
-            }
+        if (workProject == null) {
+            String error = (String) tempResult.get("error");
+            return CallToolResult.builder()
+                .isError(true)
+                .addTextContent(error != null ? error : "Project not found: " + projectName)
+                .build();
+        }
 
-            // Compute search-root directory
-            Path searchRoot;
-            if (subDirectoryRelativePath != null && !subDirectoryRelativePath.isBlank()) {
-                Path subDirPath = projectDir.resolve(subDirectoryRelativePath).normalize();
-                if (!subDirPath.startsWith(projectDir)) {
-                    LOGGER.warning("Attempted directory traversal in subDirectoryRelativePath: " + subDirectoryRelativePath);
-                    return CallToolResult.builder()
-                        .isError(true)
-                        .addTextContent("Subdirectory path resolves outside project directory, access denied")
-                        .build();
-                }
-                if (!Files.exists(subDirPath)) {
-                    LOGGER.severe("Subdirectory does not exist: " + subDirPath);
-                    return CallToolResult.builder()
-                        .isError(true)
-                        .addTextContent("Subdirectory does not exist: " + subDirPath)
-                        .build();
-                }
-                if (!Files.isDirectory(subDirPath)) {
-                    LOGGER.severe("Subdirectory path is not a directory: " + subDirPath);
-                    return CallToolResult.builder()
-                        .isError(true)
-                        .addTextContent("Subdirectory path is not a directory: " + subDirPath)
-                        .build();
-                }
-                searchRoot = subDirPath;
-            } else {
-                searchRoot = projectDir;
-            }
+        Path projectDir = workProject.projectDir();
 
-            int limit = Optional.ofNullable(fileCountLimit).orElse(Integer.MAX_VALUE);
-            if (limit <= 0) {
-                LOGGER.fine("File count limit is non-positive: " + limit);
-                Map<String, Object> structuredContent = new HashMap<>();
-                structuredContent.put("status", "success");
-                structuredContent.put("files", new ArrayList<>());
-                structuredContent.put("fileCount", 0);
-                structuredContent.put("message", "No files returned due to zero or negative limit");
-                return CallToolResult.builder()
-                    .isError(false)
-                    .addTextContent("No files returned due to zero or negative limit")
-                    .structuredContent(structuredContent)
-                    .build();
-            }
-
-            List<Map<String, Object>> matchingFiles = new ArrayList<>();
+        String projectSubExcludeFilterProp = System.getProperty("IDE_PROJECT_SUB_EXCLUDE_FILTER");
+        Pattern projectSubExcludePattern = null;
+        if (projectSubExcludeFilterProp != null && !projectSubExcludeFilterProp.isBlank()) {
             try {
-                var fileSystem = FileSystems.getDefault();
-                String qualifiedPattern = "glob:" + globPattern;
-                DirectoryStream.Filter<Path> filter = fileSystem.getPathMatcher(qualifiedPattern)::matches;
-
-                walkAndMatch(searchRoot, projectDir, filter, projectSubExcludePattern, matchingFiles, limit);
-
-                LOGGER.fine("Found " + matchingFiles.size() + " file(s) matching pattern '" + globPattern +
-                        "' in project '" + projectName + "' under subdirectory '" + subDirectoryRelativePath + "'");
-
-                Map<String, Object> structuredContent = new HashMap<>();
-                structuredContent.put("status", "success");
-                structuredContent.put("files", matchingFiles);
-                structuredContent.put("fileCount", matchingFiles.size());
-                structuredContent.put("message", "Found " + matchingFiles.size() + " file(s) matching pattern");
-
-                return CallToolResult.builder()
-                    .isError(false)
-                    .addTextContent("Found " + matchingFiles.size() + " file(s) matching pattern '" + globPattern + "'")
-                    .structuredContent(structuredContent)
-                    .build();
-
-            } catch (Exception e) {
-                LOGGER.log(Level.SEVERE, "Exception during glob processing for pattern '" + globPattern + "' in: " + projectName + " / " + searchRoot, e);
+                projectSubExcludePattern = Pattern.compile(projectSubExcludeFilterProp);
+            } catch (PatternSyntaxException e) {
+                LOGGER.severe("Invalid regex in IDE_PROJECT_SUB_EXCLUDE_FILTER: " + e.getMessage());
                 return CallToolResult.builder()
                     .isError(true)
-                    .addTextContent("Failed to process glob pattern '" + globPattern + "' for '" + projectName + "': " + e.getMessage())
+                    .addTextContent("Invalid IDE_PROJECT_SUB_EXCLUDE_FILTER: " + e.getMessage())
                     .build();
             }
-        };
+        }
 
-        return McpServerFeatures.SyncToolSpecification.builder()
-            .tool(tool)
-            .callHandler(handler)
-            .build();
+        Path patternRoot = projectDir.resolve(".").normalize();
+        if (!patternRoot.startsWith(projectDir)) {
+            LOGGER.warning("Pattern root path resolves outside project directory: " + patternRoot);
+            return CallToolResult.builder()
+                .isError(true)
+                .addTextContent("Invalid pattern root path after resolution of " + projectDir)
+                .build();
+        }
+
+        // Compute search-root directory
+        Path searchRoot;
+        if (subDirectoryRelativePath != null && !subDirectoryRelativePath.isBlank()) {
+            Path subDirPath = projectDir.resolve(subDirectoryRelativePath).normalize();
+            if (!subDirPath.startsWith(projectDir)) {
+                LOGGER.warning("Attempted directory traversal in subDirectoryRelativePath: " + subDirectoryRelativePath);
+                return CallToolResult.builder()
+                    .isError(true)
+                    .addTextContent("Subdirectory path resolves outside project directory, access denied")
+                    .build();
+            }
+            if (!Files.exists(subDirPath)) {
+                LOGGER.severe("Subdirectory does not exist: " + subDirPath);
+                return CallToolResult.builder()
+                    .isError(true)
+                    .addTextContent("Subdirectory does not exist: " + subDirPath)
+                    .build();
+            }
+            if (!Files.isDirectory(subDirPath)) {
+                LOGGER.severe("Subdirectory path is not a directory: " + subDirPath);
+                return CallToolResult.builder()
+                    .isError(true)
+                    .addTextContent("Subdirectory path is not a directory: " + subDirPath)
+                    .build();
+            }
+            searchRoot = subDirPath;
+        } else {
+            searchRoot = projectDir;
+        }
+
+        int limit = Optional.ofNullable(fileCountLimit).orElse(Integer.MAX_VALUE);
+        if (limit <= 0) {
+            // Increment success count
+            state.callsOk().incrementAndGet();
+
+            LOGGER.fine("File count limit is non-positive: " + limit);
+            Map<String, Object> structuredContent = new HashMap<>();
+            structuredContent.put("status", "success");
+            structuredContent.put("files", new ArrayList<>());
+            structuredContent.put("fileCount", 0);
+            structuredContent.put("message", "No files returned due to zero or negative limit");
+            return CallToolResult.builder()
+                .isError(false)
+                .addTextContent("No files returned due to zero or negative limit")
+                .structuredContent(structuredContent)
+                .build();
+        }
+
+        List<Map<String, Object>> matchingFiles = new ArrayList<>();
+        try {
+            var fileSystem = FileSystems.getDefault();
+            String qualifiedPattern = "glob:" + globPattern;
+            DirectoryStream.Filter<Path> filter = fileSystem.getPathMatcher(qualifiedPattern)::matches;
+
+            walkAndMatch(searchRoot, projectDir, filter, projectSubExcludePattern, matchingFiles, limit);
+
+            LOGGER.fine("Found " + matchingFiles.size() + " file(s) matching pattern '" + globPattern +
+                    "' in project '" + projectName + "' under subdirectory '" + subDirectoryRelativePath + "'");
+
+            // Increment success count
+            state.callsOk().incrementAndGet();
+
+            Map<String, Object> structuredContent = new HashMap<>();
+            structuredContent.put("status", "success");
+            structuredContent.put("files", matchingFiles);
+            structuredContent.put("fileCount", matchingFiles.size());
+            structuredContent.put("message", "Found " + matchingFiles.size() + " file(s) matching pattern");
+
+            return CallToolResult.builder()
+                .isError(false)
+                .addTextContent("Found " + matchingFiles.size() + " file(s) matching pattern '" + globPattern + "'")
+                .structuredContent(structuredContent)
+                .build();
+
+        } catch (Exception e) {
+            LOGGER.log(Level.SEVERE, "Exception during glob processing for pattern '" + globPattern + "' in: " + projectName + " / " + searchRoot, e);
+            return CallToolResult.builder()
+                .isError(true)
+                .addTextContent("Failed to process glob pattern '" + globPattern + "' for '" + projectName + "': " + e.getMessage())
+                .build();
+        }
     }
 
     /**

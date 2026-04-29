@@ -6,6 +6,8 @@ import io.modelcontextprotocol.spec.McpSchema;
 import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
 import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
 import io.modelcontextprotocol.spec.McpSchema.JsonSchema;
+import org.rogmann.mcp2sdk.ToolSpecWithState;
+import org.rogmann.mcp2sdk.ToolState;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -15,7 +17,6 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.logging.Logger;
-import java.util.function.BiFunction;
 
 /**
  * MCP tool implementation for explaining technical words or concepts from a glossary.
@@ -35,8 +36,11 @@ public class GlossaryTool {
     /** Property name of a description of the glossary */
     private static final String PROP_DESCRIPTION = "mcp.glossary.description";
 
+    /** tool state (active-flag, statistics) */
+    private final ToolState state;
+
     private GlossaryTool() {
-        // Prevent instantiation, this class serves as a factory for the tool specification
+        state = new ToolState();
     }
 
     /**
@@ -49,10 +53,10 @@ public class GlossaryTool {
     /**
      * Creates the synchronous tool specification for the glossary lookup tool.
      * Initializes the glossary from the configured markdown file.
-     * @return a SyncToolSpecification ready to be registered with an MCP server
+     * @return the tool specification and its state
      * @throws RuntimeException if the glossary file is not configured or cannot be read
      */
-    public static McpServerFeatures.SyncToolSpecification createSpecification() {
+    public static ToolSpecWithState createToolInstance() {
         // Load glossary data during specification creation
         Map<String, GlossaryEntry> mapGlossary = loadGlossary();
         Map<String, String> mapReferences = loadReferences(mapGlossary);
@@ -82,68 +86,85 @@ public class GlossaryTool {
             .inputSchema(inputSchema)
             .build();
 
-        BiFunction<McpSyncServerExchange, CallToolRequest, CallToolResult> handler = (exchange, request) -> {
-            Map<String, Object> arguments = request.arguments();
+        GlossaryTool toolImpl = new GlossaryTool();
 
-            Object oWords = arguments.get("words");
-            if (oWords == null) {
-                return CallToolResult.builder()
-                    .isError(true)
-                    .addTextContent("Missing 'words' parameter in request")
-                    .build();
-            }
+        return new ToolSpecWithState(McpServerFeatures.SyncToolSpecification.builder()
+                    .tool(tool)
+                    .callHandler(toolImpl::call)
+                    .build(),
+                toolImpl.state);
+    }
 
-            List<String> listWords = new ArrayList<>();
-            if (oWords instanceof List<?> wordsList) {
-                wordsList.stream()
-                    .filter(Objects::nonNull)
-                    .map(Object::toString)
-                    .forEach(listWords::add);
-            } else if (oWords instanceof String[] wordsArray) {
-                listWords.addAll(Arrays.asList(wordsArray));
-            } else {
-                // Handle comma-separated string
-                String[] wordsArray = oWords.toString().split(" *, *");
-                listWords.addAll(Arrays.asList(wordsArray));
-            }
+    /**
+     * Handles the tool call request.
+     * @param exchange the server exchange
+     * @param request the tool call request
+     * @return the tool call result
+     */
+    McpSchema.CallToolResult call(McpSyncServerExchange exchange, CallToolRequest request) {
+        // Increment call count
+        state.callCount().incrementAndGet();
 
-            LOGGER.info("Glossary lookup for words: " + listWords);
+        // Load glossary data for this call
+        Map<String, GlossaryEntry> mapGlossary = loadGlossary();
+        Map<String, String> mapReferences = loadReferences(mapGlossary);
 
-            Set<String> setKeysProcessed = new HashSet<>();
-            List<String> listTermsFound = new ArrayList<>();
-            StringBuilder sb = new StringBuilder();
+        Map<String, Object> arguments = request.arguments();
 
-            for (String word : listWords) {
-                String key = convertToKey(word);
-                processKey(key, mapReferences, mapGlossary, setKeysProcessed, sb, listTermsFound);
-            }
-
-            LOGGER.info("Keys checked: " + setKeysProcessed);
-            String textResponse;
-            if (sb.isEmpty()) {
-                textResponse = "Unfortunately none of the words is known to the glossary tool";
-            } else {
-                textResponse = sb.toString();
-                LOGGER.info("Terms found: " + listTermsFound);
-            }
-
-            // Prepare structured content for programmatic access
-            Map<String, Object> structuredContent = new HashMap<>();
-            structuredContent.put("status", "success");
-            structuredContent.put("termsFound", listTermsFound);
-            structuredContent.put("wordsRequested", listWords);
-            structuredContent.put("message", sb.isEmpty() ? "No terms found" : "Found " + listTermsFound.size() + " term(s)");
-
+        Object oWords = arguments.get("words");
+        if (oWords == null) {
             return CallToolResult.builder()
-                .isError(false)
-                .addTextContent(textResponse)
-                .structuredContent(structuredContent)
+                .isError(true)
+                .addTextContent("Missing 'words' parameter in request")
                 .build();
-        };
+        }
 
-        return McpServerFeatures.SyncToolSpecification.builder()
-            .tool(tool)
-            .callHandler(handler)
+        List<String> listWords = new ArrayList<>();
+        if (oWords instanceof List<?> wordsList) {
+            wordsList.stream()
+                .filter(Objects::nonNull)
+                .map(Object::toString)
+                .forEach(listWords::add);
+        } else if (oWords instanceof String[] wordsArray) {
+            listWords.addAll(Arrays.asList(wordsArray));
+        } else {
+            // Handle comma-separated string
+            String[] wordsArray = oWords.toString().split(" *, *");
+            listWords.addAll(Arrays.asList(wordsArray));
+        }
+
+        LOGGER.info("Glossary lookup for words: " + listWords);
+
+        Set<String> setKeysProcessed = new HashSet<>();
+        List<String> listTermsFound = new ArrayList<>();
+        StringBuilder sb = new StringBuilder();
+
+        for (String word : listWords) {
+            String key = convertToKey(word);
+            processKey(key, mapReferences, mapGlossary, setKeysProcessed, sb, listTermsFound);
+        }
+
+        LOGGER.info("Keys checked: " + setKeysProcessed);
+        String textResponse;
+        if (sb.isEmpty()) {
+            textResponse = "Unfortunately none of the words is known to the glossary tool";
+        } else {
+            textResponse = sb.toString();
+            LOGGER.info("Terms found: " + listTermsFound);
+            state.callsOk().incrementAndGet();
+        }
+
+        // Prepare structured content for programmatic access
+        Map<String, Object> structuredContent = new HashMap<>();
+        structuredContent.put("status", "success");
+        structuredContent.put("termsFound", listTermsFound);
+        structuredContent.put("wordsRequested", listWords);
+        structuredContent.put("message", sb.isEmpty() ? "No terms found" : "Found " + listTermsFound.size() + " term(s)");
+
+        return CallToolResult.builder()
+            .isError(false)
+            .addTextContent(textResponse)
+            .structuredContent(structuredContent)
             .build();
     }
 

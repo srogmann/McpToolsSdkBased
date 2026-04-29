@@ -6,7 +6,11 @@ import io.modelcontextprotocol.spec.McpSchema;
 import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
 import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
 import io.modelcontextprotocol.spec.McpSchema.JsonSchema;
+import org.rogmann.mcp2sdk.ToolSpecWithState;
+import org.rogmann.mcp2sdk.ToolState;
 import org.rogmann.mcp2sdk.WorkProject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -17,30 +21,31 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.logging.Logger;
-import java.util.function.BiFunction;
 
 /**
  * MCP tool implementation for reading text from a file in a project.
- * Refactored to use McpServerFeatures.SyncToolSpecification.
+ * Refactored to use ToolRegistry pattern with ToolState for statistics.
  * The tool ensures that only allowed projects and safe paths are accessed.
  * It supports limiting the number of lines read from the file.
  */
 public class ReadTextFileTool {
 
-    private static final Logger LOGGER = Logger.getLogger(ReadTextFileTool.class.getName());
+    private static final Logger LOGGER = LoggerFactory.getLogger(ReadTextFileTool.class);
 
     private static final String NAME = "get_file_text_by_path";
 
+    /** tool state (active-flag, statistics) */
+    private final ToolState state;
+
     private ReadTextFileTool() {
-        // Prevent instantiation, this class serves as a factory for the tool specification
+        state = new ToolState();
     }
 
     /**
      * Creates the synchronous tool specification for reading file text.
-     * @return a SyncToolSpecification ready to be registered with an MCP server
+     * @return the tool specification and its state
      */
-    public static McpServerFeatures.SyncToolSpecification createSpecification() {
+    public static ToolSpecWithState createToolInstance() {
         // Define Input Schema properties
         Map<String, Object> properties = new HashMap<>();
 
@@ -64,107 +69,123 @@ public class ReadTextFileTool {
         JsonSchema inputSchema = new JsonSchema("object", properties, requiredFields, null, null, null);
 
         McpSchema.Tool tool = McpSchema.Tool.builder()
-            .name(NAME)
-            .title("Read File Text by Path")
-            .description("Reads text content from a file in the specified project if access conditions are met.")
-            .inputSchema(inputSchema)
-            .build();
+                .name(NAME)
+                .title("Read File Text by Path")
+                .description("Reads text content from a file in the specified project if access conditions are met.")
+                .inputSchema(inputSchema)
+                .build();
 
-        BiFunction<McpSyncServerExchange, CallToolRequest, CallToolResult> handler = (exchange, request) -> {
-            Map<String, Object> arguments = request.arguments();
+        ReadTextFileTool toolImpl = new ReadTextFileTool();
 
-            String projectName = (String) arguments.get("projectName");
-            String pathInProject = (String) arguments.get("pathInProject");
-            Integer maxLinesCount = (Integer) arguments.get("maxLinesCount");
+        return new ToolSpecWithState(McpServerFeatures.SyncToolSpecification.builder()
+                .tool(tool)
+                .callHandler(toolImpl::call)
+                .build(),
+                toolImpl.state);
+    }
 
-            // Use a temporary map to capture potential error from WorkProject.lookupProject
-            Map<String, Object> tempResult = new HashMap<>();
-            WorkProject workProject = WorkProject.lookupProject(projectName, tempResult);
-            
-            if (workProject == null) {
-                String error = (String) tempResult.get("error");
-                return CallToolResult.builder()
+    /**
+     * Handles the tool call request.
+     *
+     * @param exchange the server exchange context
+     * @param request the tool call request
+     * @return the tool call result
+     */
+    private McpSchema.CallToolResult call(McpSyncServerExchange exchange, CallToolRequest request) {
+        // Increment call count
+        state.callCount().incrementAndGet();
+
+        Map<String, Object> arguments = request.arguments();
+
+        String projectName = (String) arguments.get("projectName");
+        String pathInProject = (String) arguments.get("pathInProject");
+        Integer maxLinesCount = (Integer) arguments.get("maxLinesCount");
+
+        // Use a temporary map to capture potential error from WorkProject.lookupProject
+        Map<String, Object> tempResult = new HashMap<>();
+        WorkProject workProject = WorkProject.lookupProject(projectName, tempResult);
+
+        if (workProject == null) {
+            String error = (String) tempResult.get("error");
+            return CallToolResult.builder()
                     .isError(true)
                     .addTextContent(error != null ? error : "Project not found: " + projectName)
                     .build();
-            }
+        }
 
-            Path projectBaseDir = workProject.projectBaseDir();
-            Path projectDir = workProject.projectDir();
+        Path projectBaseDir = workProject.projectBaseDir();
+        Path projectDir = workProject.projectDir();
 
-            Path targetFile = projectDir.resolve(pathInProject).normalize();
-            if (!targetFile.startsWith(projectDir)) {
-                String errorMsg = "Path traversal detected in pathInProject: " + projectName;
-                LOGGER.warning("Path traversal attempt detected: " + pathInProject);
-                return CallToolResult.builder()
+        Path targetFile = projectDir.resolve(pathInProject).normalize();
+        if (!targetFile.startsWith(projectDir)) {
+            String errorMsg = "Path traversal detected in pathInProject: " + projectName;
+            LOGGER.warn("Path traversal attempt detected: " + pathInProject);
+            return CallToolResult.builder()
                     .isError(true)
                     .addTextContent(errorMsg)
                     .build();
-            }
+        }
 
-            if (!Files.exists(targetFile)) {
-                String errorMsg = "File does not exist in project " + projectName + ": " + projectDir.relativize(targetFile);
-                LOGGER.info("File not found: " + targetFile);
-                return CallToolResult.builder()
+        if (!Files.exists(targetFile)) {
+            String errorMsg = "File does not exist in project " + projectName + ": " + projectDir.relativize(targetFile);
+            LOGGER.info("File not found: " + targetFile);
+            return CallToolResult.builder()
                     .isError(true)
                     .addTextContent(errorMsg)
                     .build();
-            }
+        }
 
-            if (Files.isDirectory(targetFile)) {
-                String errorMsg = "Path refers to a directory, not a file: " + projectDir.relativize(targetFile);
-                LOGGER.info("Cannot read text from directory: " + targetFile);
-                return CallToolResult.builder()
+        if (Files.isDirectory(targetFile)) {
+            String errorMsg = "Path refers to a directory, not a file: " + projectDir.relativize(targetFile);
+            LOGGER.info("Cannot read text from directory: " + targetFile);
+            return CallToolResult.builder()
                     .isError(true)
                     .addTextContent(errorMsg)
                     .build();
-            }
+        }
 
-            try (BufferedReader reader = Files.newBufferedReader(targetFile, StandardCharsets.UTF_8)) {
-                StringBuilder content = new StringBuilder();
-                int linesRead = 0;
-                int maxLines = Optional.ofNullable(maxLinesCount).orElse(Integer.MAX_VALUE);
+        try (BufferedReader reader = Files.newBufferedReader(targetFile, StandardCharsets.UTF_8)) {
+            StringBuilder content = new StringBuilder();
+            int linesRead = 0;
+            int maxLines = Optional.ofNullable(maxLinesCount).orElse(Integer.MAX_VALUE);
 
-                while (true) {
-                    String line = reader.readLine();
-                    if (line == null || linesRead >= maxLines) {
-                        break;
-                    }
-                    if (linesRead > 0) {
-                        content.append("\n");
-                    }
-                    content.append(line);
-                    linesRead++;
+            while (true) {
+                String line = reader.readLine();
+                if (line == null || linesRead >= maxLines) {
+                    break;
                 }
+                if (linesRead > 0) {
+                    content.append("\n");
+                }
+                content.append(line);
+                linesRead++;
+            }
 
-                LOGGER.fine("Successfully read " + linesRead + " lines from file: " + targetFile);
-                
-                // Prepare structured content for programmatic access if needed
-                Map<String, Object> structuredContent = new HashMap<>();
-                structuredContent.put("status", "success");
-                structuredContent.put("text", content.toString());
-                structuredContent.put("linesRead", linesRead);
-                structuredContent.put("message", "Successfully read from file: " + projectBaseDir.relativize(targetFile));
+            // Increment success counter
+            state.callsOk().incrementAndGet();
 
-                return CallToolResult.builder()
+            LOGGER.debug("Successfully read " + linesRead + " lines from file: " + targetFile);
+
+            // Prepare structured content for programmatic access if needed
+            Map<String, Object> structuredContent = new HashMap<>();
+            structuredContent.put("status", "success");
+            structuredContent.put("text", content.toString());
+            structuredContent.put("linesRead", linesRead);
+            structuredContent.put("message", "Successfully read from file: " + projectBaseDir.relativize(targetFile));
+
+            return CallToolResult.builder()
                     .isError(false)
                     .addTextContent(content.toString())
                     .structuredContent(structuredContent)
                     .build();
 
-            } catch (IOException e) {
-                String errorMsg = "Failed to read file: " + e.getMessage();
-                LOGGER.severe("IOException while reading file " + targetFile + ": " + e.getMessage());
-                return CallToolResult.builder()
+        } catch (IOException e) {
+            String errorMsg = "Failed to read file: " + e.getMessage();
+            LOGGER.error("IOException while reading file " + targetFile, e);
+            return CallToolResult.builder()
                     .isError(true)
                     .addTextContent(errorMsg)
                     .build();
-            }
-        };
-
-        return McpServerFeatures.SyncToolSpecification.builder()
-            .tool(tool)
-            .callHandler(handler)
-            .build();
+        }
     }
 }

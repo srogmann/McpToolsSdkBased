@@ -29,3 +29,8 @@ webui:
   hasAudio: false
   max:
     #tokens: 240000
+
+# Tool Configuration
+tools:
+  # Comma-separated list of tool names to activate on startup
+  active: "glossary-tool,find_files_by_glob,get_file_text_by_path,edit_file"
