@@ -11,6 +11,7 @@ import org.rogmann.mcp2sdk.ToolState;
 import org.rogmann.mcp2sdk.WorkProject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.core.env.Environment;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -51,6 +52,18 @@ public class ReadDependencyClassSourceTool {
     /** Default Maven command */
     private static final String DEFAULT_MAVEN_COMMAND = "mvn";
 
+    /** Spring Environment for configuration (set by McpConfig) */
+    private static Environment environment;
+
+    /**
+     * Sets the Spring Environment for configuration lookup.
+     * Called by McpConfig during initialization.
+     * @param env the Spring Environment
+     */
+    public static void setEnvironment(Environment env) {
+        environment = env;
+    }
+
     /** Tool state (active-flag, statistics) */
     private final ToolState state;
 
@@ -84,7 +97,7 @@ public class ReadDependencyClassSourceTool {
 
         Map<String, Object> commandProp = new HashMap<>();
         commandProp.put("type", "string");
-        commandProp.put("description", "read_metadata (output only JAR, class size and modification date), read_class_structure (output class structure from .class file), read_source (output source, if source ZIP is available in local M2)");
+        commandProp.put("description", "read_metadata (output only JAR, class size and modification date), read_class_structure (output class structure from .class file), read_source (output source; if source ZIP is missing, it will be downloaded via Maven if tools.maven.autoDownloadSources=true)");
         commandProp.put("enum", List.of("read_metadata", "read_class_structure", "read_source"));
         properties.put("command", commandProp);
 
@@ -105,7 +118,8 @@ public class ReadDependencyClassSourceTool {
         McpSchema.Tool tool = McpSchema.Tool.builder()
                 .name(NAME)
                 .title("Read Dependency Class Source")
-                .description("This tool reads the source of Java classes in Maven dependencies (i.e., in the local M2) from the current classpath.")
+                .description("This tool reads the source of Java classes in Maven dependencies (i.e., in the local M2) from the current classpath. " +
+                        "If source JARs are missing, they can be automatically downloaded via Maven (controlled by system property tools.maven.autoDownloadSources, default: true).")
                 .inputSchema(inputSchema)
                 .build();
 
@@ -161,9 +175,15 @@ public class ReadDependencyClassSourceTool {
                     .build();
         }
 
-        // Get configuration from system properties
-        String m2Path = System.getProperty("tools.m2.path", DEFAULT_M2_PATH);
-        String mavenCommand = System.getProperty("tools.maven.path", DEFAULT_MAVEN_COMMAND);
+        // Get configuration from Spring Environment (with fallback to system properties/defaults)
+        String m2Path = getProperty("tools.maven.m2-path", "tools.maven.m2Path", DEFAULT_M2_PATH);
+        String mavenCommand = getProperty("tools.maven.path", DEFAULT_MAVEN_COMMAND);
+        boolean autoDownloadSources = Boolean.parseBoolean(
+                getProperty("tools.maven.auto-download-sources", "tools.maven.autoDownloadSources", "true"));
+        int timeoutSeconds = Integer.parseInt(
+                getProperty("tools.maven.timeout-seconds", "tools.maven.timeoutSeconds", "120"));
+        LOGGER.info("Configuration: m2Path={}, mavenCommand={}, autoDownloadSources={}, timeoutSeconds={}", 
+                m2Path, mavenCommand, autoDownloadSources, timeoutSeconds);
 
         // Resolve pomPath: try direct path first, then use WorkProject if projectName is provided
         Path pomPath = Path.of(pathPom);
@@ -212,12 +232,13 @@ public class ReadDependencyClassSourceTool {
 
         try {
             // Resolve classpath using Maven
-            Map<String, Path> classpathMap = resolveClasspath(pomPath, mavenCommand);
+            Map<String, Path> classpathMap = resolveClasspath(pomPath, mavenCommand, m2Path);
 
             // Process each requested class
             List<Map<String, Object>> results = new ArrayList<>();
             for (String className : classNames) {
-                Map<String, Object> classResult = processClass(className, command, classpathMap, m2Path, startLine, endLine);
+                Map<String, Object> classResult = processClass(className, command, classpathMap, m2Path, startLine, endLine, 
+                        pomPath, mavenCommand, autoDownloadSources, timeoutSeconds);
                 results.add(classResult);
             }
 
@@ -288,7 +309,7 @@ public class ReadDependencyClassSourceTool {
     /**
      * Resolves the Maven classpath by executing mvn dependency:build-classpath
      */
-    private Map<String, Path> resolveClasspath(Path pomPath, String mavenCommand) throws IOException {
+    private Map<String, Path> resolveClasspath(Path pomPath, String mavenCommand, String m2Path) throws IOException {
         Map<String, Path> classpathMap = new HashMap<>();
 
         // Create temp file in system temp directory
@@ -336,8 +357,8 @@ public class ReadDependencyClassSourceTool {
                 for (String jarPath : jars) {
                     Path jar = Path.of(jarPath);
                     if (Files.exists(jar)) {
-                        // Extract artifact info from path
-                        ArtifactInfo artifactInfo = extractArtifactInfo(jar);
+                        // Extract artifact info from path (pass m2Path to strip prefix)
+                        ArtifactInfo artifactInfo = extractArtifactInfo(jar, m2Path);
                         if (artifactInfo != null) {
                             String key = artifactInfo.groupId + ":" + artifactInfo.artifactId;
                             classpathMap.put(key, jar);
@@ -356,10 +377,37 @@ public class ReadDependencyClassSourceTool {
 
     /**
      * Extracts artifact information from a JAR path
+     * @param jarPath the path to the JAR file
+     * @return the artifact info, or null if the path doesn't match the expected pattern
      */
     private ArtifactInfo extractArtifactInfo(Path jarPath) {
+        return extractArtifactInfo(jarPath, null);
+    }
+
+    /**
+     * Extracts artifact information from a JAR path
+     * @param jarPath the path to the JAR file
+     * @param m2Path optional path to the M2 repository (used to strip the prefix from jarPath)
+     * @return the artifact info, or null if the path doesn't match the expected pattern
+     */
+    private ArtifactInfo extractArtifactInfo(Path jarPath, String m2Path) {
         String pathStr = jarPath.toString();
-        // Pattern: .../groupId/artifactId/version/artifactId-version.jar
+        
+        // If m2Path is provided, strip it from the path to get the relative path
+        if (m2Path != null && !m2Path.isBlank()) {
+            Path m2Repo = Path.of(m2Path);
+            String m2RepoStr = m2Repo.toString();
+            if (pathStr.startsWith(m2RepoStr)) {
+                pathStr = pathStr.substring(m2RepoStr.length());
+                // Remove leading separator
+                if (pathStr.startsWith(File.separator)) {
+                    pathStr = pathStr.substring(1);
+                }
+            }
+        }
+        
+        // Pattern: groupId/artifactId/version/artifactId-version.jar
+        // groupId can have multiple parts (e.g., org/slf4j or com/fasterxml/jackson/core)
         Pattern pattern = Pattern.compile("(.+)/([^/]+)/([^/]+)/\\2-\\3(?:-sources)?\\.jar$");
         Matcher matcher = pattern.matcher(pathStr);
 
@@ -380,7 +428,9 @@ public class ReadDependencyClassSourceTool {
      */
     private Map<String, Object> processClass(String className, String command,
                                               Map<String, Path> classpathMap, String m2Path,
-                                              Integer startLine, Integer endLine) {
+                                              Integer startLine, Integer endLine,
+                                              Path pomPath, String mavenCommand,
+                                              boolean autoDownloadSources, int timeoutSeconds) {
         Map<String, Object> result = new HashMap<>();
         result.put("className", className);
         result.put("command", command);
@@ -388,7 +438,8 @@ public class ReadDependencyClassSourceTool {
         try {
             // For read_source command, prefer sources JAR; otherwise use binary JAR
             boolean preferSources = "read_source".equals(command);
-            JarLocation jarLocation = findJarForClass(className, classpathMap, m2Path, preferSources);
+            JarLocation jarLocation = findJarForClass(className, classpathMap, m2Path, preferSources, pomPath, mavenCommand,
+                    autoDownloadSources, timeoutSeconds);
 
             if (jarLocation == null) {
                 result.put("status", "not_found");
@@ -432,8 +483,14 @@ public class ReadDependencyClassSourceTool {
      * @param classpathMap map of artifact coordinates to JAR paths (from Maven classpath)
      * @param m2Path path to the M2 repository
      * @param preferSources if true, search for sources JAR first; otherwise prefer binary JAR from classpath
+     * @param pomPath path to the pom.xml (used for downloading sources)
+     * @param mavenCommand Maven command to use
+     * @param autoDownloadSources whether to automatically download source JARs if missing
+     * @param timeoutSeconds timeout in seconds for Maven operations
      */
-    private JarLocation findJarForClass(String className, Map<String, Path> classpathMap, String m2Path, boolean preferSources) throws IOException {
+    private JarLocation findJarForClass(String className, Map<String, Path> classpathMap, String m2Path, 
+                                         boolean preferSources, Path pomPath, String mavenCommand,
+                                         boolean autoDownloadSources, int timeoutSeconds) throws IOException {
         String classNamePath = className.replace(".", "/") + ".java";
         String classNameClass = className.replace(".", "/") + ".class";
 
@@ -447,6 +504,27 @@ public class ReadDependencyClassSourceTool {
                         if (hasEntryInJar(jarPath, classNamePath)) {
                             LOGGER.debug("Found sources JAR: {}", jarPath);
                             return new JarLocation(jarPath, true);
+                        }
+                    }
+                }
+            }
+            
+            // Source JAR not found - try to download it if auto-download is enabled
+            if (autoDownloadSources && pomPath != null) {
+                LOGGER.info("Source JAR not found for class {}, attempting to download...", className);
+                ArtifactInfo artifactInfo = findArtifactForClass(className, classpathMap, m2Path);
+                if (artifactInfo != null) {
+                    boolean downloaded = downloadSourceJar(artifactInfo, mavenCommand, pomPath, timeoutSeconds);
+                    if (downloaded) {
+                        // Retry search after download
+                        try (var stream = Files.walk(m2Repo)) {
+                            for (Path jarPath : stream.filter(p -> p.toString().endsWith("-sources.jar"))
+                                    .toList()) {
+                                if (hasEntryInJar(jarPath, classNamePath)) {
+                                    LOGGER.info("Successfully downloaded and found sources JAR: {}", jarPath);
+                                    return new JarLocation(jarPath, true);
+                                }
+                            }
                         }
                     }
                 }
@@ -476,6 +554,116 @@ public class ReadDependencyClassSourceTool {
         }
 
         return null;
+    }
+
+    /**
+     * Finds artifact information for a class by searching in classpath JARs
+     */
+    private ArtifactInfo findArtifactForClass(String className, Map<String, Path> classpathMap, String m2Path) throws IOException {
+        String classNameClass = className.replace(".", "/") + ".class";
+        
+        // First try to find in classpath map
+        for (Map.Entry<String, Path> entry : classpathMap.entrySet()) {
+            if (hasClassInJar(entry.getValue(), className)) {
+                String[] parts = entry.getKey().split(":");
+                if (parts.length >= 2) {
+                    // Extract version from JAR path
+                    String version = extractVersionFromJarPath(entry.getValue());
+                    return new ArtifactInfo(parts[0], parts[1], version);
+                }
+            }
+        }
+        
+        // Fallback: search M2 for the binary JAR and extract artifact info
+        Path m2Repo = Path.of(m2Path);
+        if (Files.isDirectory(m2Repo)) {
+            try (var stream = Files.walk(m2Repo)) {
+                for (Path jarPath : stream.filter(p -> p.toString().endsWith(".jar") && !p.toString().endsWith("-sources.jar"))
+                        .toList()) {
+                    if (hasEntryInJar(jarPath, classNameClass)) {
+                        return extractArtifactInfo(jarPath, m2Path);
+                    }
+                }
+            }
+        }
+        
+        return null;
+    }
+
+    /**
+     * Extracts version from a JAR path
+     */
+    private String extractVersionFromJarPath(Path jarPath) {
+        String pathStr = jarPath.toString();
+        Pattern pattern = Pattern.compile("(.+)/([^/]+)/([^/]+)/\\2-\\3\\.jar$");
+        Matcher matcher = pattern.matcher(pathStr);
+        if (matcher.find()) {
+            return matcher.group(3);
+        }
+        // Fallback: try to extract from filename
+        String fileName = jarPath.getFileName().toString();
+        Matcher matcher2 = Pattern.compile("(.+)-([0-9][^-]*)(?:-sources)?\\.jar$").matcher(fileName);
+        if (matcher2.find()) {
+            return matcher2.group(2);
+        }
+        return "unknown";
+    }
+
+    /**
+     * Downloads source JAR for an artifact using Maven
+     * @param artifactInfo the artifact coordinates
+     * @param mavenCommand Maven command to use
+     * @param pomPath path to pom.xml (used as working directory)
+     * @param timeoutSeconds timeout in seconds for the Maven operation
+     * @return true if download was successful, false otherwise
+     */
+    private boolean downloadSourceJar(ArtifactInfo artifactInfo, String mavenCommand, Path pomPath, int timeoutSeconds) {
+        LOGGER.info("Downloading source JAR for {}:{}", artifactInfo.groupId(), artifactInfo.artifactId());
+        
+        // Use mvn dependency:get to download specific source JAR
+        String artifactCoord = String.format("%s:%s:%s:jar:sources", 
+                artifactInfo.groupId(), artifactInfo.artifactId(), artifactInfo.version());
+        
+        ProcessBuilder pb = new ProcessBuilder(
+                mavenCommand,
+                "dependency:get",
+                "-Dartifact=" + artifactCoord,
+                "-q"
+        );
+        
+        // Use pom directory as working directory
+        Path pomDir = pomPath.getParent();
+        pb.directory(pomDir != null ? pomDir.toFile() : new File("."));
+        pb.redirectErrorStream(true);
+        
+        try {
+            Process process = pb.start();
+            boolean isOk = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
+            
+            if (!isOk) {
+                LOGGER.warn("Maven download timed out after {} seconds", timeoutSeconds);
+                process.destroyForcibly();
+                return false;
+            }
+            
+            if (process.exitValue() != 0) {
+                String errorOutput = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))
+                        .lines().collect(Collectors.joining("\n"));
+                LOGGER.warn("Maven download failed with exit code {}: {}", process.exitValue(), errorOutput);
+                return false;
+            }
+            
+            LOGGER.info("Successfully downloaded source JAR for {}:{}", artifactInfo.groupId(), artifactInfo.artifactId());
+            return true;
+            
+        } catch (IOException | InterruptedException e) {
+            LOGGER.warn("Failed to download source JAR for {}:{}: {}", 
+                    artifactInfo.groupId(), artifactInfo.artifactId(), e.getMessage());
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            return false;
+        }
     }
 
     /**
@@ -736,6 +924,56 @@ public class ReadDependencyClassSourceTool {
                 }
             }
         }
+    }
+
+    /**
+     * Gets a property value from Spring Environment or falls back to default.
+     * Tries multiple property names (for kebab-case and camelCase support).
+     * @param keys the property keys to try (in order of preference)
+     * @param defaultValue the default value if not found
+     * @return the property value or default
+     */
+    private static String getProperty(String[] keys, String defaultValue) {
+        if (environment != null) {
+            for (String key : keys) {
+                String value = environment.getProperty(key);
+                if (value != null) {
+                    LOGGER.debug("Resolved property {} = {}", key, value);
+                    return value;
+                }
+            }
+        }
+        // Fallback to system property
+        for (String key : keys) {
+            String value = System.getProperty(key);
+            if (value != null) {
+                LOGGER.debug("Resolved system property {} = {}", key, value);
+                return value;
+            }
+        }
+        LOGGER.debug("Using default value for properties {}: {}", String.join(",", keys), defaultValue);
+        return defaultValue;
+    }
+
+    /**
+     * Gets a property value from Spring Environment or falls back to default.
+     * @param key the property key
+     * @param defaultValue the default value if not found
+     * @return the property value or default
+     */
+    private static String getProperty(String key, String defaultValue) {
+        return getProperty(new String[]{key}, defaultValue);
+    }
+
+    /**
+     * Gets a property value from Spring Environment or falls back to default.
+     * @param key1 first property key to try (e.g., kebab-case)
+     * @param key2 second property key to try (e.g., camelCase)
+     * @param defaultValue the default value if not found
+     * @return the property value or default
+     */
+    private static String getProperty(String key1, String key2, String defaultValue) {
+        return getProperty(new String[]{key1, key2}, defaultValue);
     }
 
     /**

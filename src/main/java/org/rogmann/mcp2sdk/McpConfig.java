@@ -15,9 +15,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.boot.web.servlet.ServletRegistrationBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.env.Environment;
 import tools.jackson.databind.json.JsonMapper;
-
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Spring configuration class for the Model Context Protocol (MCP) server.
@@ -78,12 +77,14 @@ public class McpConfig {
     }
 
     // Helper method to populate the registry with available tools
-    private void populateToolRegistry(ToolRegistry registry) {
+    private void populateToolRegistry(ToolRegistry registry, Environment environment) {
         registry.registerToolDefinition(CreateNewFileTool.createToolInstance());
         registry.registerToolDefinition(ReadTextFileTool.createToolInstance());
         registry.registerToolDefinition(EditFileTool.createToolInstance());
         registry.registerToolDefinition(FindFilesByGlobTool.createToolInstance());
 
+        // Set Environment for ReadDependencyClassSourceTool before creating instance
+        ReadDependencyClassSourceTool.setEnvironment(environment);
         registry.registerToolDefinition(ReadDependencyClassSourceTool.createToolInstance());
 
         registry.registerToolDefinition(GlossaryTool.createToolInstance());
@@ -96,7 +97,8 @@ public class McpConfig {
     @Bean
     public McpSyncServer streamableMcpServer(
             HttpServletStreamableServerTransportProvider transportProvider, 
-            ToolRegistry registry) {
+            ToolRegistry registry,
+            Environment environment) {
         LOG.info("Building Streamable HTTP MCP Server on /mcp");
 
         var capabilities = McpSchema.ServerCapabilities.builder()
@@ -113,7 +115,7 @@ public class McpConfig {
         // For this config, we rely on ToolRegistry's PostConstruct or a separate initializer.
         // To ensure tools exist before server starts using them:
         if (registry.getMapTools().isEmpty()) {
-            populateToolRegistry(registry);
+            populateToolRegistry(registry, environment);
         }
         
         registry.registerServer(server);
