@@ -56,9 +56,12 @@ public class WebUiProxy {
     private static final String PROP_HAS_AUDIO = "webui.hasAudio";
     private static final String PROP_MAX_TOKENS = "webui.max.tokens";
 
-    /** Path to static web content */
-    @Value("${" + PROP_WEBUI_PUBLIC_PATH + ":./webui/public}")
+    /** Path to static web content (file system) */
+    @Value("${" + PROP_WEBUI_PUBLIC_PATH + ":}")
     private String publicPath;
+
+    /** Flag to indicate if classpath resources should be used */
+    private boolean useClasspathResources = false;
 
     /** Name of the LLM model */
     @Value("${" + PROP_MODEL_NAME + ":unknown}")
@@ -113,63 +116,83 @@ public class WebUiProxy {
 
         LOG.info("{} GET static resource: {}", LocalDateTime.now(), path);
 
-        File requestedFile = new File(publicPath + path);
-        File gzFile = new File(publicPath + path + ".gz");
-
-        // Security check for path traversal
-        try {
-            File canonicalFile = requestedFile.getCanonicalFile();
-            Path publicPathCanonical = Paths.get(publicPath).toRealPath();
-            if (!canonicalFile.toPath().startsWith(publicPathCanonical)) {
-                LOG.warn("Forbidden path traversal attempt: {} -> {}", path, canonicalFile);
-                return ResponseEntity.status(403).body("Forbidden path".getBytes(StandardCharsets.UTF_8));
-            }
-        } catch (IOException e) {
-            LOG.error("Error accessing file: {}", requestedFile, e);
-            return ResponseEntity.status(500).body("Error accessing file".getBytes(StandardCharsets.UTF_8));
-        }
-
-        // Determine which file to serve
-        File serveFile;
-        if (gzFile.exists()) {
-            serveFile = gzFile;
-        } else if (requestedFile.exists()) {
-            serveFile = requestedFile;
-        } else {
-            return ResponseEntity.status(404).body("File not found".getBytes(StandardCharsets.UTF_8));
-        }
-
-        // Determine content type based on extension
-        String ext = path.substring(path.lastIndexOf('.') + 1);
-        String contentType = "application/octet-stream";
-        switch (ext.toLowerCase()) {
-            case "html" -> contentType = "text/html";
-            case "css" -> contentType = "text/css";
-            case "js", "mjs" -> contentType = "text/javascript";
-            case "ico" -> contentType = "image/x-icon";
-            case "png" -> contentType = "image/png";
-            case "jpg", "jpeg" -> contentType = "image/jpeg";
-            case "svg" -> contentType = "image/svg+xml";
-            case "json" -> contentType = "application/json";
-            default -> { /* keep default */ }
-        }
+        // Determine if we should use classpath resources
+        boolean useClasspath = shouldUseClasspathResources();
 
         try {
             byte[] content;
-            if (serveFile == gzFile) {
-                // Decompress gz file
-                try (InputStream fis = new FileInputStream(gzFile);
-                     GZIPInputStream gis = new GZIPInputStream(fis);
-                     ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
-                    byte[] buffer = new byte[4096];
-                    int read;
-                    while ((read = gis.read(buffer)) != -1) {
-                        baos.write(buffer, 0, read);
+            boolean isGzipped = false;
+
+            if (useClasspath) {
+                // Load from classpath (JAR) - resources are in public/chat/ to avoid conflict with Spring Boot's static resource handling
+                String resourcePath = "public/chat" + path;
+                String gzResourcePath = resourcePath + ".gz";
+
+                // Try gzipped version first
+                InputStream gzStream = getClass().getClassLoader().getResourceAsStream(gzResourcePath);
+                if (gzStream != null) {
+                    try (GZIPInputStream gis = new GZIPInputStream(gzStream)) {
+                        content = readAllBytes(gis);
                     }
-                    content = baos.toByteArray();
+                    isGzipped = true;
+                    LOG.debug("Loaded gzipped resource from classpath: {}", gzResourcePath);
+                } else {
+                    // Try uncompressed version
+                    InputStream resourceStream = getClass().getClassLoader().getResourceAsStream(resourcePath);
+                    if (resourceStream == null) {
+                        return ResponseEntity.status(404).body("File not found".getBytes(StandardCharsets.UTF_8));
+                    }
+                    content = readAllBytes(resourceStream);
+                    LOG.debug("Loaded resource from classpath: {}", resourcePath);
                 }
             } else {
-                content = Files.readAllBytes(serveFile.toPath());
+                // Load from file system
+                File requestedFile = new File(publicPath + path);
+                File gzFile = new File(publicPath + path + ".gz");
+
+                // Security check for path traversal
+                File canonicalFile = requestedFile.getCanonicalFile();
+                Path publicPathCanonical = Paths.get(publicPath).toRealPath();
+                if (!canonicalFile.toPath().startsWith(publicPathCanonical)) {
+                    LOG.warn("Forbidden path traversal attempt: {} -> {}", path, canonicalFile);
+                    return ResponseEntity.status(403).body("Forbidden path".getBytes(StandardCharsets.UTF_8));
+                }
+
+                // Determine which file to serve
+                File serveFile;
+                if (gzFile.exists()) {
+                    serveFile = gzFile;
+                    isGzipped = true;
+                } else if (requestedFile.exists()) {
+                    serveFile = requestedFile;
+                } else {
+                    return ResponseEntity.status(404).body("File not found".getBytes(StandardCharsets.UTF_8));
+                }
+
+                if (isGzipped) {
+                    // Decompress gz file
+                    try (InputStream fis = new FileInputStream(gzFile);
+                         GZIPInputStream gis = new GZIPInputStream(fis)) {
+                        content = readAllBytes(gis);
+                    }
+                } else {
+                    content = Files.readAllBytes(serveFile.toPath());
+                }
+            }
+
+            // Determine content type based on extension
+            String ext = path.substring(path.lastIndexOf('.') + 1);
+            String contentType = "application/octet-stream";
+            switch (ext.toLowerCase()) {
+                case "html" -> contentType = "text/html";
+                case "css" -> contentType = "text/css";
+                case "js", "mjs" -> contentType = "text/javascript";
+                case "ico" -> contentType = "image/x-icon";
+                case "png" -> contentType = "image/png";
+                case "jpg", "jpeg" -> contentType = "image/jpeg";
+                case "svg" -> contentType = "image/svg+xml";
+                case "json" -> contentType = "application/json";
+                default -> { /* keep default */ }
             }
 
             HttpHeaders headers = new HttpHeaders();
@@ -178,9 +201,27 @@ public class WebUiProxy {
 
             return ResponseEntity.ok().headers(headers).body(content);
         } catch (IOException e) {
-            LOG.error("Error reading file: {}", serveFile, e);
-            return ResponseEntity.status(500).body("Error reading file".getBytes(StandardCharsets.UTF_8));
+            LOG.error("Error reading resource: {}", path, e);
+            return ResponseEntity.status(500).body("Error reading resource".getBytes(StandardCharsets.UTF_8));
         }
+    }
+
+    /**
+     * Determines whether to use classpath resources or file system.
+     * Uses classpath if publicPath is empty or does not exist as a directory.
+     */
+    private boolean shouldUseClasspathResources() {
+        if (publicPath == null || publicPath.isBlank()) {
+            useClasspathResources = true;
+            return true;
+        }
+        Path path = Paths.get(publicPath);
+        if (!Files.exists(path) || !Files.isDirectory(path)) {
+            useClasspathResources = true;
+            return true;
+        }
+        useClasspathResources = false;
+        return false;
     }
 
     /**
@@ -559,6 +600,25 @@ public class WebUiProxy {
         while ((bytesRead = in.read(buffer)) != -1) {
             out.write(buffer, 0, bytesRead);
             out.flush(); // Critical for SSE: push chunks immediately
+        }
+    }
+
+    /**
+     * Reads all bytes from an InputStream into a byte array.
+     * Uses buffered reading with 4KB buffer.
+     *
+     * @param inputStream the input stream to read from
+     * @return byte array containing all data from the stream
+     * @throws IOException if an I/O error occurs
+     */
+    private byte[] readAllBytes(InputStream inputStream) throws IOException {
+        try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[4096];
+            int read;
+            while ((read = inputStream.read(buffer)) != -1) {
+                baos.write(buffer, 0, read);
+            }
+            return baos.toByteArray();
         }
     }
 }
