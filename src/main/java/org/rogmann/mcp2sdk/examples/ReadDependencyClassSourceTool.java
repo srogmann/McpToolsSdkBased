@@ -604,20 +604,33 @@ public class ReadDependencyClassSourceTool {
                 return;
             }
 
+            // First, count total lines using Stream
+            long totalLines;
+            try (BufferedReader countReader = new BufferedReader(
+                    new InputStreamReader(jarFile.getInputStream(entry), StandardCharsets.UTF_8))) {
+                totalLines = countReader.lines().count();
+            }
+
+            // Build the content with header information
             StringBuilder content = new StringBuilder();
-            int lineNum = 0;
+            content.append("--- File: ").append(sourceEntry).append(" ---\n");
+            content.append("Lines ").append(startLine).append("-").append(Math.min(endLine, totalLines)).append(" of ").append(totalLines).append("\n\n");
+
+            int linesRead = 0;
+            int currentLine = 0;
             try (BufferedReader reader = new BufferedReader(
                     new InputStreamReader(jarFile.getInputStream(entry), StandardCharsets.UTF_8))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
-                    lineNum++;
-                    if (lineNum >= startLine && lineNum <= endLine) {
-                        if (lineNum > startLine) {
+                    currentLine++;
+                    if (currentLine >= startLine && currentLine <= endLine) {
+                        if (linesRead > 0) {
                             content.append("\n");
                         }
                         content.append(line);
+                        linesRead++;
                     }
-                    if (lineNum >= endLine) {
+                    if (currentLine >= endLine) {
                         break;
                     }
                 }
@@ -626,7 +639,19 @@ public class ReadDependencyClassSourceTool {
             result.put("status", "success");
             result.put("structure", content.toString());
             result.put("type", "source");
-            result.put("linesRead", Math.min(endLine - startLine + 1, lineNum));
+            result.put("linesRead", linesRead);
+            result.put("totalLines", totalLines);
+            result.put("startLine", startLine);
+            result.put("endLine", Math.min(endLine, (int) totalLines));
+
+            if (totalLines > endLine) {
+                result.put("truncated", true);
+                result.put("message", String.format("Showing lines %d-%d of %d total. Use start_line=%d to continue.",
+                        startLine, endLine, totalLines, endLine + 1));
+            } else {
+                result.put("truncated", false);
+                result.put("message", String.format("File has %d lines total.", totalLines));
+            }
         }
     }
 
@@ -671,7 +696,18 @@ public class ReadDependencyClassSourceTool {
                 return;
             }
 
+            // First, count total lines using Stream
+            long totalLines;
+            try (BufferedReader countReader = new BufferedReader(
+                    new InputStreamReader(jarFile.getInputStream(entry), StandardCharsets.UTF_8))) {
+                totalLines = countReader.lines().count();
+            }
+
+            // Build the source content with header information
             StringBuilder content = new StringBuilder();
+            content.append("--- File: ").append(sourceEntry).append(" ---\n");
+            content.append("Lines ").append(startLine).append("-").append(Math.min(endLine, totalLines)).append(" of ").append(totalLines).append("\n\n");
+
             int linesRead = 0;
             int currentLine = 0;
 
@@ -696,18 +732,18 @@ public class ReadDependencyClassSourceTool {
             result.put("status", "success");
             result.put("source", content.toString());
             result.put("linesRead", linesRead);
-            result.put("totalLines", currentLine);
+            result.put("totalLines", totalLines);
             result.put("startLine", startLine);
-            result.put("endLine", Math.min(endLine, currentLine));
+            result.put("endLine", Math.min(endLine, (int) totalLines));
             result.put("jarPath", jarPath.toString());
 
-            if (currentLine > endLine) {
+            if (totalLines > endLine) {
                 result.put("truncated", true);
                 result.put("message", String.format("Showing lines %d-%d of %d total. Use start_line=%d to continue.",
-                        startLine, endLine, currentLine, endLine + 1));
+                        startLine, endLine, totalLines, endLine + 1));
             } else {
                 result.put("truncated", false);
-                result.put("message", String.format("File has %d lines total.", currentLine));
+                result.put("message", String.format("File has %d lines total.", totalLines));
             }
         }
     }
