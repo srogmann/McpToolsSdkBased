@@ -21,6 +21,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Stream;
 
 /**
  * MCP tool implementation for reading text from a file in a project.
@@ -150,8 +151,10 @@ public class ReadTextFileTool {
                     .build();
         }
 
-       try (BufferedReader reader = Files.newBufferedReader(targetFile, StandardCharsets.UTF_8)) {
-            StringBuilder content = new StringBuilder();
+        try (Stream<String> linesStream = Files.lines(targetFile, StandardCharsets.UTF_8)) {
+            // First, count total lines in the file
+            long totalLines = linesStream.count();
+
             int start = Optional.ofNullable(startLine).orElse(1);
             int end = Optional.ofNullable(endLine).orElse(start + 999);
 
@@ -162,49 +165,57 @@ public class ReadTextFileTool {
                 end = start + 999;
             }
 
-            int linesRead = 0;
-            int currentLine = 0;
-            String line;
-            while ((line = reader.readLine()) != null) {
-                currentLine++;
-                if (currentLine >= start && currentLine <= end) {
-                    if (linesRead > 0) {
-                        content.append("\n");
+            // Build the text content with header information
+            StringBuilder content = new StringBuilder();
+            content.append("--- File: ").append(projectBaseDir.relativize(targetFile)).append(" ---\n");
+            content.append("Lines ").append(start).append("-").append(Math.min(end, (int) totalLines)).append(" of ").append(totalLines).append("\n\n");
+
+            try (BufferedReader reader = Files.newBufferedReader(targetFile, StandardCharsets.UTF_8)) {
+                int linesRead = 0;
+                int currentLine = 0;
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    currentLine++;
+                    if (currentLine >= start && currentLine <= end) {
+                        if (linesRead > 0) {
+                            content.append("\n");
+                        }
+                        content.append(line);
+                        linesRead++;
                     }
-                    content.append(line);
-                    linesRead++;
+                    if (currentLine >= end) {
+                        break;
+                    }
                 }
-                if (currentLine >= end) {
-                    break;
+
+                // Increment success counter
+                state.callsOk().incrementAndGet();
+
+                LOGGER.debug("Successfully read " + linesRead + " lines from file: " + targetFile + " (total: " + totalLines + ")");
+
+                // Prepare structured content for programmatic access if needed
+                Map<String, Object> structuredContent = new HashMap<>();
+                structuredContent.put("status", "success");
+                structuredContent.put("text", content.toString());
+                structuredContent.put("linesRead", linesRead);
+                structuredContent.put("startLine", start);
+                structuredContent.put("endLine", Math.min(end, currentLine));
+                structuredContent.put("totalLines", totalLines);
+                structuredContent.put("message", "Successfully read from file: " + projectBaseDir.relativize(targetFile));
+
+                if (currentLine > end) {
+                    structuredContent.put("truncated", true);
+                    structuredContent.put("nextStartLine", end + 1);
+                } else {
+                    structuredContent.put("truncated", false);
                 }
+
+                return CallToolResult.builder()
+                        .isError(false)
+                        .addTextContent(content.toString())
+                        .structuredContent(structuredContent)
+                        .build();
             }
-
-            // Increment success counter
-            state.callsOk().incrementAndGet();
-
-            LOGGER.debug("Successfully read " + linesRead + " lines from file: " + targetFile);
-
-           // Prepare structured content for programmatic access if needed
-            Map<String, Object> structuredContent = new HashMap<>();
-            structuredContent.put("status", "success");
-            structuredContent.put("text", content.toString());
-            structuredContent.put("linesRead", linesRead);
-            structuredContent.put("startLine", start);
-            structuredContent.put("endLine", Math.min(end, currentLine));
-            structuredContent.put("message", "Successfully read from file: " + projectBaseDir.relativize(targetFile));
-
-            if (currentLine > end) {
-                structuredContent.put("truncated", true);
-                structuredContent.put("nextStartLine", end + 1);
-            } else {
-                structuredContent.put("truncated", false);
-            }
-
-            return CallToolResult.builder()
-                    .isError(false)
-                    .addTextContent(content.toString())
-                    .structuredContent(structuredContent)
-                    .build();
 
         } catch (IOException e) {
             String errorMsg = "Failed to read file: " + e.getMessage();
