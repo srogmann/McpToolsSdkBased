@@ -24,6 +24,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * MCP tool for calling an LLM to send a prompt or conduct a conversation within an MCP session.
@@ -133,12 +134,13 @@ public class CallLlmTool {
         state.callCount().incrementAndGet();
 
         // Use the session ID managed by the MCP SDK
-        String sessionId = exchange.sessionId();
-        if (sessionId == null || sessionId.isBlank()) {
+        String exSessionId = exchange.sessionId();
+        if (exSessionId == null || exSessionId.isBlank()) {
             LOG.warn("MCP SDK provided a null or blank session ID.");
             // Fallback to a random ID to avoid crashes, although SDK should provide one
-            sessionId = UUID.randomUUID().toString();
+            exSessionId = UUID.randomUUID().toString();
         }
+        final String sessionId = exSessionId;
 
         // Retrieve or create the session
         CallLlmSession session = sessions.computeIfAbsent(sessionId, k -> {
@@ -186,65 +188,73 @@ public class CallLlmTool {
             String requestBody = jsonMapper.writeValueAsString(llmRequest);
             LOG.debug("Request to LLM for session {}: {}", sessionId, requestBody);
 
-            // Execute HTTP request
-            String responseBody = sendHttpRequest(requestBody);
-            if (responseBody == null) {
+            // Execute HTTP request and parse response (Supports both SSE and standard JSON)
+            StringBuilder reasoningBuilder = new StringBuilder();
+            StringBuilder assistantBuilder = new StringBuilder();
+            StringBuilder fullResponseBody = new StringBuilder();
+            AtomicReference<JsonNode> refOutput = new AtomicReference<>();
+
+            class SseState {
+                boolean isSse = false;
+                int reasonCount = 0;
+                Instant tsLastProgress = Instant.MIN;
+            }
+            SseState sseState = new SseState();
+
+            sendHttpRequest(requestBody, line -> {
+                fullResponseBody.append(line).append("\n");
+                if (!sseState.isSse && (line.startsWith("event:") || line.startsWith("data:"))) {
+                    sseState.isSse = true;
+                }
+                if (sseState.isSse && line.startsWith("data: ")) {
+                    try {
+                        String data = line.substring(6).trim();
+                        if (data.isEmpty()) return;
+                        JsonNode node = jsonMapper.readTree(data);
+                        String type = node.path("type").asString();
+                        if ("response.reasoning_text.delta".equals(type)) {
+                            reasoningBuilder.append(node.path("delta").asString());
+                            sseState.reasonCount++;
+                            Instant tsNow = Instant.now();
+                            if (Duration.between(sseState.tsLastProgress, tsNow).getSeconds() >= 2) {
+                                String progressToken = sessionId + '-' + sseState.reasonCount;
+                                int len = reasoningBuilder.length();
+                                String msg = len < 80 ? reasoningBuilder.toString() : "[...]" + reasoningBuilder.substring(len - 80, len);
+                                String progressMsg = "Reasoning %d: %s".formatted(sseState.reasonCount, msg);
+                                McpSchema.ProgressNotification progress = new McpSchema.ProgressNotification(progressToken,
+                                        sseState.reasonCount, null, progressMsg);
+                                exchange.progressNotification(progress);
+                                LOG.debug("Progress {}: {}", sessionId, progressMsg);
+                                sseState.tsLastProgress = tsNow;
+                            }
+                        } else if ("response.output_text.delta".equals(type)) {
+                            assistantBuilder.append(node.path("delta").asString());
+                        } else if ("response.completed".equals(type)) {
+                            refOutput.set(node.path("response").path("output"));
+                        }
+                    } catch (RuntimeException e) {
+                        LOG.warn("Failed to parse SSE data line: {}", line, e);
+                    }
+                }
+            });
+
+            String responseBody = fullResponseBody.toString();
+            if (responseBody.isBlank()) {
                 return CallToolResult.builder()
                     .isError(true)
                     .addTextContent("No response received from the LLM service.")
                     .build();
             }
 
-            // Parse the Responses API response (Supports both SSE and standard JSON)
             LOG.debug("Response in session {}: {}", sessionId, responseBody);
-            
-            StringBuilder reasoningBuilder = new StringBuilder();
-            StringBuilder assistantBuilder = new StringBuilder();
-            JsonNode output = null;
 
-            if (responseBody.trim().startsWith("event:") || responseBody.trim().startsWith("data:")) {
-                // SSE Parsing
-                String[] lines = responseBody.split("\n");
-                int reasonCount = 0;
-                Instant tsLastProgress = Instant.MIN;
-                for (String line : lines) {
-                    if (line.startsWith("data: ")) {
-                        try {
-                            String data = line.substring(6).trim();
-                            if (data.isEmpty()) continue;
-                            JsonNode node = jsonMapper.readTree(data);
-                            String type = node.path("type").asString();
-                            if ("response.reasoning_text.delta".equals(type)) {
-                                reasoningBuilder.append(node.path("delta").asString());
-                                reasonCount++;
-                                Instant tsNow = Instant.now();
-                                if (Duration.between(tsLastProgress, tsNow).getSeconds() >= 2) {
-                                    String progressToken = sessionId + '-' + reasonCount;
-                                    int len = reasoningBuilder.length();
-                                    String msg = len < 80 ? reasoningBuilder.toString() : "[...]" + reasoningBuilder.substring(len - 80, len);
-                                    String progressMsg = "Reasoning %d: %s".formatted(reasonCount, msg);
-                                    McpSchema.ProgressNotification progress = new McpSchema.ProgressNotification(progressToken,
-                                            reasonCount, null, progressMsg);
-                                    exchange.progressNotification(progress);
-                                    LOG.debug("Progress {}: {}", sessionId, progressMsg);
-                                    tsLastProgress = tsNow;
-                                }
-                            } else if ("response.output_text.delta".equals(type)) {
-                                assistantBuilder.append(node.path("delta").asString());
-                            } else if ("response.completed".equals(type)) {
-                                output = node.path("response").path("output");
-                            }
-                        } catch (RuntimeException e) {
-                            LOG.warn("Failed to parse SSE data line: {}", line, e);
-                        }
-                    }
-                }
-            } else {
+            if (!sseState.isSse) {
                 // Standard JSON Parsing
                 try {
                     JsonNode root = jsonMapper.readTree(responseBody);
-                    output = root.get("output");
-                    
+                    refOutput.set(root.get("output"));
+                    JsonNode output = refOutput.get();
+
                     if (output != null && output.isArray()) {
                         for (JsonNode itemNode : output) {
                             if (!(itemNode instanceof ObjectNode item)) continue;
@@ -275,6 +285,7 @@ public class CallLlmTool {
                 }
             }
 
+            JsonNode output = refOutput.get();
             if (output == null || !output.isArray()) {
                 // Even if output is null, we might have collected text via builders (in some streaming cases)
                 if (assistantBuilder.isEmpty()) {
@@ -348,10 +359,10 @@ public class CallLlmTool {
     /**
      * Sends a POST request to the configured LLM Responses API endpoint.
      * @param requestBody the JSON request body
-     * @return the raw response body as a string, or null if the request failed
+     * @param lineConsumer consumer for each line of the response
      * @throws IOException if an I/O error occurs
      */
-    private String sendHttpRequest(String requestBody) throws IOException {
+    private void sendHttpRequest(String requestBody, java.util.function.Consumer<String> lineConsumer) throws IOException {
         String targetUrl = modelUrl;
         if (!targetUrl.endsWith("/responses")) {
             if (targetUrl.endsWith("/")) {
@@ -377,18 +388,16 @@ public class CallLlmTool {
         int responseCode = connection.getResponseCode();
         if (responseCode != HttpURLConnection.HTTP_OK) {
             LOG.error(String.format("HTTP error accessing %s: %d - %s", targetUrl, responseCode, connection.getResponseMessage()));
-            return null;
+            throw new IOException("HTTP error: " + responseCode);
         }
 
         try (InputStream is = connection.getInputStream();
              InputStreamReader isr = new InputStreamReader(is, StandardCharsets.UTF_8);
              BufferedReader br = new BufferedReader(isr)) {
-            StringBuilder sb = new StringBuilder();
             String line;
             while ((line = br.readLine()) != null) {
-                sb.append(line).append("\n");
+                lineConsumer.accept(line);
             }
-            return sb.toString();
         } finally {
             connection.disconnect();
         }
