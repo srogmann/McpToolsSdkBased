@@ -1,5 +1,6 @@
 package org.rogmann.mcp2sdk;
 
+import ch.qos.logback.classic.spi.StackTraceElementProxy;
 import ch.qos.logback.classic.spi.ThrowableProxy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -25,6 +26,7 @@ public class McpServerMain {
 
         // spring shutdown-workaround
         Class<?>[] classes = {
+                StackTraceElementProxy.class,
                 ThrowableProxy.class
         };
         Arrays.stream(classes).forEach(c -> LOG.debug("preload: {}", c));
