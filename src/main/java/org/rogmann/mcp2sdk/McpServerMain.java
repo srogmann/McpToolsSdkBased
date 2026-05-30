@@ -1,9 +1,6 @@
 package org.rogmann.mcp2sdk;
 
-import ch.qos.logback.classic.spi.PackagingDataCalculator;
-import ch.qos.logback.classic.spi.StackTraceElementProxy;
-import ch.qos.logback.classic.spi.ThrowableProxy;
-import ch.qos.logback.classic.spi.ThrowableProxyUtil;
+import ch.qos.logback.classic.spi.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.SpringApplication;
@@ -30,6 +27,7 @@ public class McpServerMain {
         Class<?>[] classes = {
                 PackagingDataCalculator.class,
                 StackTraceElementProxy.class,
+                STEUtil.class,
                 ThrowableProxy.class,
                 ThrowableProxyUtil.class
         };

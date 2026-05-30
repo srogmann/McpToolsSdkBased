@@ -204,14 +204,21 @@ public class CallLlmTool {
                     .build();
             }
 
+            ObjectNode assistantMsgNode = null;
+            ObjectNode reasoningNode = null;
+
             StringBuilder reasoningBuilder = new StringBuilder();
             String assistantText = null;
-            for (JsonNode item : output) {
+            for (JsonNode itemNode : output) {
+                if (!(itemNode instanceof ObjectNode item)) {
+                    continue;
+                }
                 String type = item.has("type") ? item.get("type").asString() : "";
                 if ("reasoning".equals(type)) {
                     if (showReasoning) {
                         JsonNode content = item.get("content");
                         if (content != null && content.isArray()) {
+                            reasoningNode = item;
                             for (JsonNode contentItem : content) {
                                 if ("reasoning_text".equals(contentItem.path("type").asString())) {
                                     reasoningBuilder.append(contentItem.path("text").asString()).append("\n");
@@ -222,6 +229,7 @@ public class CallLlmTool {
                 } else if ("message".equals(type)) {
                     JsonNode content = item.get("content");
                     if (content != null && content.isArray()) {
+                        assistantMsgNode = item;
                         for (JsonNode contentItem : content) {
                             if ("output_text".equals(contentItem.path("type").asString())) {
                                 assistantText = contentItem.path("text").asString();
@@ -245,11 +253,10 @@ public class CallLlmTool {
                 finalResponse = "Reasoning:\n" + reasoningBuilder.toString().trim() + "\n\nAnswer:\n" + assistantText;
             }
 
-            // Update conversation history for the specific session with assistant response
-            ObjectNode assistantMsg = jsonMapper.createObjectNode();
-            assistantMsg.put("role", "assistant");
-            assistantMsg.put("content", assistantText);
-            conversationHistory.add(assistantMsg);
+            if (reasoningNode != null) {
+                conversationHistory.add(reasoningNode);
+            }
+            conversationHistory.add(assistantMsgNode);
 
             state.callsOk().incrementAndGet();
             return CallToolResult.builder()
