@@ -1,5 +1,6 @@
 package org.rogmann.mcp2sdk;
 
+import ch.qos.logback.classic.spi.PackagingDataCalculator;
 import ch.qos.logback.classic.spi.StackTraceElementProxy;
 import ch.qos.logback.classic.spi.ThrowableProxy;
 import ch.qos.logback.classic.spi.ThrowableProxyUtil;
@@ -27,6 +28,7 @@ public class McpServerMain {
 
         // spring shutdown-workaround
         Class<?>[] classes = {
+                PackagingDataCalculator.class,
                 StackTraceElementProxy.class,
                 ThrowableProxy.class,
                 ThrowableProxyUtil.class
