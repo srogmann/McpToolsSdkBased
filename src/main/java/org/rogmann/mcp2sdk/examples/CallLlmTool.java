@@ -179,6 +179,7 @@ public class CallLlmTool {
             if (maxTokens != null) {
                 llmRequest.put("max_tokens", maxTokens);
             }
+            llmRequest.put("stream", true);
 
             String requestBody = jsonMapper.writeValueAsString(llmRequest);
             LOG.debug("Request to LLM for session {}: {}", sessionId, requestBody);
@@ -192,53 +193,107 @@ public class CallLlmTool {
                     .build();
             }
 
-            // Parse the Responses API response
+            // Parse the Responses API response (Supports both SSE and standard JSON)
             LOG.debug("Response in session {}: {}", sessionId, responseBody);
-            JsonNode root = jsonMapper.readTree(responseBody);
-            JsonNode output = root.get("output");
+            
+            StringBuilder reasoningBuilder = new StringBuilder();
+            StringBuilder assistantBuilder = new StringBuilder();
+            JsonNode output = null;
+
+            if (responseBody.trim().startsWith("event:") || responseBody.trim().startsWith("data:")) {
+                // SSE Parsing
+                String[] lines = responseBody.split("\n");
+                for (String line : lines) {
+                    if (line.startsWith("data: ")) {
+                        try {
+                            String data = line.substring(6).trim();
+                            if (data.isEmpty()) continue;
+                            JsonNode node = jsonMapper.readTree(data);
+                            String type = node.path("type").asString();
+                            if ("response.reasoning_text.delta".equals(type)) {
+                                reasoningBuilder.append(node.path("delta").asString());
+                            } else if ("response.output_text.delta".equals(type)) {
+                                assistantBuilder.append(node.path("delta").asString());
+                            } else if ("response.completed".equals(type)) {
+                                output = node.path("response").path("output");
+                            }
+                        } catch (RuntimeException e) {
+                            LOG.warn("Failed to parse SSE data line: {}", line, e);
+                        }
+                    }
+                }
+            } else {
+                // Standard JSON Parsing
+                try {
+                    JsonNode root = jsonMapper.readTree(responseBody);
+                    output = root.get("output");
+                    
+                    if (output != null && output.isArray()) {
+                        for (JsonNode itemNode : output) {
+                            if (!(itemNode instanceof ObjectNode item)) continue;
+                            String type = item.path("type").asString();
+                            if ("reasoning".equals(type)) {
+                                JsonNode content = item.get("content");
+                                if (content != null && content.isArray()) {
+                                    for (JsonNode c : content) {
+                                        if ("reasoning_text".equals(c.path("type").asString())) {
+                                            reasoningBuilder.append(c.path("text").asString());
+                                        }
+                                    }
+                                }
+                            } else if ("message".equals(type)) {
+                                JsonNode content = item.get("content");
+                                if (content != null && content.isArray()) {
+                                    for (JsonNode c : content) {
+                                        if ("output_text".equals(c.path("type").asString())) {
+                                            assistantBuilder.append(c.path("text").asString());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (RuntimeException e) {
+                    LOG.error("Failed to parse standard JSON response", e);
+                }
+            }
 
             if (output == null || !output.isArray()) {
-                return CallToolResult.builder()
-                    .isError(true)
-                    .addTextContent("LLM response output was empty or invalid.")
-                    .build();
+                // Even if output is null, we might have collected text via builders (in some streaming cases)
+                if (assistantBuilder.isEmpty()) {
+                    return CallToolResult.builder()
+                        .isError(true)
+                        .addTextContent("LLM response output was empty or invalid.")
+                        .build();
+                }
             }
 
             ObjectNode assistantMsgNode = null;
             ObjectNode reasoningNode = null;
 
-            StringBuilder reasoningBuilder = new StringBuilder();
-            String assistantText = null;
-            for (JsonNode itemNode : output) {
+            for (JsonNode itemNode : output != null ? output : jsonMapper.createArrayNode()) {
                 if (!(itemNode instanceof ObjectNode item)) {
                     continue;
                 }
                 String type = item.has("type") ? item.get("type").asString() : "";
                 if ("reasoning".equals(type)) {
-                    if (showReasoning) {
-                        JsonNode content = item.get("content");
-                        if (content != null && content.isArray()) {
-                            reasoningNode = item;
-                            for (JsonNode contentItem : content) {
-                                if ("reasoning_text".equals(contentItem.path("type").asString())) {
-                                    reasoningBuilder.append(contentItem.path("text").asString()).append("\n");
-                                }
-                            }
-                        }
-                    }
+                    reasoningNode = item;
                 } else if ("message".equals(type)) {
-                    JsonNode content = item.get("content");
-                    if (content != null && content.isArray()) {
-                        assistantMsgNode = item;
-                        for (JsonNode contentItem : content) {
-                            if ("output_text".equals(contentItem.path("type").asString())) {
-                                assistantText = contentItem.path("text").asString();
-                                break;
-                            }
+                    assistantMsgNode = item;
+                }
+            }
+
+            String assistantText = assistantBuilder.toString();
+            if (assistantText.isEmpty() && assistantMsgNode != null) {
+                JsonNode content = assistantMsgNode.get("content");
+                if (content != null && content.isArray()) {
+                    for (JsonNode contentItem : content) {
+                        if ("output_text".equals(contentItem.path("type").asString())) {
+                            assistantText = contentItem.path("text").asString();
+                            break;
                         }
                     }
                 }
-                if (assistantText != null && (!showReasoning || !reasoningBuilder.isEmpty())) break;
             }
 
             if (assistantText == null) {
@@ -314,7 +369,7 @@ public class CallLlmTool {
             StringBuilder sb = new StringBuilder();
             String line;
             while ((line = br.readLine()) != null) {
-                sb.append(line);
+                sb.append(line).append("\n");
             }
             return sb.toString();
         } finally {
