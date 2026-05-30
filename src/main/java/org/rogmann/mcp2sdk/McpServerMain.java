@@ -25,13 +25,28 @@ public class McpServerMain {
 
         // spring shutdown-workaround
         Class<?>[] classes = {
+                // Logger
                 PackagingDataCalculator.class,
                 StackTraceElementProxy.class,
                 STEUtil.class,
                 ThrowableProxy.class,
                 ThrowableProxyUtil.class
         };
+        String[] sClasses = {
+                "ch.qos.logback.classic.spi.ClassPackagingData",
+                "org.apache.catalina.Lifecycle$SingleUse",
+                "reactor.core.publisher.LambdaMonoSubscriber"
+        };
         Arrays.stream(classes).forEach(c -> LOG.debug("preload: {}", c));
+        final ClassLoader cl = McpServerMain.class.getClassLoader();
+        Arrays.stream(sClasses).forEach(name -> {
+            try {
+                Class<?> clazz = cl.loadClass(name);
+                LOG.debug("preload: {}", clazz);
+            } catch (ClassNotFoundException e) {
+                LOG.warn("missing preload-class: " + e);
+            }
+        });
 
         SpringApplication.run(McpServerMain.class, args);
     }
