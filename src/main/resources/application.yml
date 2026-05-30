@@ -9,6 +9,7 @@ server:
       prefix: access_log
       suffix: .log
       file-date-format: .yyyy-MM-dd
+kind: Application
 
 logging:
   level:
@@ -18,17 +19,21 @@ logging:
     org.springframework.boot.web.servlet.context: DEBUG
     org.rogmann.mcp2sdk.chat: DEBUG
 
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 3s
+
 # Web-UI Konfiguration
 webui:
   public:
-    #path: ...
+  #path: ...
   model:
-    #name: Qwen3.6-27B
-    #url: http://...
+  #name: Qwen3.6-27B
+  #url: http://...
   hasVision: false
   hasAudio: false
   max:
-    #tokens: 240000
+  #tokens: 240000
 
 # Tool Configuration
 tools:
