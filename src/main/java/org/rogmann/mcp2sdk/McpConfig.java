@@ -89,6 +89,8 @@ public class McpConfig {
 
         registry.registerToolDefinition(GlossaryTool.createToolInstance());
 
+        registry.registerToolDefinition(CallLlmTool.createToolInstance());
+
         //registry.registerToolDefinition(VideoPlayerTool.createToolInstance());
         //registry.registerToolDefinition(VideoSearchTool.createToolInstance());
     }

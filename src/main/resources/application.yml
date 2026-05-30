@@ -18,12 +18,13 @@ logging:
     org.springframework.web.filter.RequestLoggingFilter: DEBUG
     org.springframework.boot.web.servlet.context: DEBUG
     org.rogmann.mcp2sdk.chat: DEBUG
+    org.rogmann.mcp2sdk.examples.CallLlmTool: DEBUG
 
 spring:
   lifecycle:
     timeout-per-shutdown-phase: 3s
 
-# Web-UI Konfiguration
+# Web-UI configuration
 webui:
   public:
   #path: ...
