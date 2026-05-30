@@ -6,6 +6,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.web.server.GracefulShutdownCallback;
+import org.springframework.boot.web.server.GracefulShutdownResult;
 
 import java.util.Arrays;
 
@@ -33,7 +34,8 @@ public class McpServerMain {
                 ThrowableProxy.class,
                 ThrowableProxyUtil.class,
                 // Spring
-                GracefulShutdownCallback.class
+                GracefulShutdownCallback.class,
+                GracefulShutdownResult.class
         };
         String[] sClasses = {
                 "ch.qos.logback.classic.spi.ClassPackagingData",
