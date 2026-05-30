@@ -5,5 +5,8 @@
 # Maven
 target/
 
+# public WebUI
+src/main/resources/public/chat/*
+
 # Logfiles
 logs/
