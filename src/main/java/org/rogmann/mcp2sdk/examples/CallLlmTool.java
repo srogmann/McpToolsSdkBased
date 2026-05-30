@@ -20,6 +20,8 @@ import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -203,6 +205,8 @@ public class CallLlmTool {
             if (responseBody.trim().startsWith("event:") || responseBody.trim().startsWith("data:")) {
                 // SSE Parsing
                 String[] lines = responseBody.split("\n");
+                int reasonCount = 0;
+                Instant tsLastProgress = Instant.MIN;
                 for (String line : lines) {
                     if (line.startsWith("data: ")) {
                         try {
@@ -212,6 +216,19 @@ public class CallLlmTool {
                             String type = node.path("type").asString();
                             if ("response.reasoning_text.delta".equals(type)) {
                                 reasoningBuilder.append(node.path("delta").asString());
+                                reasonCount++;
+                                Instant tsNow = Instant.now();
+                                if (Duration.between(tsLastProgress, tsNow).getSeconds() >= 2) {
+                                    String progressToken = sessionId + '-' + reasonCount;
+                                    int len = reasoningBuilder.length();
+                                    String msg = len < 80 ? reasoningBuilder.toString() : "[...]" + reasoningBuilder.substring(len - 80, len);
+                                    String progressMsg = "Reasoning %d: %s".formatted(reasonCount, msg);
+                                    McpSchema.ProgressNotification progress = new McpSchema.ProgressNotification(progressToken,
+                                            reasonCount, null, progressMsg);
+                                    exchange.progressNotification(progress);
+                                    LOG.debug("Progress {}: {}", sessionId, progressMsg);
+                                    tsLastProgress = tsNow;
+                                }
                             } else if ("response.output_text.delta".equals(type)) {
                                 assistantBuilder.append(node.path("delta").asString());
                             } else if ("response.completed".equals(type)) {
