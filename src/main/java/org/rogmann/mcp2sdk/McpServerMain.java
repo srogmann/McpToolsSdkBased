@@ -40,6 +40,7 @@ public class McpServerMain {
         String[] sClasses = {
                 "ch.qos.logback.classic.spi.ClassPackagingData",
                 "org.apache.catalina.Lifecycle$SingleUse",
+                "org.apache.catalina.webresources.WarResourceSet",
                 "reactor.core.publisher.LambdaMonoSubscriber"
         };
         Arrays.stream(classes).forEach(c -> LOG.debug("preload: {}", c));
