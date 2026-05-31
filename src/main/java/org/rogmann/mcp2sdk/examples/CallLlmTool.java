@@ -1,7 +1,11 @@
 package org.rogmann.mcp2sdk.examples;
 
+import io.modelcontextprotocol.client.McpClient;
+import io.modelcontextprotocol.client.McpSyncClient;
+import io.modelcontextprotocol.client.transport.HttpClientStreamableHttpTransport;
 import io.modelcontextprotocol.server.McpServerFeatures;
 import io.modelcontextprotocol.server.McpSyncServerExchange;
+import io.modelcontextprotocol.spec.McpClientTransport;
 import io.modelcontextprotocol.spec.McpSchema;
 import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
 import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
@@ -43,6 +47,8 @@ public class CallLlmTool {
     private static final String PROP_MODEL_URL = "llmtool.model.url";
     private static final String PROP_MAX_TOKENS = "llmtool.max.tokens";
 
+    private static final String PROP_MCP_URL = "llmtool.mcp.url";
+
     /** tool state (active-flag, statistics) */
     private final ToolState state;
 
@@ -57,6 +63,12 @@ public class CallLlmTool {
     /** JsonMapper for JSON processing */
     private final JsonMapper jsonMapper;
 
+    /** optional MCP client */
+    private final McpSyncClient mcpClient;
+
+    /** optional list of MCP tools */
+    private final McpSchema.ListToolsResult mcpTools;
+
     /**
      * Helper class to maintain session-specific state.
      */
@@ -64,12 +76,38 @@ public class CallLlmTool {
         final List<ObjectNode> conversationHistory = new ArrayList<>();
     }
 
-    private CallLlmTool(String modelName, String modelUrl, Integer maxTokens) {
+    private CallLlmTool(String modelName, String modelUrl, Integer maxTokens, String mcpUrl) {
         this.state = new ToolState();
         this.modelName = modelName;
         this.modelUrl = modelUrl;
         this.maxTokens = maxTokens;
         this.jsonMapper = JsonMapper.builder().build();
+
+        if (mcpUrl != null) {
+            LOG.info("Connect to MCP server: {}", mcpUrl);
+            McpClientTransport transport = HttpClientStreamableHttpTransport
+                    .builder(mcpUrl)
+                    .endpoint("/mcp")
+                    .build();
+            mcpClient = McpClient.sync(transport)
+                    .requestTimeout(Duration.ofSeconds(10))
+                    .capabilities(McpSchema.ClientCapabilities.builder()
+                            //.roots(true)       // Enable roots capability
+                            //.sampling()        // Enable sampling capability
+                            //.elicitation()     // Enable elicitation capability
+                            .build())
+                    //.sampling(request -> new McpSchema.CreateMessageResult(response))
+                    //.elicitation(request -> new McpSchema.ElicitResult(McpSchema.ElicitResult.Action.ACCEPT, content))
+                    .build();
+
+            // Initialize connection
+            mcpClient.initialize();
+
+            mcpTools = mcpClient.listTools();
+        } else {
+            mcpClient = null;
+            mcpTools = null;
+        }
     }
 
     /**
@@ -115,7 +153,9 @@ public class CallLlmTool {
 
         Integer maxTokens = Integer.getInteger(PROP_MAX_TOKENS);
 
-        CallLlmTool toolImpl = new CallLlmTool(modelName, modelUrl, maxTokens);
+        String mcpUrl = System.getProperty(PROP_MCP_URL);
+
+        CallLlmTool toolImpl = new CallLlmTool(modelName, modelUrl, maxTokens, mcpUrl);
 
         return new ToolSpecWithState(McpServerFeatures.SyncToolSpecification.builder()
                     .tool(tool)
@@ -179,6 +219,29 @@ public class CallLlmTool {
             ArrayNode inputNode = jsonMapper.createArrayNode();
             inputNode.addAll(conversationHistory);
             llmRequest.set("input", inputNode);
+            if (mcpTools != null) {
+                ArrayNode tools = llmRequest.putArray("tools");
+                for (McpSchema.Tool tool : mcpTools.tools()) {
+                    ObjectNode objTool = tools.addObject();
+                    objTool.put("type", "function");
+                    objTool.put("name", tool.name());
+                    objTool.put("description", tool.description());
+                    JsonSchema jsonSchema = tool.inputSchema();
+                    if (jsonSchema != null) {
+                        ObjectNode paramsNode = jsonMapper.createObjectNode();
+                        paramsNode.put("type", jsonSchema.type());
+                        paramsNode.set("properties", jsonMapper.valueToTree(jsonSchema.properties()));
+
+                        List<String> required = jsonSchema.required();
+                        if (required != null && !required.isEmpty()) {
+                            ArrayNode requiredArray = paramsNode.putArray("required");
+                            required.forEach(requiredArray::add);
+                        }
+                        objTool.set("parameters", paramsNode);
+                    }
+                }
+                llmRequest.put("tool_choice", "auto");
+            }
 
             if (maxTokens != null) {
                 llmRequest.put("max_tokens", maxTokens);
