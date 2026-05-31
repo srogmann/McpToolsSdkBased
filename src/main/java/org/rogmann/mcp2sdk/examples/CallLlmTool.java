@@ -474,12 +474,29 @@ public class CallLlmTool {
     }
 
     private Map<String, Object> convertNodeToMap(JsonNode node) {
-        if (node == null || !node.isObject()) {
-            LOG.warn("Empty args in tool-call of type {}: {}", node == null ? "null" : node.getNodeType(), node);
+        if (node == null) {
             return Collections.emptyMap();
         }
+
+        JsonNode objectNode = node;
+        if (node.isString()) {
+            try {
+                objectNode = jsonMapper.readTree(node.asString());
+            } catch (RuntimeException e) {
+                LOG.warn("Failed to parse arguments string as JSON: {}", node.asString(), e);
+                return Collections.emptyMap();
+            }
+        }
+
+        if (objectNode == null || !objectNode.isObject()) {
+            LOG.warn("Arguments are not a JSON object. Type: {}, Value: {}", 
+                    objectNode == null ? "null" : objectNode.getNodeType(), 
+                    objectNode == null ? "null" : objectNode);
+            return Collections.emptyMap();
+        }
+
         Map<String, Object> map = new HashMap<>();
-        for (Map.Entry<String, JsonNode> entry : node.properties()) {
+        for (Map.Entry<String, JsonNode> entry : objectNode.properties()) {
             map.put(entry.getKey(), convertNodeToValue(entry.getValue()));
         }
         return map;
