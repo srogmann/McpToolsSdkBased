@@ -79,9 +79,9 @@ public class WebUiProxy {
     @Value("${" + PROP_HAS_AUDIO + ":false}")
     private boolean hasAudio;
 
-    /** Maximum tokens (default 16000) */
-    @Value("${" + PROP_MAX_TOKENS + ":16000}")
-    private int maxTokens;
+    /** Maximum tokens (only set if explicitly configured) */
+    @Value("${" + PROP_MAX_TOKENS + ":}")
+    private Integer maxTokens;
 
     /** Pattern for detecting JSON responses (possibly Tool-Call) */
     private static final Pattern REG_EXP_JSON = Pattern.compile("[{].*\".*[}]", Pattern.DOTALL);
@@ -415,7 +415,7 @@ public class WebUiProxy {
         llmRequest.put("model", modelName);
 
         // Set default max_tokens if not present
-        if (!llmRequest.has("max_tokens") && maxTokens > 0) {
+        if (!llmRequest.has("max_tokens") && maxTokens != null) {
             llmRequest.put("max_tokens", maxTokens);
         }
 
@@ -533,7 +533,7 @@ public class WebUiProxy {
         // Force non-streaming for buffered mode
         llmRequest.put("stream", false);
 
-        if (!llmRequest.has("max_tokens") && maxTokens > 0) {
+        if (!llmRequest.has("max_tokens") && maxTokens != null) {
             llmRequest.put("max_tokens", maxTokens);
         }
 
