@@ -475,8 +475,8 @@ public class WebUiProxy {
         }
 
         HttpURLConnection connection = null;
-        // Collect SSE data lines for usage extraction
-        List<String> sseDataLines = new ArrayList<>();
+        // Track the last complete SSE data line (may span multiple chunks)
+        final StringBuilder pendingDataLine = new StringBuilder(2000);
         final LocalDateTime tsStart = LocalDateTime.now();
         try {
             connection = (HttpURLConnection) url.openConnection();
@@ -538,13 +538,13 @@ public class WebUiProxy {
             // Read the response and write immediately to client
             try (InputStream is = connection.getInputStream();
                  OutputStream os = clientResponse.getOutputStream()) {
-                copyStream(is, os, sseDataLines);
+                copyStream(is, os, pendingDataLine);
                 // Ensure flush happens at the end
                 os.flush();
             }
 
             // --- USAGE STATISTICS ---
-            recordUsageStatistics(tsStart, sseDataLines);
+            recordUsageStatistics(tsStart, pendingDataLine);
 
         } catch (IOException e) {
             LOG.error("IO-error while calling LLM ({}): {}", url, e.getMessage(), e);
@@ -562,35 +562,21 @@ public class WebUiProxy {
     }
 
     /**
-     * Parses the collected SSE data lines for usage/timing information,
+     * Parses the last usage-bearing SSE data line for usage/timing information,
      * computes statistics, logs them, and optionally writes to a JSONL file.
      *
-     * @param tsStart      timestamp when the request started
-     * @param sseDataLines collected SSE data line JSON strings
+     * @param tsStart         timestamp when the request started
+     * @param pendingDataLine contains the JSON content of the last <code>data:</code> line
+     *                        that had a <code>"usage"</code> field, or empty if none
      */
-    private void recordUsageStatistics(LocalDateTime tsStart, List<String> sseDataLines) {
-        if (sseDataLines.isEmpty()) {
-            LOG.info("No SSE data lines collected for usage statistics.");
-            return;
-        }
-
-        // Find the last data line that contains usage information
-        String lastUsageJson = null;
-        for (int i = sseDataLines.size() - 1; i >= 0; i--) {
-            String line = sseDataLines.get(i);
-            if (line.contains("\"usage\"")) {
-                lastUsageJson = line;
-                break;
-            }
-        }
-
-        if (lastUsageJson == null) {
-            // No usage data from server, log only start time and model
+    private void recordUsageStatistics(LocalDateTime tsStart, StringBuilder pendingDataLine) {
+        if (pendingDataLine == null || pendingDataLine.isEmpty()) {
             LOG.info("No usage statistics from server. tsStart={}, model={}", tsStart, modelName);
             return;
         }
 
         try {
+            String lastUsageJson = pendingDataLine.toString();
             JsonNode dataNode = jsonMapper.readTree(lastUsageJson);
             JsonNode usageNode = dataNode.get("usage");
             JsonNode timingsNode = dataNode.get("timings");
@@ -797,54 +783,52 @@ public class WebUiProxy {
     /**
      * Helper to copy InputStream to OutputStream with buffering.
      * Ensures data is flushed periodically for streaming.
-     * Also collects SSE data lines for usage statistics extraction.
+     * Also tracks the last complete SSE data line (which may span multiple chunks)
+     * and records the last one containing usage information.
      *
-     * @param in           source input stream
-     * @param out          target output stream
-     * @param sseDataLines collector for SSE data line JSON strings (may be null)
+     * @param in             source input stream
+     * @param out            target output stream
+     * @param pendingDataLine tracks the current incomplete/complete SSE data: line (may be null)
      * @throws IOException if an I/O error occurs
      */
-    private void copyStream(InputStream in, OutputStream out, List<String> sseDataLines) throws IOException {
+    private void copyStream(InputStream in, OutputStream out, StringBuilder pendingDataLine) throws IOException {
         byte[] buffer = new byte[4096];
         int bytesRead;
-        long bytesReadTotal = 0;
+        // Remainder of a partial "data: ..." line that didn't end with \n in the previous chunk
+        StringBuilder remainder = new StringBuilder(2000);
         while ((bytesRead = in.read(buffer)) != -1) {
-            bytesReadTotal += bytesRead;
-            String chunk;
-            try {
-                chunk = new String(buffer, 0, bytesRead, StandardCharsets.UTF_8);
-            } catch (Exception e) {
-                LOG.warn("copyStream: UTF-8 decoding failed at byte {} ({} bytes in chunk), skipping SSE parsing: {}",
-                        bytesReadTotal, bytesRead, e.getMessage());
-                chunk = null;
-            }
-            if (chunk != null) {
-                LOG.info("copyStrem: {}", chunk);
-            } else {
-                LOG.info("copyStrem: {} raw bytes (UTF-8 decoding failed)", bytesRead);
-            }
+            String chunk = new String(buffer, 0, bytesRead, StandardCharsets.UTF_8);
+            LOG.info("copyStrem: {}", chunk);
             out.write(buffer, 0, bytesRead);
             out.flush(); // Critical for SSE: push chunks immediately
 
-            // Collect SSE data lines for usage extraction
-            if (sseDataLines != null && chunk != null) {
+            // Track SSE data lines spanning chunks
+            if (pendingDataLine != null) {
+                remainder.append(chunk);
+                String text = remainder.toString();
+                remainder.setLength(0);
+
+                // Process complete lines (ending with \n) and possibly a trailing partial line
                 int idx = 0;
-                while (idx < chunk.length()) {
-                    int dataStart = chunk.indexOf("data: ", idx);
-                    if (dataStart < 0) {
-                        break;
-                    }
-                    int lineEnd = chunk.indexOf('\n', dataStart);
+                while (idx < text.length()) {
+                    int lineEnd = text.indexOf('\n', idx);
                     if (lineEnd < 0) {
-                        // partial line at end, keep rest for next chunk
-                        sseDataLines.add(chunk.substring(dataStart + 6));
+                        // Incomplete line – keep as remainder for next chunk
+                        remainder.append(text.substring(idx));
                         break;
                     }
-                    String dataLine = chunk.substring(dataStart + 6, lineEnd).trim();
-                    if (!dataLine.isEmpty() && !"[DONE]".equals(dataLine)) {
-                        sseDataLines.add(dataLine);
-                    }
+                    String line = text.substring(idx, lineEnd).trim();
                     idx = lineEnd + 1;
+
+                    if (line.startsWith("data: ")) {
+                        String dataContent = line.substring(6).trim();
+                        if (!dataContent.isEmpty() && !"[DONE]".equals(dataContent)) {
+                            if (dataContent.contains("\"usage\"")) {
+                                pendingDataLine.setLength(0);
+                                pendingDataLine.append(dataContent);
+                            }
+                        }
+                    }
                 }
             }
         }
