@@ -603,6 +603,7 @@ public class WebUiProxy {
         byte[] buffer = new byte[4096];
         int bytesRead;
         while ((bytesRead = in.read(buffer)) != -1) {
+            LOG.info("copyStrem: {}", new String(buffer, 0, bytesRead, StandardCharsets.UTF_8));
             out.write(buffer, 0, bytesRead);
             out.flush(); // Critical for SSE: push chunks immediately
         }
