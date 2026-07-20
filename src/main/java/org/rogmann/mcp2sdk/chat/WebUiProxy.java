@@ -798,7 +798,6 @@ public class WebUiProxy {
         StringBuilder remainder = new StringBuilder(2000);
         while ((bytesRead = in.read(buffer)) != -1) {
             String chunk = new String(buffer, 0, bytesRead, StandardCharsets.UTF_8);
-            LOG.info("copyStrem: {}", chunk);
             out.write(buffer, 0, bytesRead);
             out.flush(); // Critical for SSE: push chunks immediately
 
