@@ -1,18 +1,19 @@
 package org.rogmann.mcp2sdk.chat;
 
-import org.springframework.http.HttpMethod;
-import org.springframework.http.ResponseEntity;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.node.ArrayNode;
 import tools.jackson.databind.node.ObjectNode;
 import tools.jackson.databind.json.JsonMapper;
+import jakarta.annotation.PreDestroy;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.io.*;
@@ -25,6 +26,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.regex.Pattern;
 import java.util.zip.GZIPInputStream;
@@ -55,6 +57,32 @@ public class WebUiProxy {
     private static final String PROP_HAS_VISION = "webui.hasVision";
     private static final String PROP_HAS_AUDIO = "webui.hasAudio";
     private static final String PROP_MAX_TOKENS = "webui.max.tokens";
+    private static final String PROP_LOG_FILE = "webui.stats.file";
+
+    /**
+     * Records usage statistics for a single LLM request/response cycle.
+     *
+     * @param tsStart         timestamp when the request started
+     * @param millisPP        milliseconds for prompt processing (time-to-first-token)
+     * @param millisTG        milliseconds for token generation (after first token until completion)
+     * @param model           model name as reported by the server
+     * @param promptTokens    number of prompt tokens sent
+     * @param completionTokens number of completion tokens generated
+     * @param totalTokens     total tokens (prompt + completion)
+     * @param cachedTokens    number of cached/prompt tokens reused (0 if not reported)
+     * @param ppTPS           prompt processing tokens per second
+     * @param tgTPS           token generation tokens per second
+     */
+    public record LlmUsage(LocalDateTime tsStart, long millisPP, long millisTG, String model,
+                           long promptTokens, long completionTokens, long totalTokens,
+                           long cachedTokens, float ppTPS, float tgTPS) {}
+
+    /** Collected usage statistics for all LLM requests */
+    private final List<LlmUsage> usages = Collections.synchronizedList(new ArrayList<>());
+
+    /** Path to the JSONL statistics file (set via property {@value #PROP_LOG_FILE}) */
+    @Value("${" + PROP_LOG_FILE + ":}")
+    private String statsFilePath;
 
     /** Path to static web content (file system) */
     @Value("${" + PROP_WEBUI_PUBLIC_PATH + ":}")
@@ -447,6 +475,9 @@ public class WebUiProxy {
         }
 
         HttpURLConnection connection = null;
+        // Collect SSE data lines for usage extraction
+        List<String> sseDataLines = new ArrayList<>();
+        final LocalDateTime tsStart = LocalDateTime.now();
         try {
             connection = (HttpURLConnection) url.openConnection();
             connection.setRequestMethod("POST");
@@ -478,7 +509,7 @@ public class WebUiProxy {
                 // Copy error stream to client
                 try (InputStream errorStream = connection.getErrorStream()) {
                     if (errorStream != null) {
-                        copyStream(errorStream, clientResponse.getOutputStream());
+                        copyStream(errorStream, clientResponse.getOutputStream(), null);
                     }
                 }
                 return;
@@ -507,10 +538,13 @@ public class WebUiProxy {
             // Read the response and write immediately to client
             try (InputStream is = connection.getInputStream();
                  OutputStream os = clientResponse.getOutputStream()) {
-                copyStream(is, os);
+                copyStream(is, os, sseDataLines);
                 // Ensure flush happens at the end
                 os.flush();
             }
+
+            // --- USAGE STATISTICS ---
+            recordUsageStatistics(tsStart, sseDataLines);
 
         } catch (IOException e) {
             LOG.error("IO-error while calling LLM ({}): {}", url, e.getMessage(), e);
@@ -525,6 +559,171 @@ public class WebUiProxy {
                 connection.disconnect();
             }
         }
+    }
+
+    /**
+     * Parses the collected SSE data lines for usage/timing information,
+     * computes statistics, logs them, and optionally writes to a JSONL file.
+     *
+     * @param tsStart      timestamp when the request started
+     * @param sseDataLines collected SSE data line JSON strings
+     */
+    private void recordUsageStatistics(LocalDateTime tsStart, List<String> sseDataLines) {
+        if (sseDataLines.isEmpty()) {
+            LOG.info("No SSE data lines collected for usage statistics.");
+            return;
+        }
+
+        // Find the last data line that contains usage information
+        String lastUsageJson = null;
+        for (int i = sseDataLines.size() - 1; i >= 0; i--) {
+            String line = sseDataLines.get(i);
+            if (line.contains("\"usage\"")) {
+                lastUsageJson = line;
+                break;
+            }
+        }
+
+        if (lastUsageJson == null) {
+            // No usage data from server, log only start time and model
+            LOG.info("No usage statistics from server. tsStart={}, model={}", tsStart, modelName);
+            return;
+        }
+
+        try {
+            JsonNode dataNode = jsonMapper.readTree(lastUsageJson);
+            JsonNode usageNode = dataNode.get("usage");
+            JsonNode timingsNode = dataNode.get("timings");
+
+            String model = dataNode.has("model") ? dataNode.get("model").asText() : modelName;
+
+            long promptTokens = usageNode.has("prompt_tokens") ? usageNode.get("prompt_tokens").asLong() : 0;
+            long completionTokens = usageNode.has("completion_tokens") ? usageNode.get("completion_tokens").asLong() : 0;
+            long totalTokens = usageNode.has("total_tokens") ? usageNode.get("total_tokens").asLong() : 0;
+            long cachedTokens = 0;
+            if (usageNode.has("prompt_tokens_details") && usageNode.get("prompt_tokens_details").has("cached_tokens")) {
+                cachedTokens = usageNode.get("prompt_tokens_details").get("cached_tokens").asLong();
+            }
+
+            long millisPP;
+            long millisTG;
+            float ppTPS;
+            float tgTPS;
+
+            if (timingsNode != null) {
+                // llama.cpp provides timings
+                double promptMs = timingsNode.has("prompt_ms") ? timingsNode.get("prompt_ms").asDouble() : 0;
+                double predictedMs = timingsNode.has("predicted_ms") ? timingsNode.get("predicted_ms").asDouble() : 0;
+                millisPP = Math.round(promptMs);
+                millisTG = Math.round(predictedMs);
+
+                double serverPpTPS = timingsNode.has("prompt_per_second") ? timingsNode.get("prompt_per_second").asDouble() : 0;
+                double serverTgTPS = timingsNode.has("predicted_per_second") ? timingsNode.get("predicted_per_second").asDouble() : 0;
+
+                // Compute our own values from the raw data
+                float computedPpTPS = (millisPP > 0 && promptTokens > 0) ? (promptTokens * 1000f / millisPP) : 0;
+                float computedTgTPS = (millisTG > 0 && completionTokens > 0) ? (completionTokens * 1000f / millisTG) : 0;
+
+                ppTPS = (float) serverPpTPS;
+                tgTPS = (float) serverTgTPS;
+
+                LOG.info("Usage stats (llama.cpp): promptTokens={}, completionTokens={}, totalTokens={}, cachedTokens={}, "
+                                + "millisPP={}, millisTG={}, ppTPS={} (computed: {}), tgTPS={} (computed: {})",
+                        promptTokens, completionTokens, totalTokens, cachedTokens,
+                        millisPP, millisTG, ppTPS, computedPpTPS, tgTPS, computedTgTPS);
+            } else {
+                // No timings (e.g. vLLM) - compute from wall clock
+                LocalDateTime tsNow = LocalDateTime.now();
+                long totalMillis = java.time.Duration.between(tsStart, tsNow).toMillis();
+                // Estimate: assume first token time is negligible for vLLM, use total as TG
+                millisPP = 0;
+                millisTG = totalMillis;
+
+                float computedPpTPS = 0;
+                float computedTgTPS = (millisTG > 0 && completionTokens > 0) ? (completionTokens * 1000f / millisTG) : 0;
+                ppTPS = computedPpTPS;
+                tgTPS = computedTgTPS;
+
+                LOG.info("Usage stats (vLLM): promptTokens={}, completionTokens={}, totalTokens={}, cachedTokens={}, "
+                                + "totalMillis={}, ppTPS={}, tgTPS={}",
+                        promptTokens, completionTokens, totalTokens, cachedTokens,
+                        totalMillis, ppTPS, tgTPS);
+            }
+
+            LlmUsage usage = new LlmUsage(tsStart, millisPP, millisTG, model,
+                    promptTokens, completionTokens, totalTokens, cachedTokens, ppTPS, tgTPS);
+            usages.add(usage);
+
+            // Write to JSONL file if configured
+            writeStatsJsonl(usage, usageNode);
+
+        } catch (RuntimeException e) {
+            LOG.warn("Failed to parse usage statistics from SSE data: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Writes a usage record to the JSONL statistics file if the property {@value #PROP_LOG_FILE} is set.
+     * Creates the file with a header if it does not exist yet.
+     *
+     * @param usage     the usage record to write
+     * @param usageNode the raw usage JSON node from the server response
+     */
+    private void writeStatsJsonl(LlmUsage usage, JsonNode usageNode) {
+        if (statsFilePath == null || statsFilePath.isBlank()) {
+            return;
+        }
+        try {
+            Path statsFile = Paths.get(statsFilePath);
+
+            ObjectNode record = jsonMapper.createObjectNode();
+            record.put("type", "llm-request");
+            record.put("tsStart", usage.tsStart().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
+            record.put("millisPP", usage.millisPP());
+            record.put("millisTG", usage.millisTG());
+            record.put("model", usage.model());
+            record.put("promptTokens", usage.promptTokens());
+            record.put("completionTokens", usage.completionTokens());
+            record.put("totalTokens", usage.totalTokens());
+            record.put("cachedTokens", usage.cachedTokens());
+            record.put("ppTPS", usage.ppTPS());
+            record.put("tgTPS", usage.tgTPS());
+            record.set("usage", usageNode);
+
+            String jsonLine = jsonMapper.writeValueAsString(record) + "\n";
+
+            // Ensure parent directories exist
+            Path parent = statsFile.getParent();
+            if (parent != null && !Files.exists(parent)) {
+                Files.createDirectories(parent);
+            }
+
+            Files.writeString(statsFile, jsonLine, StandardCharsets.UTF_8,
+                    java.nio.file.StandardOpenOption.CREATE,
+                    java.nio.file.StandardOpenOption.APPEND);
+
+            LOG.debug("Appended usage stats to JSONL file: {}", statsFile);
+        } catch (IOException e) {
+            LOG.warn("Failed to write usage stats to JSONL file '{}': {}", statsFilePath, e.getMessage());
+        }
+    }
+
+    /**
+     * Shutdown hook: logs overall usage statistics.
+     * Called by Spring when the application context is closed.
+     */
+    @PreDestroy
+    public void onShutdown() {
+        if (usages.isEmpty()) {
+            LOG.info("Shutdown: no LLM usage statistics collected.");
+            return;
+        }
+        int requestCount = usages.size();
+        long totalPromptTokens = usages.stream().mapToLong(LlmUsage::promptTokens).sum();
+        long totalCompletionTokens = usages.stream().mapToLong(LlmUsage::completionTokens).sum();
+        long totalTokens = usages.stream().mapToLong(LlmUsage::totalTokens).sum();
+        LOG.info("Shutdown: LLM usage statistics - #Requests={}, #TokenIn={}, #TokenOut={}, #TotalTokens={}",
+                requestCount, totalPromptTokens, totalCompletionTokens, totalTokens);
     }
 
     /**
@@ -598,14 +797,43 @@ public class WebUiProxy {
     /**
      * Helper to copy InputStream to OutputStream with buffering.
      * Ensures data is flushed periodically for streaming.
+     * Also collects SSE data lines for usage statistics extraction.
+     *
+     * @param in           source input stream
+     * @param out          target output stream
+     * @param sseDataLines collector for SSE data line JSON strings (may be null)
+     * @throws IOException if an I/O error occurs
      */
-    private void copyStream(InputStream in, OutputStream out) throws IOException {
+    private void copyStream(InputStream in, OutputStream out, List<String> sseDataLines) throws IOException {
         byte[] buffer = new byte[4096];
         int bytesRead;
         while ((bytesRead = in.read(buffer)) != -1) {
-            LOG.info("copyStrem: {}", new String(buffer, 0, bytesRead, StandardCharsets.UTF_8));
+            String chunk = new String(buffer, 0, bytesRead, StandardCharsets.UTF_8);
+            LOG.info("copyStrem: {}", chunk);
             out.write(buffer, 0, bytesRead);
             out.flush(); // Critical for SSE: push chunks immediately
+
+            // Collect SSE data lines for usage extraction
+            if (sseDataLines != null) {
+                int idx = 0;
+                while (idx < chunk.length()) {
+                    int dataStart = chunk.indexOf("data: ", idx);
+                    if (dataStart < 0) {
+                        break;
+                    }
+                    int lineEnd = chunk.indexOf('\n', dataStart);
+                    if (lineEnd < 0) {
+                        // partial line at end, keep rest for next chunk
+                        sseDataLines.add(chunk.substring(dataStart + 6));
+                        break;
+                    }
+                    String dataLine = chunk.substring(dataStart + 6, lineEnd).trim();
+                    if (!dataLine.isEmpty() && !"[DONE]".equals(dataLine)) {
+                        sseDataLines.add(dataLine);
+                    }
+                    idx = lineEnd + 1;
+                }
+            }
         }
     }
 
