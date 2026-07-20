@@ -25,9 +25,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 import java.util.zip.GZIPInputStream;
 
@@ -475,8 +477,9 @@ public class WebUiProxy {
         }
 
         HttpURLConnection connection = null;
-        // Track the last complete SSE data line (may span multiple chunks)
-        final StringBuilder pendingDataLine = new StringBuilder(2000);
+        // Collect SSE data lines and first-content-token timestamp
+        List<String> sseDataLines = new ArrayList<>();
+        final AtomicReference<LocalDateTime> firstContentTime = new AtomicReference<>(null);
         final LocalDateTime tsStart = LocalDateTime.now();
         try {
             connection = (HttpURLConnection) url.openConnection();
@@ -509,7 +512,7 @@ public class WebUiProxy {
                 // Copy error stream to client
                 try (InputStream errorStream = connection.getErrorStream()) {
                     if (errorStream != null) {
-                        copyStream(errorStream, clientResponse.getOutputStream(), null);
+                        copyStream(errorStream, clientResponse.getOutputStream(), null, null);
                     }
                 }
                 return;
@@ -538,13 +541,13 @@ public class WebUiProxy {
             // Read the response and write immediately to client
             try (InputStream is = connection.getInputStream();
                  OutputStream os = clientResponse.getOutputStream()) {
-                copyStream(is, os, pendingDataLine);
+                copyStream(is, os, sseDataLines, firstContentTime);
                 // Ensure flush happens at the end
                 os.flush();
             }
 
             // --- USAGE STATISTICS ---
-            recordUsageStatistics(tsStart, pendingDataLine);
+            recordUsageStatistics(tsStart, firstContentTime.get(), sseDataLines);
 
         } catch (IOException e) {
             LOG.error("IO-error while calling LLM ({}): {}", url, e.getMessage(), e);
@@ -562,21 +565,37 @@ public class WebUiProxy {
     }
 
     /**
-     * Parses the last usage-bearing SSE data line for usage/timing information,
+     * Parses the collected SSE data lines for usage/timing information,
      * computes statistics, logs them, and optionally writes to a JSONL file.
      *
      * @param tsStart         timestamp when the request started
-     * @param pendingDataLine contains the JSON content of the last <code>data:</code> line
-     *                        that had a <code>"usage"</code> field, or empty if none
+     * @param firstContentTime timestamp of the first content token (streaming), or null if not available
+     * @param sseDataLines    collected SSE data line JSON strings
      */
-    private void recordUsageStatistics(LocalDateTime tsStart, StringBuilder pendingDataLine) {
-        if (pendingDataLine == null || pendingDataLine.isEmpty()) {
+    private void recordUsageStatistics(LocalDateTime tsStart, LocalDateTime firstContentTime,
+                                       List<String> sseDataLines) {
+        if (sseDataLines.isEmpty()) {
+            LOG.info("No SSE data lines collected for usage statistics.");
+            return;
+        }
+
+        // Find the last data line that contains usage information
+        String lastUsageJson = null;
+        for (int i = sseDataLines.size() - 1; i >= 0; i--) {
+            String line = sseDataLines.get(i);
+            if (line.contains("\"usage\"")) {
+                lastUsageJson = line;
+                break;
+            }
+        }
+
+        if (lastUsageJson == null) {
+            // No usage data from server, log only start time and model
             LOG.info("No usage statistics from server. tsStart={}, model={}", tsStart, modelName);
             return;
         }
 
         try {
-            String lastUsageJson = pendingDataLine.toString();
             JsonNode dataNode = jsonMapper.readTree(lastUsageJson);
             JsonNode usageNode = dataNode.get("usage");
             JsonNode timingsNode = dataNode.get("timings");
@@ -597,7 +616,7 @@ public class WebUiProxy {
             float tgTPS;
 
             if (timingsNode != null) {
-                // llama.cpp provides timings
+                // llama.cpp provides detailed timings in the response.
                 double promptMs = timingsNode.has("prompt_ms") ? timingsNode.get("prompt_ms").asDouble() : 0;
                 double predictedMs = timingsNode.has("predicted_ms") ? timingsNode.get("predicted_ms").asDouble() : 0;
                 millisPP = Math.round(promptMs);
@@ -606,7 +625,7 @@ public class WebUiProxy {
                 double serverPpTPS = timingsNode.has("prompt_per_second") ? timingsNode.get("prompt_per_second").asDouble() : 0;
                 double serverTgTPS = timingsNode.has("predicted_per_second") ? timingsNode.get("predicted_per_second").asDouble() : 0;
 
-                // Compute our own values from the raw data
+                // Compute own values from the raw data for comparison
                 float computedPpTPS = (millisPP > 0 && promptTokens > 0) ? (promptTokens * 1000f / millisPP) : 0;
                 float computedTgTPS = (millisTG > 0 && completionTokens > 0) ? (completionTokens * 1000f / millisTG) : 0;
 
@@ -617,23 +636,47 @@ public class WebUiProxy {
                                 + "millisPP={}, millisTG={}, ppTPS={} (computed: {}), tgTPS={} (computed: {})",
                         promptTokens, completionTokens, totalTokens, cachedTokens,
                         millisPP, millisTG, ppTPS, computedPpTPS, tgTPS, computedTgTPS);
-            } else {
-                // No timings (e.g. vLLM) - compute from wall clock
-                LocalDateTime tsNow = LocalDateTime.now();
-                long totalMillis = java.time.Duration.between(tsStart, tsNow).toMillis();
-                // Estimate: assume first token time is negligible for vLLM, use total as TG
-                millisPP = 0;
-                millisTG = totalMillis;
 
-                float computedPpTPS = 0;
+            } else if (firstContentTime != null) {
+                // Streaming with vLLM (no timings, but we have firstContentTime from the stream).
+                LocalDateTime tsNow = LocalDateTime.now();
+                millisPP = Duration.between(tsStart, firstContentTime).toMillis();
+                millisTG = Duration.between(firstContentTime, tsNow).toMillis();
+
+                float computedPpTPS = (millisPP > 0 && promptTokens > 0) ? (promptTokens * 1000f / millisPP) : 0;
                 float computedTgTPS = (millisTG > 0 && completionTokens > 0) ? (completionTokens * 1000f / millisTG) : 0;
                 ppTPS = computedPpTPS;
                 tgTPS = computedTgTPS;
 
-                LOG.info("Usage stats (vLLM): promptTokens={}, completionTokens={}, totalTokens={}, cachedTokens={}, "
-                                + "totalMillis={}, ppTPS={}, tgTPS={}",
+                LOG.info("Usage stats (vLLM streaming): promptTokens={}, completionTokens={}, totalTokens={}, cachedTokens={}, "
+                                + "millisPP={}, millisTG={}, ppTPS={}, tgTPS={}",
                         promptTokens, completionTokens, totalTokens, cachedTokens,
-                        totalMillis, ppTPS, tgTPS);
+                        millisPP, millisTG, ppTPS, tgTPS);
+
+            } else {
+                // Non-streaming (buffered): only totalMillis known.
+                // Estimate PP/TG split using the heuristic ppTPS = 5 * tgTPS.
+                long totalMillis = Duration.between(tsStart, LocalDateTime.now()).toMillis();
+                // ppTPS = 5 * tgTPS  =>  promptTokens/millisPP = 5 * completionTokens/millisTG
+                // millisPP + millisTG = totalMillis
+                // => promptTokens / (5*tgTPS) * 1000 + completionTokens / tgTPS * 1000 = totalMillis
+                // => 1000/tgTPS * (promptTokens/5 + completionTokens) = totalMillis
+                // => tgTPS = 1000 * (promptTokens/5 + completionTokens) / totalMillis
+                if (totalMillis > 0 && completionTokens > 0) {
+                    float factor = (promptTokens / 5f + completionTokens);
+                    tgTPS = 1000f * factor / totalMillis;
+                    ppTPS = 5f * tgTPS;
+                } else {
+                    ppTPS = 0;
+                    tgTPS = 0;
+                }
+                millisPP = (ppTPS > 0 && promptTokens > 0) ? Math.round(promptTokens * 1000f / ppTPS) : totalMillis;
+                millisTG = (tgTPS > 0 && completionTokens > 0) ? Math.round(completionTokens * 1000f / tgTPS) : totalMillis;
+
+                LOG.info("Usage stats (non-streaming): promptTokens={}, completionTokens={}, totalTokens={}, cachedTokens={}, "
+                                + "totalMillis={}, millisPP={}, millisTG={}, ppTPS={}, tgTPS={}",
+                        promptTokens, completionTokens, totalTokens, cachedTokens,
+                        totalMillis, millisPP, millisTG, ppTPS, tgTPS);
             }
 
             LlmUsage usage = new LlmUsage(tsStart, millisPP, millisTG, model,
@@ -650,7 +693,7 @@ public class WebUiProxy {
 
     /**
      * Writes a usage record to the JSONL statistics file if the property {@value #PROP_LOG_FILE} is set.
-     * Creates the file with a header if it does not exist yet.
+     * Creates the file if it does not exist yet.
      *
      * @param usage     the usage record to write
      * @param usageNode the raw usage JSON node from the server response
@@ -744,6 +787,7 @@ public class WebUiProxy {
             connection.setRequestProperty("Cookie", cookie);
         }
 
+        final LocalDateTime tsStart = LocalDateTime.now();
         try (OutputStream os = connection.getOutputStream();
              OutputStreamWriter osw = new OutputStreamWriter(os, StandardCharsets.UTF_8)) {
             osw.write(requestOut);
@@ -755,11 +799,26 @@ public class WebUiProxy {
             return null;
         }
 
+        String responseBody;
         try (InputStream is = connection.getInputStream()) {
-            return readResponse(is);
+            responseBody = readResponse(is);
         } finally {
             connection.disconnect();
         }
+
+        // Try to parse usage from the non-streaming JSON response
+        try {
+            JsonNode responseNode = jsonMapper.readTree(responseBody);
+            if (responseNode.has("usage")) {
+                List<String> dataLines = new ArrayList<>();
+                dataLines.add(jsonMapper.writeValueAsString(responseNode));
+                recordUsageStatistics(tsStart, null, dataLines);
+            }
+        } catch (RuntimeException e) {
+            LOG.debug("Could not parse usage from non-streaming response: {}", e.getMessage());
+        }
+
+        return responseBody;
     }
 
     /**
@@ -783,51 +842,54 @@ public class WebUiProxy {
     /**
      * Helper to copy InputStream to OutputStream with buffering.
      * Ensures data is flushed periodically for streaming.
-     * Also tracks the last complete SSE data line (which may span multiple chunks)
-     * and records the last one containing usage information.
+     * Also collects SSE data lines for usage statistics extraction
+     * and records the timestamp of the first content token.
      *
-     * @param in             source input stream
-     * @param out            target output stream
-     * @param pendingDataLine tracks the current incomplete/complete SSE data: line (may be null)
+     * @param in               source input stream
+     * @param out              target output stream
+     * @param sseDataLines     collector for SSE data line JSON strings (may be null)
+     * @param firstContentTime atomic reference to store the timestamp of the first content token (may be null)
      * @throws IOException if an I/O error occurs
      */
-    private void copyStream(InputStream in, OutputStream out, StringBuilder pendingDataLine) throws IOException {
+    private void copyStream(InputStream in, OutputStream out, List<String> sseDataLines,
+                            AtomicReference<LocalDateTime> firstContentTime) throws IOException {
         byte[] buffer = new byte[4096];
         int bytesRead;
-        // Remainder of a partial "data: ..." line that didn't end with \n in the previous chunk
-        StringBuilder remainder = new StringBuilder(2000);
         while ((bytesRead = in.read(buffer)) != -1) {
             String chunk = new String(buffer, 0, bytesRead, StandardCharsets.UTF_8);
+            LOG.info("copyStrem: {}", chunk);
             out.write(buffer, 0, bytesRead);
             out.flush(); // Critical for SSE: push chunks immediately
 
-            // Track SSE data lines spanning chunks
-            if (pendingDataLine != null) {
-                remainder.append(chunk);
-                String text = remainder.toString();
-                remainder.setLength(0);
-
-                // Process complete lines (ending with \n) and possibly a trailing partial line
+            // Collect SSE data lines for usage extraction
+            // and detect the first content token for PP/TG separation
+            if (sseDataLines != null || firstContentTime != null) {
                 int idx = 0;
-                while (idx < text.length()) {
-                    int lineEnd = text.indexOf('\n', idx);
-                    if (lineEnd < 0) {
-                        // Incomplete line – keep as remainder for next chunk
-                        remainder.append(text.substring(idx));
+                while (idx < chunk.length()) {
+                    int dataStart = chunk.indexOf("data: ", idx);
+                    if (dataStart < 0) {
                         break;
                     }
-                    String line = text.substring(idx, lineEnd).trim();
-                    idx = lineEnd + 1;
-
-                    if (line.startsWith("data: ")) {
-                        String dataContent = line.substring(6).trim();
-                        if (!dataContent.isEmpty() && !"[DONE]".equals(dataContent)) {
-                            if (dataContent.contains("\"usage\"")) {
-                                pendingDataLine.setLength(0);
-                                pendingDataLine.append(dataContent);
-                            }
+                    int lineEnd = chunk.indexOf('\n', dataStart);
+                    if (lineEnd < 0) {
+                        // partial line at end, keep rest for next chunk
+                        if (sseDataLines != null) {
+                            sseDataLines.add(chunk.substring(dataStart + 6));
+                        }
+                        break;
+                    }
+                    String dataLine = chunk.substring(dataStart + 6, lineEnd).trim();
+                    if (!dataLine.isEmpty() && !"[DONE]".equals(dataLine)) {
+                        if (sseDataLines != null) {
+                            sseDataLines.add(dataLine);
+                        }
+                        // Check for first content token (streaming: choices[0].delta.content != null)
+                        if (firstContentTime != null && firstContentTime.get() == null
+                                && dataLine.contains("\"content\"")) {
+                            firstContentTime.compareAndExchange(null, LocalDateTime.now());
                         }
                     }
+                    idx = lineEnd + 1;
                 }
             }
         }
