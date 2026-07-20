@@ -807,14 +807,27 @@ public class WebUiProxy {
     private void copyStream(InputStream in, OutputStream out, List<String> sseDataLines) throws IOException {
         byte[] buffer = new byte[4096];
         int bytesRead;
+        long bytesReadTotal = 0;
         while ((bytesRead = in.read(buffer)) != -1) {
-            String chunk = new String(buffer, 0, bytesRead, StandardCharsets.UTF_8);
-            LOG.info("copyStrem: {}", chunk);
+            bytesReadTotal += bytesRead;
+            String chunk;
+            try {
+                chunk = new String(buffer, 0, bytesRead, StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                LOG.warn("copyStream: UTF-8 decoding failed at byte {} ({} bytes in chunk), skipping SSE parsing: {}",
+                        bytesReadTotal, bytesRead, e.getMessage());
+                chunk = null;
+            }
+            if (chunk != null) {
+                LOG.info("copyStrem: {}", chunk);
+            } else {
+                LOG.info("copyStrem: {} raw bytes (UTF-8 decoding failed)", bytesRead);
+            }
             out.write(buffer, 0, bytesRead);
             out.flush(); // Critical for SSE: push chunks immediately
 
             // Collect SSE data lines for usage extraction
-            if (sseDataLines != null) {
+            if (sseDataLines != null && chunk != null) {
                 int idx = 0;
                 while (idx < chunk.length()) {
                     int dataStart = chunk.indexOf("data: ", idx);
