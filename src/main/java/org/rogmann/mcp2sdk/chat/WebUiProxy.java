@@ -853,6 +853,8 @@ public class WebUiProxy {
      */
     private void copyStream(InputStream in, OutputStream out, List<String> sseDataLines,
                             AtomicReference<LocalDateTime> firstContentTime) throws IOException {
+        // Buffer for a partial SSE data line that was split across chunk boundaries.
+        StringBuilder pendingData = new StringBuilder();
         byte[] buffer = new byte[4096];
         int bytesRead;
         while ((bytesRead = in.read(buffer)) != -1) {
@@ -863,21 +865,28 @@ public class WebUiProxy {
             // Collect SSE data lines for usage extraction
             // and detect the first content token for PP/TG separation
             if (sseDataLines != null || firstContentTime != null) {
+                // Prepend any pending data from a previous partial line
+                String parseText;
+                if (!pendingData.isEmpty()) {
+                    parseText = pendingData.toString() + chunk;
+                    pendingData.setLength(0);
+                } else {
+                    parseText = chunk;
+                }
+
                 int idx = 0;
-                while (idx < chunk.length()) {
-                    int dataStart = chunk.indexOf("data: ", idx);
+                while (idx < parseText.length()) {
+                    int dataStart = parseText.indexOf("data: ", idx);
                     if (dataStart < 0) {
                         break;
                     }
-                    int lineEnd = chunk.indexOf('\n', dataStart);
+                    int lineEnd = parseText.indexOf('\n', dataStart);
                     if (lineEnd < 0) {
-                        // partial line at end, keep rest for next chunk
-                        if (sseDataLines != null) {
-                            sseDataLines.add(chunk.substring(dataStart + 6));
-                        }
+                        // Partial line: store from "data:" onward and continue with next chunk
+                        pendingData.append(parseText.substring(dataStart));
                         break;
                     }
-                    String dataLine = chunk.substring(dataStart + 6, lineEnd).trim();
+                    String dataLine = parseText.substring(dataStart + 6, lineEnd).trim();
                     if (!dataLine.isEmpty() && !"[DONE]".equals(dataLine)) {
                         if (sseDataLines != null) {
                             sseDataLines.add(dataLine);
