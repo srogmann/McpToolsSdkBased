@@ -419,6 +419,11 @@ public class WebUiProxy {
             llmRequest.put("max_tokens", maxTokens);
         }
 
+        // Add stream_options to include usage info (token statistics) in the streaming response
+        ObjectNode streamOptions = jsonMapper.createObjectNode();
+        streamOptions.put("include_usage", true);
+        llmRequest.set("stream_options", streamOptions);
+
         String requestOut = jsonMapper.writeValueAsString(llmRequest);
         LOG.debug("LLM Request: {}", requestOut);
 
