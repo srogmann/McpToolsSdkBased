@@ -67,7 +67,7 @@
 
     <build>
         <plugins>
-            <!-- Spring Boot Plugin für executable JAR -->
+            <!-- Spring Boot Plugin für executable JAR (Standard) -->
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
@@ -82,4 +82,52 @@
         </plugins>
     </build>
 
+    <profiles>
+        <profile>
+            <id>fat</id>
+            <build>
+                <plugins>
+                    <!-- Spring Boot Repackage deaktivieren -->
+                    <plugin>
+                        <groupId>org.springframework.boot</groupId>
+                        <artifactId>spring-boot-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>repackage</id>
+                                <phase>none</phase>
+                            </execution>
+                        </executions>
+                    </plugin>
+
+                    <!-- Assembly Plugin für Fat-JAR -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-assembly-plugin</artifactId>
+                        <version>3.7.1</version>
+                        <configuration>
+                            <descriptorRefs>
+                                <descriptorRef>jar-with-dependencies</descriptorRef>
+                            </descriptorRefs>
+                            <archive>
+                                <manifest>
+                                    <mainClass>org.rogmann.mcp2sdk.rag.EmbeddingMain</mainClass>
+                                </manifest>
+                            </archive>
+                            <finalName>${project.build.finalName}-fat</finalName>
+                            <appendAssemblyId>false</appendAssemblyId>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <id>make-assembly</id>
+                                <phase>package</phase>
+                                <goals>
+                                    <goal>single</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>
