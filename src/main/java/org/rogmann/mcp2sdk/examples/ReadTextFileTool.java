@@ -35,6 +35,9 @@ public class ReadTextFileTool {
 
     private static final String NAME = "get_file_text_by_path";
 
+    /** 3000 loc is default */
+    private static final int MAX_LINES_DEFAULT = 3000;
+
     /** tool state (active-flag, statistics) */
     private final ToolState state;
 
@@ -67,7 +70,7 @@ public class ReadTextFileTool {
 
         Map<String, Object> endLineProp = new HashMap<>();
         endLineProp.put("type", "integer");
-        endLineProp.put("description", "1-based end line (default is start_line + 999)");
+        endLineProp.put("description", "1-based end line (default is start_line + %d)".formatted(MAX_LINES_DEFAULT - 1));
         properties.put("end_line", endLineProp);
 
         List<String> requiredFields = List.of("projectName", "pathInProject");
@@ -156,13 +159,13 @@ public class ReadTextFileTool {
             long totalLines = linesStream.count();
 
             int start = Optional.ofNullable(startLine).orElse(1);
-            int end = Optional.ofNullable(endLine).orElse(start + 999);
+            int end = Optional.ofNullable(endLine).orElse(start + MAX_LINES_DEFAULT - 1);
 
             if (start < 1) {
                 start = 1;
             }
             if (end < start) {
-                end = start + 999;
+                end = start + MAX_LINES_DEFAULT - 1;
             }
 
             // Build the text content with header information
