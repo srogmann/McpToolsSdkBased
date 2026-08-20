@@ -1654,8 +1654,13 @@ public class WebUiProxy {
         long totalPromptTokens = usages.stream().mapToLong(LlmUsage::promptTokens).sum();
         long totalCompletionTokens = usages.stream().mapToLong(LlmUsage::completionTokens).sum();
         long totalTokens = usages.stream().mapToLong(LlmUsage::totalTokens).sum();
-        LOG.info("Shutdown: LLM usage statistics - #Requests={}, #TokenIn={}, #TokenOut={}, #TotalTokens={}",
-                requestCount, totalPromptTokens, totalCompletionTokens, totalTokens);
+        long totalCachedTokens = usages.stream().mapToLong(LlmUsage::cachedTokens).sum();
+        // #TokenInUncached reflects the prompt tokens that actually had to be computed
+        // (i.e. not served from the KV/prefix cache).
+        long totalUncachedTokens = Math.max(0, totalPromptTokens - totalCachedTokens);
+        LOG.info("Shutdown: LLM usage statistics - #Requests={}, #TokenIn={}, #TokenInCached={}, #TokenInUncached={}, #TokenOut={}, #TotalTokens={}",
+                requestCount, totalPromptTokens, totalCachedTokens, totalUncachedTokens,
+                totalCompletionTokens, totalTokens);
     }
 
     /**
