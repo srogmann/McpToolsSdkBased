@@ -47,10 +47,14 @@ public class CreateNewFileTool {
         // Define Input Schema properties
         Map<String, Object> properties = new HashMap<>();
 
-        Map<String, Object> projectNameProp = new HashMap<>();
-        projectNameProp.put("type", "string");
-        projectNameProp.put("description", "Name of the project");
-        properties.put("projectName", projectNameProp);
+        // Offer the project name if several projects are possible (a filter is set) or
+        // if add-on directories are configured (then it is optional).
+        if (WorkProject.needsProjectName() || WorkProject.hasAddonDirectories()) {
+            Map<String, Object> projectNameProp = new HashMap<>();
+            projectNameProp.put("type", "string");
+            projectNameProp.put("description", WorkProject.projectNameDescription());
+            properties.put("projectName", projectNameProp);
+        }
 
         Map<String, Object> pathInProjectProp = new HashMap<>();
         pathInProjectProp.put("type", "string");
@@ -67,7 +71,7 @@ public class CreateNewFileTool {
         overwriteProp.put("description", "Whether an existing file may be overwritten");
         properties.put("overwrite", overwriteProp);
 
-        List<String> requiredFields = List.of("projectName", "pathInProject", "text");
+        List<String> requiredFields = List.of("pathInProject", "text");
 
         JsonSchema inputSchema = new JsonSchema("object", properties, requiredFields, null, null, null);
 
@@ -106,7 +110,9 @@ public class CreateNewFileTool {
 
         // Use a temporary map to capture potential error from WorkProject.lookupProject
         Map<String, Object> tempResult = new HashMap<>();
-        WorkProject workProject = WorkProject.lookupProject(projectName, tempResult);
+        WorkProject workProject = (projectName == null || projectName.isBlank())
+                ? WorkProject.lookupProject(tempResult)
+                : WorkProject.lookupProject(projectName, tempResult);
 
         if (workProject == null) {
             String error = (String) tempResult.get("error");

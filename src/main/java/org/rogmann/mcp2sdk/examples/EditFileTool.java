@@ -45,10 +45,14 @@ public class EditFileTool {
         // Define Input Schema properties
         Map<String, Object> properties = new HashMap<>();
 
-        Map<String, Object> projectNameProp = new HashMap<>();
-        projectNameProp.put("type", "string");
-        projectNameProp.put("description", "Name of the project");
-        properties.put("projectName", projectNameProp);
+        // Offer the project name if several projects are possible (a filter is set) or
+        // if add-on directories are configured (then it is optional).
+        if (WorkProject.needsProjectName() || WorkProject.hasAddonDirectories()) {
+            Map<String, Object> projectNameProp = new HashMap<>();
+            projectNameProp.put("type", "string");
+            projectNameProp.put("description", WorkProject.projectNameDescription());
+            properties.put("projectName", projectNameProp);
+        }
 
         Map<String, Object> pathInProjectProp = new HashMap<>();
         pathInProjectProp.put("type", "string");
@@ -70,7 +74,7 @@ public class EditFileTool {
         replaceAllProp.put("description", "Whether to replace all occurrences (default: false)");
         properties.put("replaceAll", replaceAllProp);
 
-        List<String> requiredFields = List.of("projectName", "pathInProject", "oldString", "newString");
+        List<String> requiredFields = List.of("pathInProject", "oldString", "newString");
 
         JsonSchema inputSchema = new JsonSchema("object", properties, requiredFields, null, null, null);
 
@@ -115,7 +119,9 @@ public class EditFileTool {
 
         // Use a temporary map to capture potential error from WorkProject.lookupProject
         Map<String, Object> tempResult = new HashMap<>();
-        WorkProject workProject = WorkProject.lookupProject(projectName, tempResult);
+        WorkProject workProject = (projectName == null || projectName.isBlank())
+                ? WorkProject.lookupProject(tempResult)
+                : WorkProject.lookupProject(projectName, tempResult);
 
         if (workProject == null) {
             String error = (String) tempResult.get("error");

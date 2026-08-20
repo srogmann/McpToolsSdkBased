@@ -84,10 +84,14 @@ public class ReadDependencyClassSourceTool {
         pathPomProp.put("description", "Path to the pom.xml whose classpath should be determined. Can be relative or absolute. If relative and projectName is provided, the path is resolved relative to the project directory.");
         properties.put("path_pom", pathPomProp);
 
-        Map<String, Object> projectNameProp = new HashMap<>();
-        projectNameProp.put("type", "string");
-        projectNameProp.put("description", "Optional: Name of the project. Used to resolve relative paths to pom.xml when the path is not found directly.");
-        properties.put("projectName", projectNameProp);
+        // Offer the project name if several projects are possible (a filter is set) or
+        // if add-on directories are configured (then it is optional).
+        if (WorkProject.needsProjectName() || WorkProject.hasAddonDirectories()) {
+            Map<String, Object> projectNameProp = new HashMap<>();
+            projectNameProp.put("type", "string");
+            projectNameProp.put("description", "Optional: Name of the project or add-on directory. Used to resolve relative paths to pom.xml when the path is not found directly.");
+            properties.put("projectName", projectNameProp);
+        }
 
         Map<String, Object> classNameProp = new HashMap<>();
         classNameProp.put("type", "array");
@@ -185,46 +189,43 @@ public class ReadDependencyClassSourceTool {
         LOGGER.info("Configuration: m2Path={}, mavenCommand={}, autoDownloadSources={}, timeoutSeconds={}", 
                 m2Path, mavenCommand, autoDownloadSources, timeoutSeconds);
 
-        // Resolve pomPath: try direct path first, then use WorkProject if projectName is provided
+        // Resolve pomPath: try direct path first, then resolve relative paths via the project
+        // directory. If no project name is supplied, fall back to the configured project
+        // (single-project setup); a name is only required when several projects are possible.
         Path pomPath = Path.of(pathPom);
         if (!Files.exists(pomPath)) {
-            // If path not found and projectName is provided, try to resolve via WorkProject
-            if (projectName != null && !projectName.isBlank()) {
-                Map<String, Object> lookupResult = new HashMap<>();
-                WorkProject workProject = WorkProject.lookupProject(projectName, lookupResult);
-                if (workProject == null) {
-                    String error = (String) lookupResult.get("error");
-                    return CallToolResult.builder()
-                            .isError(true)
-                            .addTextContent(error != null ? error : "Project not found: " + projectName)
-                            .build();
-                }
-                // Resolve pomPath relative to project directory
-                try {
-                    pomPath = workProject.projectDir().resolve(pathPom).normalize();
-                } catch (InvalidPathException e) {
-                    LOGGER.error("Can't resolve path ({}) of project directory ({})", pathPom, workProject.projectDir(), e);
-                    throw new RuntimeException("Internal path error");
-                }
-
-                // Security check: ensure pomPath is within project directory
-                if (!pomPath.startsWith(workProject.projectDir())) {
-                    return CallToolResult.builder()
-                            .isError(true)
-                            .addTextContent("Path traversal detected in path_pom: " + pathPom)
-                            .build();
-                }
-                
-                if (!Files.exists(pomPath)) {
-                    return CallToolResult.builder()
-                            .isError(true)
-                            .addTextContent("pom.xml not found in project " + projectName + ": " + pathPom)
-                            .build();
-                }
-            } else {
+            Map<String, Object> lookupResult = new HashMap<>();
+            WorkProject workProject = (projectName == null || projectName.isBlank())
+                    ? WorkProject.lookupProject(lookupResult)
+                    : WorkProject.lookupProject(projectName, lookupResult);
+            if (workProject == null) {
+                String error = (String) lookupResult.get("error");
+                String detail = (error != null ? error : "Project not found: " + projectName);
                 return CallToolResult.builder()
                         .isError(true)
-                        .addTextContent("pom.xml not found: " + pathPom + " (consider providing projectName for relative paths)")
+                        .addTextContent("pom.xml not found: " + pathPom + " (" + detail + ")")
+                        .build();
+            }
+            // Resolve pomPath relative to project directory
+            try {
+                pomPath = workProject.projectDir().resolve(pathPom).normalize();
+            } catch (InvalidPathException e) {
+                LOGGER.error("Can't resolve path ({}) of project directory ({})", pathPom, workProject.projectDir(), e);
+                throw new RuntimeException("Internal path error");
+            }
+
+            // Security check: ensure pomPath is within project directory
+            if (!pomPath.startsWith(workProject.projectDir())) {
+                return CallToolResult.builder()
+                        .isError(true)
+                        .addTextContent("Path traversal detected in path_pom: " + pathPom)
+                        .build();
+            }
+
+            if (!Files.exists(pomPath)) {
+                return CallToolResult.builder()
+                        .isError(true)
+                        .addTextContent("pom.xml not found in project " + workProject.projectName() + ": " + pathPom)
                         .build();
             }
         }

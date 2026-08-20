@@ -78,6 +78,9 @@ public class McpConfig {
 
     // Helper method to populate the registry with available tools
     private void populateToolRegistry(ToolRegistry registry, Environment environment) {
+        // Fail fast on a misconfigured add-on configuration (missing description, duplicates, ...).
+        WorkProject.validateAddonConfiguration();
+
         registry.registerToolDefinition(CreateNewFileTool.createToolInstance());
         registry.registerToolDefinition(ReadTextFileTool.createToolInstance());
         registry.registerToolDefinition(EditFileTool.createToolInstance());
@@ -88,6 +91,8 @@ public class McpConfig {
         registry.registerToolDefinition(ReadDependencyClassSourceTool.createToolInstance());
 
         registry.registerToolDefinition(GlossaryTool.createToolInstance());
+
+        registry.registerToolDefinition(JavaScriptTool.createToolInstance());
 
         registry.registerToolDefinition(CallLlmTool.createToolInstance());
 

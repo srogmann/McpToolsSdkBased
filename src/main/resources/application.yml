@@ -13,11 +13,11 @@ kind: Application
 
 logging:
   level:
-    org.springframework.web: DEBUG
+    org.springframework.web: INFO
     org.springframework.security.web: DEBUG
     org.springframework.web.filter.RequestLoggingFilter: DEBUG
     org.springframework.boot.web.servlet.context: DEBUG
-    org.rogmann.mcp2sdk.chat: DEBUG
+    org.rogmann.mcp2sdk.chat: INFO
     org.rogmann.mcp2sdk.examples.CallLlmTool: DEBUG
 
 spring:
@@ -35,11 +35,15 @@ webui:
   hasAudio: false
   max:
   #tokens: 240000
+  #backend: llamacpp   # or vllm (deepseek-compatible thinking/reasoning_effort)
+  # To report per-request prefix-cache tokens from the upstream vLLM /metrics endpoint.
+  # Only meaningful when backend is vllm; vLLM streaming omits prompt_tokens_details.
+  #fetch-metrics: false
 
 # Tool Configuration
 tools:
   # Comma-separated list of tool names to activate on startup
-  active: "glossary-tool,find_files_by_glob,get_file_text_by_path,edit_file"
+  active: "glossary_tool,find_files_by_glob,get_file_text_by_path,edit_file"
   
   # Maven-related tool configuration
   maven:

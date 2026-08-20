@@ -53,10 +53,14 @@ public class ReadTextFileTool {
         // Define Input Schema properties
         Map<String, Object> properties = new HashMap<>();
 
-        Map<String, Object> projectNameProp = new HashMap<>();
-        projectNameProp.put("type", "string");
-        projectNameProp.put("description", "Name of the project");
-        properties.put("projectName", projectNameProp);
+        // Offer the project name if several projects are possible (a filter is set) or
+        // if add-on directories are configured (then it is optional).
+        if (WorkProject.needsProjectName() || WorkProject.hasAddonDirectories()) {
+            Map<String, Object> projectNameProp = new HashMap<>();
+            projectNameProp.put("type", "string");
+            projectNameProp.put("description", WorkProject.projectNameDescription());
+            properties.put("projectName", projectNameProp);
+        }
 
         Map<String, Object> pathInProjectProp = new HashMap<>();
         pathInProjectProp.put("type", "string");
@@ -73,7 +77,7 @@ public class ReadTextFileTool {
         endLineProp.put("description", "1-based end line (default is start_line + %d)".formatted(MAX_LINES_DEFAULT - 1));
         properties.put("end_line", endLineProp);
 
-        List<String> requiredFields = List.of("projectName", "pathInProject");
+        List<String> requiredFields = List.of("pathInProject");
 
         JsonSchema inputSchema = new JsonSchema("object", properties, requiredFields, null, null, null);
 
@@ -111,9 +115,29 @@ public class ReadTextFileTool {
         Integer startLine = (Integer) arguments.get("start_line");
         Integer endLine = (Integer) arguments.get("end_line");
 
+        // Detect camelCase variants which are likely a parameter naming mistake.
+        if (arguments.containsKey("startLine") && startLine == null) {
+            String msg = "Parameter 'startLine' (camelCase) is not supported, use 'start_line' instead.";
+            LOGGER.warn(msg + " Request contained startLine: {}", arguments.get("startLine"));
+            return CallToolResult.builder()
+                    .isError(true)
+                    .addTextContent(msg)
+                    .build();
+        }
+        if (arguments.containsKey("endLine") && endLine == null) {
+            String msg = "Parameter 'endLine' (camelCase) is not supported, use 'end_line' instead.";
+            LOGGER.warn(msg + " Request contained endLine: {}", arguments.get("endLine"));
+            return CallToolResult.builder()
+                    .isError(true)
+                    .addTextContent(msg)
+                    .build();
+        }
+
         // Use a temporary map to capture potential error from WorkProject.lookupProject
         Map<String, Object> tempResult = new HashMap<>();
-        WorkProject workProject = WorkProject.lookupProject(projectName, tempResult);
+        WorkProject workProject = (projectName == null || projectName.isBlank())
+                ? WorkProject.lookupProject(tempResult)
+                : WorkProject.lookupProject(projectName, tempResult);
 
         if (workProject == null) {
             String error = (String) tempResult.get("error");

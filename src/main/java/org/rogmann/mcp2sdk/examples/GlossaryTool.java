@@ -28,7 +28,7 @@ public class GlossaryTool {
 
     private static final Logger LOGGER = Logger.getLogger(GlossaryTool.class.getName());
 
-    private static final String NAME = "glossary-tool";
+    private static final String NAME = "glossary_tool";
 
     /** Property name of a path to a markdown file */
     private static final String PROP_PATH = "mcp.glossary.path";
