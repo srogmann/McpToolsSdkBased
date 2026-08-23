@@ -64,6 +64,7 @@ public class McpServerMain {
         preloadReactorClasses(cl,
                 "io.modelcontextprotocol.spec.McpServerSession",
                 "reactor.core.Exceptions",
+                "reactor.core.publisher.FluxFlatMap",
                 "reactor.core.publisher.FluxOnErrorReturn",
                 "reactor.core.publisher.LambdaMonoSubscriber",
                 "reactor.core.publisher.MonoPeekTerminal",
