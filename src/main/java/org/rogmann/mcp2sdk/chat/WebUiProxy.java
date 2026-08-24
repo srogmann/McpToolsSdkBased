@@ -90,14 +90,28 @@ public class WebUiProxy {
      * @param completionTokens number of completion tokens generated
      * @param totalTokens     total tokens (prompt + completion)
      * @param cachedTokens    number of cached/prompt tokens reused (0 if not reported)
-     * @param ppUncachedTPS   prompt processing tokens per second for the tokens NOT served
-     *                        from the KV cache (0 if no uncached tokens or no timing data)
-     * @param ppTPS           prompt processing tokens per second (all prompt tokens)
+     * @param ppUncachedTPS   prompt processing tokens per second for the tokens NOT served from
+     *                        the KV cache (0 if no uncached tokens or no timing data). Only adds
+     *                        information beyond {@code ppTPS} in the llama.cpp path, where
+     *                        {@code ppTPS} is the server-reported rate for all prompt tokens; in
+     *                        the vLLM-metrics and streaming paths it equals {@code ppTPS}
+     * @param ppTPS           prompt processing tokens per second. In the vLLM-metrics and streaming
+     *                        paths this is cache-corrected (based on the tokens that actually had
+     *                        to be computed); in the llama.cpp path it is the server-reported
+     *                        {@code prompt_per_second} (all prompt tokens)
      * @param tgTPS           token generation tokens per second
+     * @param estimated       {@code true} if any of the rates/timings had to be estimated
+     *                        (wall-clock, heuristics or synthesized fallbacks) instead of being
+     *                        taken from authoritative server timings/metrics
+     * @param ttftClientMs    client-side measured time to the first output token (reasoning or
+     *                        answer content), from request send to first SSE delta. Wall-clock
+     *                        and therefore an upper bound of the server TTFT; {@code 0} when not
+     *                        measurable (e.g. non-streaming)
      */
     public record LlmUsage(LocalDateTime tsStart, long millisPP, long millisTG, String model,
                            long promptTokens, long completionTokens, long totalTokens,
-                           long cachedTokens, float ppUncachedTPS, float ppTPS, float tgTPS) {}
+                           long cachedTokens, float ppUncachedTPS, float ppTPS, float tgTPS,
+                           boolean estimated, long ttftClientMs) {}
 
     /** Collected usage statistics for all LLM requests */
     private final List<LlmUsage> usages = Collections.synchronizedList(new ArrayList<>());
@@ -115,11 +129,11 @@ public class WebUiProxy {
 
     /** Name of the LLM model */
     @Value("${" + PROP_MODEL_NAME + ":unknown}")
-    private String modelName;
+    private String modelNameProp;
 
     /** URL of the LLM endpoint */
     @Value("${" + PROP_MODEL_URL + ":http://localhost:8080}")
-    private String modelUrl;
+    private String modelUrlProp;
 
     /** Reasoning mode: on, off, auto (auto = derive from the chat template) */
     @Value("${" + PROP_REASONING + ":auto}")
@@ -264,6 +278,24 @@ public class WebUiProxy {
     public WebUiProxy() {
         // Jackson 3: ObjectMapper is immutable, must be created via Builder
         this.jsonMapper = JsonMapper.builder().build();
+    }
+
+    /**
+     * Returns the name of the LLM model.
+     *
+     * @return the model name
+     */
+    public String getModelName() {
+        return modelNameProp;
+    }
+
+    /**
+     * Returns the URL of the LLM endpoint.
+     *
+     * @return the model URL
+     */
+    public String getModelUrl() {
+        return modelUrlProp;
     }
 
     /**
@@ -491,7 +523,7 @@ public class WebUiProxy {
         ArrayNode data = jsonMapper.createArrayNode();
 
         ObjectNode model = jsonMapper.createObjectNode();
-        model.put("id", modelName);
+        model.put("id", getModelName());
         model.put("object", "model");
         model.put("created", System.currentTimeMillis() / 1000);
         model.put("owned_by", "user");
@@ -855,7 +887,7 @@ public class WebUiProxy {
 
         mapProps.set("default_generation_settings", mapDefGenSettings);
         mapProps.put("total_slots", 1);
-        mapProps.put("model_path", modelName);
+        mapProps.put("model_path", getModelName());
 
         ObjectNode modalities = jsonMapper.createObjectNode();
         modalities.put("vision", hasVision);
@@ -924,16 +956,16 @@ public class WebUiProxy {
             return chatTemplateCache;
         }
         chatTemplateLoaded = true;
-        String key = normalizeModelName(modelName);
+        String key = normalizeModelName(getModelName());
         String resourcePath = "chat-templates/" + key + ".jinja";
         try (InputStream is = getClass().getClassLoader().getResourceAsStream(resourcePath)) {
             if (is == null) {
                 LOG.info("No chat template for model '{}' (looked for {}), reasoning detection disabled",
-                        modelName, resourcePath);
+                        getModelName(), resourcePath);
                 return null;
             }
             chatTemplateCache = new String(is.readAllBytes(), StandardCharsets.UTF_8);
-            LOG.info("Loaded chat template for model '{}' from {}", modelName, resourcePath);
+            LOG.info("Loaded chat template for model '{}' from {}", getModelName(), resourcePath);
             return chatTemplateCache;
         } catch (IOException e) {
             LOG.warn("Failed to read chat template {}: {}", resourcePath, e.getMessage());
@@ -960,14 +992,14 @@ public class WebUiProxy {
         }
         for (String marker : THINKING_MARKERS) {
             if (template.contains(marker)) {
-                String markerNew = mapReasoning.putIfAbsent(modelName, marker);
+                String markerNew = mapReasoning.putIfAbsent(getModelName(), marker);
                 if (markerNew != null) {
-                    LOG.info("Model {}: Reasoning-marker {}", modelName, marker);
+                    LOG.info("Model {}: Reasoning-marker {}", getModelName(), marker);
                 }
                 return true;
             }
         }
-        LOG.info("Model {}: found no reasoning marker in template of length {}", modelName, template.length());
+        LOG.info("Model {}: found no reasoning marker in template of length {}", getModelName(), template.length());
         return false;
     }
 
@@ -1134,7 +1166,7 @@ public class WebUiProxy {
      * @return the current counter value, or -1 on failure
      */
     private long readVllmCachedTokensMetric() {
-        String base = modelUrl;
+        String base = getModelUrl();
         if (!base.endsWith("/")) {
             base += "/";
         }
@@ -1190,7 +1222,7 @@ public class WebUiProxy {
         ObjectNode llmRequest = (ObjectNode) requestNode.deepCopy();
 
         // Set model name (overwrite if present)
-        llmRequest.put("model", modelName);
+        llmRequest.put("model", getModelName());
 
         // Backend-specific reasoning translation:
         // - llamacpp (default): reconstruct reasoning_effort into chat_template_kwargs so
@@ -1227,7 +1259,7 @@ public class WebUiProxy {
         LOG.debug("LLM Request: {}", shortenRequestBody(requestOut));
 
         // Build target URL: modelUrl + requestPath
-        String targetUrl = modelUrl;
+        String targetUrl = getModelUrl();
         if (!targetUrl.endsWith("/")) {
             targetUrl = targetUrl + "/";
         }
@@ -1251,8 +1283,11 @@ public class WebUiProxy {
         final AtomicReference<LocalDateTime> firstContentTime = new AtomicReference<>(null);
         final LocalDateTime tsStart = LocalDateTime.now();
         // Monotonic counterpart of tsStart, used as the reference for the per-chunk token rates
-        // synthesized on the vLLM path (request-send time -> chunk arrival times).
+        // synthesized on the vLLM path (request-send time -> chunk arrival times) and for the
+        // client-side time-to-first-output-token measurement.
         final long tsStartNano = System.nanoTime();
+        // nanoTime of the first output token (reasoning or answer content), 0 until captured.
+        final AtomicLong firstOutputNano = new AtomicLong(0L);
         // When enabled, sample the upstream vLLM cached-tokens counter before the request so the
         // delta after the stream reveals how many prompt tokens were served from the prefix cache.
         boolean sampleMetrics = BACKEND_VLLM.equalsIgnoreCase(backend) && fetchMetrics;
@@ -1327,7 +1362,7 @@ public class WebUiProxy {
             // Read the response and write immediately to client
             try (InputStream is = connection.getInputStream();
                  OutputStream os = clientResponse.getOutputStream()) {
-                copyStream(is, os, sseDataLines, firstContentTime,
+                copyStream(is, os, sseDataLines, firstContentTime, firstOutputNano,
                         BACKEND_VLLM.equalsIgnoreCase(backend), tsStartNano);
                 // Ensure flush happens at the end
                 os.flush();
@@ -1335,7 +1370,7 @@ public class WebUiProxy {
 
             // --- USAGE STATISTICS ---
             recordUsageStatistics(tsStart, firstContentTime.get(), sseDataLines, sampleMetrics,
-                    metricsBefore);
+                    metricsBefore, firstOutputNano, tsStartNano);
 
             // Diagnostic: report how much of the streamed output was reasoning vs answer.
             // Confirms whether the backend actually engaged thinking mode.
@@ -1374,16 +1409,90 @@ public class WebUiProxy {
     }
 
     /**
+     * Reads the time-to-first-token from a vLLM metrics node, tolerating the different field
+     * names/units that vLLM versions use (explicit milliseconds or bare seconds). Returns
+     * {@code 0} when the value is absent or not positive.
+     *
+     * @param metricsNode vLLM per-request metrics node
+     * @return TTFT in milliseconds, or {@code 0}
+     */
+    private static double readMetricsTtftMs(JsonNode metricsNode) {
+        return readMetricsMs(metricsNode, 0,
+                new MetricsMsField("time_to_first_token_ms", 1.0),
+                new MetricsMsField("time_to_first_token_s", 1000.0),
+                new MetricsMsField("time_to_first_token", 1000.0));
+    }
+
+    /**
+     * Reads the generation duration from a vLLM metrics node, tolerating different field
+     * names/units (explicit milliseconds or bare seconds). When no total generation duration is
+     * reported directly, it is derived from vLLM's per-output-token figure
+     * ({@code time_per_output_token}, seconds per token) times the completion tokens.
+     *
+     * @param metricsNode       vLLM per-request metrics node
+     * @param completionTokens  completion tokens generated (used for the
+     *                          {@code time_per_output_token} fallback)
+     * @return generation time in milliseconds, or {@code 0} if unavailable
+     */
+    private static double readMetricsGenMs(JsonNode metricsNode, long completionTokens) {
+        double genMs = readMetricsMs(metricsNode, 0,
+                new MetricsMsField("generation_time_ms", 1.0),
+                new MetricsMsField("generation_time_s", 1000.0),
+                new MetricsMsField("generation_time", 1000.0));
+        if (genMs <= 0 && metricsNode != null) {
+            JsonNode perToken = metricsNode.get("time_per_output_token");
+            if (perToken != null && perToken.isNumber() && completionTokens > 0) {
+                genMs = perToken.asDouble() * completionTokens * 1000.0;
+            }
+        }
+        return genMs;
+    }
+
+    /**
+     * Reads a duration from a JSON node under the first matching field name, applying the
+     * field's unit-to-milliseconds factor. Returns {@code def} when no candidate matches.
+     *
+     * @param node       JSON node to read from
+     * @param def        default value
+     * @param candidates candidate field name + unit-factor pairs
+     * @return the duration in milliseconds, or {@code def}
+     */
+    private static double readMetricsMs(JsonNode node, double def, MetricsMsField... candidates) {
+        if (node == null) {
+            return def;
+        }
+        for (MetricsMsField candidate : candidates) {
+            JsonNode value = node.get(candidate.key());
+            if (value != null && value.isNumber()) {
+                return value.asDouble() * candidate.unitFactorToMs();
+            }
+        }
+        return def;
+    }
+
+    /**
+     * Describes a candidate duration field of a vLLM metrics node together with the factor that
+     * converts its stored unit into milliseconds (1.0 for already-ms values, 1000.0 for seconds).
+     */
+    private record MetricsMsField(String key, double unitFactorToMs) {}
+
+    /**
      * Parses the collected SSE data lines for usage/timing information,
      * computes statistics, logs them, and optionally writes to a JSONL file.
      *
      * @param tsStart         timestamp when the request started
      * @param firstContentTime timestamp of the first content token (streaming), or null if not available
      * @param sseDataLines    collected SSE data line JSON strings
+     * @param sampleMetrics   whether the upstream vLLM cache metrics were sampled
+     * @param metricsBefore   cached-token counter before the request (or -1)
+     * @param firstOutputNano {@link System#nanoTime()} of the first output token (reasoning/answer),
+     *                        or null/0 if not measurable
+     * @param tsStartNano     {@link System#nanoTime()} of the request start
      */
     private void recordUsageStatistics(LocalDateTime tsStart, LocalDateTime firstContentTime,
                                        List<String> sseDataLines, boolean sampleMetrics,
-                                       long metricsBefore) {
+                                       long metricsBefore, AtomicLong firstOutputNano,
+                                       long tsStartNano) {
         if (sseDataLines.isEmpty()) {
             LOG.info("No SSE data lines collected for usage statistics.");
             return;
@@ -1401,7 +1510,7 @@ public class WebUiProxy {
 
         if (lastUsageJson == null) {
             // No usage data from server, log only start time and model
-            LOG.info("No usage statistics from server. tsStart={}, model={}", tsStart, modelName);
+            LOG.info("No usage statistics from server. tsStart={}, model={}", tsStart, getModelName());
             return;
         }
 
@@ -1414,7 +1523,7 @@ public class WebUiProxy {
             // precedence over the wall-clock/rate heuristics used for other backends.
             JsonNode metricsNode = dataNode.get("metrics");
 
-            String model = dataNode.has("model") ? dataNode.get("model").asString() : modelName;
+            String model = dataNode.has("model") ? dataNode.get("model").asString() : getModelName();
 
             long promptTokens = usageNode.has("prompt_tokens") ? usageNode.get("prompt_tokens").asLong() : 0;
             long completionTokens = usageNode.has("completion_tokens") ? usageNode.get("completion_tokens").asLong() : 0;
@@ -1434,10 +1543,19 @@ public class WebUiProxy {
                 }
             }
 
+            // Client-side time-to-first-output-token (wall-clock, upper bound of the server
+            // TTFT). 0 when not measurable (e.g. non-streaming without a streamed SSE feed).
+            long ttftClientMs = (firstOutputNano != null && firstOutputNano.get() > 0L)
+                    ? millisElapsed(tsStartNano, firstOutputNano.get()) : 0L;
+
             long millisPP;
             long millisTG;
             float ppTPS;
             float tgTPS;
+            // Indicates whether the reported rates/timings had to be estimated (wall-clock,
+            // heuristics or synthesized fallbacks) instead of being taken from authoritative
+            // server timings/metrics. Helps consumers judge the trustworthiness of a record.
+            boolean estimated;
 
             if (timingsNode != null) {
                 // llama.cpp provides detailed timings in the response.
@@ -1449,88 +1567,95 @@ public class WebUiProxy {
                 double serverPpTPS = timingsNode.has("prompt_per_second") ? timingsNode.get("prompt_per_second").asDouble() : 0;
                 double serverTgTPS = timingsNode.has("predicted_per_second") ? timingsNode.get("predicted_per_second").asDouble() : 0;
 
-                // Compute own values from the raw data for comparison
-                float computedPpTPS = (millisPP > 0 && promptTokens > 0) ? (promptTokens * 1000f / millisPP) : 0;
-                float computedTgTPS = (millisTG > 0 && completionTokens > 0) ? (completionTokens * 1000f / millisTG) : 0;
-
+                // Server-reported rates: llama.cpp's prompt_per_second is based on ALL prompt
+                // tokens (uncached share). ppUncachedTPS below gives the cache-corrected counterpart.
                 ppTPS = (float) serverPpTPS;
                 tgTPS = (float) serverTgTPS;
+                estimated = false;
 
                 LOG.info("Usage stats (llama.cpp): promptTokens={}, completionTokens={}, totalTokens={}, cachedTokens={}, "
-                                + "millisPP={}, millisTG={}, ppUncachedTPS={}, ppTPS={} (computed: {}), tgTPS={} (computed: {})",
+                                + "millisPP={}, millisTG={}, ppTPS={} (server), ppUncachedTPS={} (cache-corrected), "
+                                + "tgTPS={} (server), ttftClientMs={}, estimated={}",
                         promptTokens, completionTokens, totalTokens, cachedTokens,
-                        millisPP, millisTG, computePpUncachedTPS(millisPP, promptTokens, cachedTokens),
-                        ppTPS, computedPpTPS, tgTPS, computedTgTPS);
+                        millisPP, millisTG, ppTPS,
+                        computePpUncachedTPS(millisPP, promptTokens, cachedTokens),
+                        tgTPS, ttftClientMs, estimated);
 
-            } else if (metricsNode != null && metricsNode.has("time_to_first_token_ms")
-                    && metricsNode.get("time_to_first_token_ms").asDouble() > 0) {
+            } else if (metricsNode != null && readMetricsTtftMs(metricsNode) > 0) {
                 // vLLM provides authoritative server-side timing metrics (with
-                // --enable-prompt-tokens-details), which are far more accurate than the wall-clock
-                // split below, so the rate heuristic must not be applied in this case.
-                double ttftMs = metricsNode.get("time_to_first_token_ms").asDouble();
-                double genMs = metricsNode.has("generation_time_ms")
-                        ? metricsNode.get("generation_time_ms").asDouble() : 0;
-                millisPP = Math.round(ttftMs);
-                millisTG = Math.round(genMs);
+                // --enable-per-request-metrics / --enable-prompt-tokens-details). They are far
+                // more accurate than the wall-clock split below, so the rate heuristic must not
+                // be applied in this case. Field names/units vary across vLLM versions; the
+                // helpers below read them tolerantly and normalize everything to milliseconds.
+                millisPP = Math.round(readMetricsTtftMs(metricsNode));
+                millisTG = Math.round(readMetricsGenMs(metricsNode, completionTokens));
+
+                // Prompt rate: only the tokens that actually had to be computed count. With a
+                // large cached share a naive promptTokens/time split is inflated by the "free"
+                // KV-cache hits, so correct for the cached tokens that
+                // --enable-prompt-tokens-details reports.
+                long uncachedTokens = Math.max(0, promptTokens - cachedTokens);
+                ppTPS = (millisPP > 0 && uncachedTokens > 0)
+                        ? (uncachedTokens * 1000f / millisPP) : 0;
 
                 double serverTgTPS = metricsNode.has("tokens_per_second")
                         ? metricsNode.get("tokens_per_second").asDouble() : 0;
                 tgTPS = (float) serverTgTPS;
-                if (tgTPS <= 0 && millisTG > 0 && completionTokens > 0) {
+                // The generation rate/ time may be missing or zero; fall back to the raw values
+                // and flag the record as estimated in that case.
+                boolean genEstimated = tgTPS <= 0;
+                if (genEstimated && millisTG > 0 && completionTokens > 0) {
                     tgTPS = completionTokens * 1000f / millisTG;
                 }
-                ppTPS = (millisPP > 0 && promptTokens > 0)
-                        ? (promptTokens * 1000f / millisPP) : 0;
+                estimated = genEstimated;
 
+                long ttftServerMs = millisPP;
+                long ttftDeltaMs = (ttftClientMs > 0) ? (ttftClientMs - ttftServerMs) : 0;
                 LOG.info("Usage stats (vLLM metrics): promptTokens={}, completionTokens={}, totalTokens={}, cachedTokens={}, "
-                                + "millisPP={}, millisTG={}, ppUncachedTPS={}, ppTPS={}, tgTPS={}",
+                                + "millisPP={}, millisTG={}, ppTPS={} (cache-corrected), tgTPS={}, "
+                                + "ttftServerMs={}, ttftClientMs={}, ttftDeltaMs={}, estimated={}",
                         promptTokens, completionTokens, totalTokens, cachedTokens,
-                        millisPP, millisTG, computePpUncachedTPS(millisPP, promptTokens, cachedTokens),
-                        ppTPS, tgTPS);
+                        millisPP, millisTG, ppTPS, tgTPS,
+                        ttftServerMs, ttftClientMs, ttftDeltaMs, estimated);
 
             } else if (firstContentTime != null) {
                 // Streaming with vLLM (no timings, but we have firstContentTime from the stream).
+                // This is a wall-clock estimate, not server-authoritative, therefore flagged.
                 LocalDateTime tsNow = LocalDateTime.now();
                 millisPP = Duration.between(tsStart, firstContentTime).toMillis();
                 millisTG = Duration.between(firstContentTime, tsNow).toMillis();
 
-                float computedPpTPS = (millisPP > 0 && promptTokens > 0) ? (promptTokens * 1000f / millisPP) : 0;
+                long uncachedTokens = Math.max(0, promptTokens - cachedTokens);
+                float computedPpTPS = (millisPP > 0 && uncachedTokens > 0) ? (uncachedTokens * 1000f / millisPP) : 0;
                 float computedTgTPS = (millisTG > 0 && completionTokens > 0) ? (completionTokens * 1000f / millisTG) : 0;
                 ppTPS = computedPpTPS;
                 tgTPS = computedTgTPS;
+                estimated = true;
 
                 LOG.info("Usage stats (vLLM streaming): promptTokens={}, completionTokens={}, totalTokens={}, cachedTokens={}, "
-                                + "millisPP={}, millisTG={}, ppUncachedTPS={}, ppTPS={}, tgTPS={}",
+                                + "millisPP={}, millisTG={}, ppTPS={} (cache-corrected), tgTPS={}, "
+                                + "ttftClientMs={}, estimated={}",
                         promptTokens, completionTokens, totalTokens, cachedTokens,
-                        millisPP, millisTG, computePpUncachedTPS(millisPP, promptTokens, cachedTokens),
-                        ppTPS, tgTPS);
+                        millisPP, millisTG, ppTPS, tgTPS, ttftClientMs, estimated);
 
             } else {
-                // Non-streaming (buffered): only totalMillis known.
-                // Estimate PP/TG split using the heuristic ppTPS = 5 * tgTPS.
+                // Non-streaming (buffered) without server-side timing (no timings and no usable
+                // vLLM metrics): there is no reliable way to split the request into prompt- and
+                // generation-time. The former fixed ppTPS = 5 * tgTPS heuristic fabricated
+                // misleading values and has been removed; the pp/tg rates are reported as unknown
+                // (0) and the record is flagged as estimated.
                 long totalMillis = Duration.between(tsStart, LocalDateTime.now()).toMillis();
-                // ppTPS = 5 * tgTPS  =>  promptTokens/millisPP = 5 * completionTokens/millisTG
-                // millisPP + millisTG = totalMillis
-                // => promptTokens / (5*tgTPS) * 1000 + completionTokens / tgTPS * 1000 = totalMillis
-                // => 1000/tgTPS * (promptTokens/5 + completionTokens) = totalMillis
-                // => tgTPS = 1000 * (promptTokens/5 + completionTokens) / totalMillis
-                if (totalMillis > 0 && completionTokens > 0) {
-                    float factor = (promptTokens / 5f + completionTokens);
-                    tgTPS = 1000f * factor / totalMillis;
-                    ppTPS = 5f * tgTPS;
-                } else {
-                    ppTPS = 0;
-                    tgTPS = 0;
-                }
-                millisPP = (ppTPS > 0 && promptTokens > 0) ? Math.round(promptTokens * 1000f / ppTPS) : totalMillis;
-                millisTG = (tgTPS > 0 && completionTokens > 0) ? Math.round(completionTokens * 1000f / tgTPS) : totalMillis;
+                millisPP = 0;
+                millisTG = 0;
+                ppTPS = 0;
+                tgTPS = 0;
+                estimated = true;
 
-                LOG.info("Usage stats (non-streaming): promptTokens={}, completionTokens={}, totalTokens={}, cachedTokens={}, "
-                                + "totalMillis={}, millisPP={}, millisTG={}, ppUncachedTPS={}, ppTPS={}, tgTPS={}",
-                        promptTokens, completionTokens, totalTokens, cachedTokens,
-                        totalMillis, millisPP, millisTG,
-                        computePpUncachedTPS(millisPP, promptTokens, cachedTokens),
-                        ppTPS, tgTPS);
+                LOG.info("Usage stats (non-streaming, no server metrics): promptTokens={}, completionTokens={}, totalTokens={}, "
+                                + "cachedTokens={}, totalMillis={}, millisPP={}, millisTG={}, ppTPS={}, tgTPS={}, estimated={}",
+                        promptTokens, completionTokens, totalTokens,
+                        cachedTokens, totalMillis, millisPP, millisTG,
+                        ppTPS, tgTPS, estimated);
             }
 
             // Effective prompt-processing rate for the tokens that actually had to be computed
@@ -1540,7 +1665,7 @@ public class WebUiProxy {
 
             LlmUsage usage = new LlmUsage(tsStart, millisPP, millisTG, model,
                     promptTokens, completionTokens, totalTokens, cachedTokens,
-                    ppUncachedTPS, ppTPS, tgTPS);
+                    ppUncachedTPS, ppTPS, tgTPS, estimated, ttftClientMs);
             usages.add(usage);
 
             // Write to JSONL file if configured
@@ -1621,6 +1746,8 @@ public class WebUiProxy {
             record.put("ppUncachedTPS", usage.ppUncachedTPS());
             record.put("ppTPS", usage.ppTPS());
             record.put("tgTPS", usage.tgTPS());
+            record.put("estimated", usage.estimated());
+            record.put("ttftClientMs", usage.ttftClientMs());
             record.set("usage", usageNode);
 
             String jsonLine = jsonMapper.writeValueAsString(record) + "\n";
@@ -1669,7 +1796,7 @@ public class WebUiProxy {
      */
     private String forwardRequestToLLMBuffered(JsonNode requestNode, String cookie, String requestPath) throws IOException {
         ObjectNode llmRequest = (ObjectNode) requestNode.deepCopy();
-        llmRequest.put("model", modelName);
+        llmRequest.put("model", getModelName());
 
         // Keep the reasoning translation consistent with the streaming path.
         if (BACKEND_VLLM.equalsIgnoreCase(backend)) {
@@ -1690,7 +1817,7 @@ public class WebUiProxy {
 
         String requestOut = jsonMapper.writeValueAsString(llmRequest);
 
-        String targetUrl = modelUrl;
+        String targetUrl = getModelUrl();
         if (!targetUrl.endsWith("/")) targetUrl += "/";
         targetUrl += requestPath.startsWith("/") ? requestPath.substring(1) : requestPath;
 
@@ -1748,8 +1875,9 @@ public class WebUiProxy {
                 List<String> dataLines = new ArrayList<>();
                 dataLines.add(jsonMapper.writeValueAsString(responseNode));
                 // Non-streaming responses carry prompt_tokens_details.cached_tokens natively,
-                // so no extra /metrics sampling is needed here.
-                recordUsageStatistics(tsStart, null, dataLines, false, -1);
+                // so no extra /metrics sampling is needed here. No per-chunk timing is available,
+                // hence the firstOutputNano/tsStartNano are left null/0 (ttftClientMs = 0).
+                recordUsageStatistics(tsStart, null, dataLines, false, -1, null, 0L);
             }
         } catch (RuntimeException e) {
             LOG.warn("Could not parse usage from non-streaming response: {}", e.getMessage());
@@ -1799,13 +1927,16 @@ public class WebUiProxy {
      * @param in               source input stream
      * @param out              target output stream
      * @param sseDataLines     collector for SSE data line JSON strings (may be null)
-     * @param firstContentTime atomic reference to store the timestamp of the first content token (may be null)
+     * @param firstContentTime atomic reference to store the timestamp of the first answer-content token (may be null)
+     * @param firstOutputNano  atomic long to store the {@link System#nanoTime()} of the first output
+     *                         token (reasoning or answer content), used for the client TTFT (may be null)
      * @param rewriteFlashReasoning whether to apply the vLLM-specific SSE enrichment (reasoning rewrite + live timings)
      * @param tsStartNano      {@link System#nanoTime()} of the request start, reference for the prompt rate
      * @throws IOException if an I/O error occurs
      */
     private void copyStream(InputStream in, OutputStream out, List<String> sseDataLines,
                             AtomicReference<LocalDateTime> firstContentTime,
+                            AtomicLong firstOutputNano,
                             boolean rewriteFlashReasoning, long tsStartNano) throws IOException {
         // Buffer for a partial SSE data line that was split across chunk boundaries.
         StringBuilder pendingData = new StringBuilder();
@@ -1820,8 +1951,9 @@ public class WebUiProxy {
             String chunk = new String(buffer, 0, bytesRead, StandardCharsets.UTF_8);
 
             // Collect SSE data lines for usage extraction
-            // and detect the first content token for PP/TG separation
-            if (sseDataLines != null || firstContentTime != null || rewriteFlashReasoning) {
+            // and detect the first output/content token for the PP/TG split and client TTFT.
+            if (sseDataLines != null || firstContentTime != null || firstOutputNano != null
+                    || rewriteFlashReasoning) {
                 // Prepend any pending data from a previous partial line
                 String parseText;
                 if (!pendingData.isEmpty()) {
@@ -1846,6 +1978,12 @@ public class WebUiProxy {
                     String dataLine = parseText.substring(dataStart + 6, lineEnd).trim();
                     if (!dataLine.isEmpty()) {
                         boolean isDoneLine = "[DONE]".equals(dataLine);
+                        // Record the client-side timestamps of the first output token (reasoning or
+                        // answer) and of the first answer-content token, unless already captured.
+                        // DONE-lines never carry a delta, so they are skipped here.
+                        if (!isDoneLine) {
+                            recordFirstTokenTiming(dataLine, firstContentTime, firstOutputNano);
+                        }
                         // The line forwarded to the client: for vLLM this is the reasoning rewrite
                         // plus a synthesized llama.cpp-style "timings" node (live token/s rates).
                         String clientLine = dataLine;
@@ -1877,11 +2015,6 @@ public class WebUiProxy {
                                 sseDataLines.addAll(lastTwoLines);
                                 sseDataLines.add(dataLine);
                             }
-                            // Check for first content token (streaming: choices[0].delta.content != null)
-                            if (firstContentTime != null && firstContentTime.get() == null
-                                    && dataLine.contains("\"content\"")) {
-                                firstContentTime.compareAndExchange(null, LocalDateTime.now());
-                            }
                         }
                     }
                     idx = lineEnd + 1;
@@ -1895,6 +2028,69 @@ public class WebUiProxy {
         if (!lastTwoLines.isEmpty()) {
             LOG.debug("SSE last two lines: {}", lastTwoLines);
         }
+    }
+
+    /**
+     * Records the client-side timestamps of the first output token and of the first answer-content
+     * token of a single SSE data payload, unless they are already captured.
+     *
+     * <p>The first <em>output</em> token is the first delta that carries either reasoning
+     * ({@code reasoning}/{@code reasoning_content}) or answer content — it is the client-side
+     * counterpart of the server {@code time_to_first_token}. The first <em>answer-content</em>
+     * token is the first delta carrying a non-null {@code content}, used for the PP/TG split.
+     * For a reasoning model the output token therefore arrives before the answer-content token.
+     * Values that are present but {@code null} (OpenAI streams often carry {@code "content": null}
+     * while thinking) do not count.</p>
+     *
+     * @param dataLine          raw SSE data payload
+     * @param firstContentTime  atomic reference for the first answer-content token (may be null)
+     * @param firstOutputNano   atomic long for the first output token as {@link System#nanoTime()}
+     *                          value (may be null)
+     */
+    private void recordFirstTokenTiming(String dataLine,
+                                        AtomicReference<LocalDateTime> firstContentTime,
+                                        AtomicLong firstOutputNano) {
+        boolean needOutput = firstOutputNano != null && firstOutputNano.get() == 0L;
+        boolean needContent = firstContentTime != null && firstContentTime.get() == null;
+        if (!needOutput && !needContent) {
+            return;
+        }
+        JsonNode node;
+        try {
+            node = jsonMapper.readTree(dataLine);
+        } catch (RuntimeException e) {
+            // payload is not decodable JSON (e.g. a keep-alive frame); nothing to record.
+            return;
+        }
+        JsonNode choices = (node == null) ? null : node.get("choices");
+        if (choices == null || !choices.isArray() || choices.isEmpty()) {
+            return;
+        }
+        JsonNode delta = choices.get(0).get("delta");
+        if (delta == null || !delta.isObject()) {
+            return;
+        }
+        boolean hasReasoning = isNonNullString(delta, "reasoning")
+                || isNonNullString(delta, "reasoning_content");
+        boolean hasAnswerContent = isNonNullString(delta, "content");
+        if (needOutput && (hasReasoning || hasAnswerContent)) {
+            firstOutputNano.compareAndExchange(0L, System.nanoTime());
+        }
+        if (needContent && hasAnswerContent) {
+            firstContentTime.compareAndExchange(null, LocalDateTime.now());
+        }
+    }
+
+    /**
+     * Returns whether the given JSON object has a string value (non-null) under the field name.
+     *
+     * @param node JSON object to inspect
+     * @param field field name
+     * @return {@code true} if the field exists and holds a non-null string
+     */
+    private static boolean isNonNullString(JsonNode node, String field) {
+        JsonNode value = node.get(field);
+        return value != null && value.isTextual() && !value.asString().isEmpty();
     }
 
     /**
