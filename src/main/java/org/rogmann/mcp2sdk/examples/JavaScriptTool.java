@@ -16,11 +16,10 @@ import org.rogmann.mcp2sdk.ToolSpecWithState;
 import org.rogmann.mcp2sdk.ToolState;
 import org.rogmann.mcp2sdk.js.JsArchiveBridge;
 import org.rogmann.mcp2sdk.js.JsCryptoBridge;
+import org.rogmann.mcp2sdk.js.JsFileSystem;
 import org.rogmann.mcp2sdk.js.JsFileSystemBridge;
 import org.rogmann.mcp2sdk.js.JsMcpProxyBridge;
 import org.rogmann.mcp2sdk.js.JsModuleInterface;
-import org.rogmann.mcp2sdk.js.JsObjdumpBridge;
-import org.rogmann.mcp2sdk.js.JsPythonBridge;
 import org.rogmann.mcp2sdk.poi.DocxToolBoxJsBridge;
 import org.rogmann.mcp2sdk.poi.PoiToolBoxJsBridge;
 import org.rogmann.mcp2sdk.poi.PptxToolBoxJsBridge;
@@ -67,8 +66,6 @@ public class JavaScriptTool {
         modules.put("fs", new JsFileSystemBridge());
         modules.put("crypto", new JsCryptoBridge());
         modules.put("archive", new JsArchiveBridge());
-        modules.put("objdump", new JsObjdumpBridge());
-        modules.put("python", new JsPythonBridge());
         modules.put("poi", new PoiToolBoxJsBridge());
         modules.put("docx", new DocxToolBoxJsBridge());
         modules.put("pptx", new PptxToolBoxJsBridge());
@@ -101,6 +98,16 @@ public class JavaScriptTool {
 
     /**
      * Creates the synchronous tool specification for the JavaScript execution tool.
+     * <p>
+     * The tool accepts {@code script} (inline source), {@code path} (a saved JS file from the
+     * project), or both. When both are given, the inline {@code script} runs first as a
+     * pre-initialization step and the file content is appended - the concatenation is executed
+     * as one script. This lets the LLM keep a stable bootstrap/helper prefix in {@code script}
+     * while the (frequently edited) main logic lives in the file, without copying the
+     * initialization into every file or editing it in. All variants are routed through the same
+     * sandbox engine ({@link #runScript}), so a JavaScript file always runs under exactly the
+     * same restrictions as inline source.
+     * </p>
      * @return the tool specification and its state
      */
     public static ToolSpecWithState createToolInstance() {
@@ -112,12 +119,25 @@ public class JavaScriptTool {
 
         Map<String, Object> scriptProp = new HashMap<>();
         scriptProp.put("type", "string");
-        scriptProp.put("description", "JavaScript source code");
+        scriptProp.put("description",
+                "JavaScript source code to execute inline. If 'path' is also given, this script "
+                + "runs first (e.g. pre-initializations / helpers) and the file content is "
+                + "appended afterwards. At least one of 'script' or 'path' must be provided.");
         properties.put("script", scriptProp);
 
-        List<String> requiredFields = List.of("script");
+        Map<String, Object> pathProp = new HashMap<>();
+        pathProp.put("type", "string");
+        pathProp.put("description",
+                "Path of an existing JavaScript file in the project (relative to the project base "
+                + "directory, optionally prefixed with /addonName/...), e.g. created/edited with "
+                + "create_new_file/edit_file or fs.writeFile. It is read with the same controlled "
+                + "fs access and executed in exactly the same sandbox as 'script'. If 'script' is "
+                + "also given, the file runs after the inline script; otherwise the file alone is "
+                + "executed. At least one of 'script' or 'path' must be provided.");
+        properties.put("path", pathProp);
 
-        JsonSchema inputSchema = new JsonSchema("object", properties, requiredFields, null, null, null);
+        // At least one of 'script' or 'path' must be provided; enforced in call().
+        JsonSchema inputSchema = new JsonSchema("object", properties, List.of(), null, null, null);
 
         McpSchema.Tool tool = McpSchema.Tool.builder()
             .name(NAME)
@@ -137,6 +157,13 @@ public class JavaScriptTool {
 
     /**
      * Handles the tool call request.
+     * <p>
+     * Accepts {@code script} (inline source), {@code path} (a JS file to execute), or both.
+     * A file is read through the controlled {@code fs} access (so only project-base / add-on
+     * paths are allowed). If both are given, the inline {@code script} is executed first as a
+     * pre-initialization step and the file content is appended; all combinations are executed
+     * by the same engine {@link #runScript}, guaranteeing identical sandbox restrictions.
+     * </p>
      * @param exchange the server exchange
      * @param request the tool call request
      * @return the tool call result
@@ -148,15 +175,60 @@ public class JavaScriptTool {
         Map<String, Object> arguments = request.arguments();
 
         Object oScript = arguments.get("script");
-        if (oScript == null) {
+        Object oPath = arguments.get("path");
+        if (oScript == null && oPath == null) {
             return CallToolResult.builder()
                 .isError(true)
-                .addTextContent("Missing 'script' parameter in request")
+                .addTextContent("Provide at least one of 'script' (inline JavaScript source code) "
+                        + "or 'path' (a JavaScript file in the project to execute).")
                 .build();
         }
 
-        String script = oScript.toString();
-        LOGGER.info("Executing JavaScript: " + script);
+        final String script;
+        final String sourceName;
+        if (oPath == null) {
+            // Inline-only.
+            script = oScript.toString();
+            sourceName = "inline";
+        } else {
+            String path = oPath.toString();
+            String fileContent;
+            try {
+                fileContent = JsFileSystem.readFile(path);
+            } catch (RuntimeException e) {
+                return CallToolResult.builder()
+                    .isError(true)
+                    .addTextContent("Cannot read JavaScript file '" + path + "': " + e.getMessage())
+                    .build();
+            }
+            if (oScript == null) {
+                // File-only.
+                script = fileContent;
+                sourceName = path;
+            } else {
+                // Combined: pre-initialization (inline script) first, then the file.
+                script = oScript.toString() + "\n" + fileContent;
+                sourceName = "inline+" + path;
+            }
+        }
+        return runScript(script, sourceName);
+    }
+
+    /**
+     * Executes JavaScript source code in the sandboxed GraalVM JS context.
+     * <p>
+     * All modes of {@code javascript_tool} - inline {@code script}, file {@code path}, or the
+     * combined {@code script}+{@code path} concatenation - delegate here, so every execution
+     * uses the exact same sandbox, module wiring, console capture and error formatting. This is
+     * what guarantees that a JavaScript file is executed under precisely the same restrictions
+     * as a script passed directly by the LLM.
+     * </p>
+     * @param script the JavaScript source code to execute
+     * @param sourceName a human-readable name for logging (e.g. "inline" or the file path)
+     * @return the tool call result
+     */
+    private CallToolResult runScript(String script, String sourceName) {
+        LOGGER.info("Executing JavaScript (" + sourceName + "): " + script);
 
         // Capture console.log output (stdout)
         ByteArrayOutputStream baosOut = new ByteArrayOutputStream();
