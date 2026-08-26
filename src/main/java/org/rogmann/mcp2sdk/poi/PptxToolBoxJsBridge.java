@@ -101,6 +101,10 @@ public class PptxToolBoxJsBridge implements JsModuleInterface {
             box.appendParagraph(args[0].asString(), args[1].asString());
             return null;
         });
+        methods.put("getTableData", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.getTableData(args[0].asString())));
+        methods.put("getTableText", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.getTableText(args[0].asString())));
 
         methods.put("addTextBox", (ProxyExecutable) args -> {
             String text = args.length > 1 && !args[1].isNull() ? args[1].asString() : "";

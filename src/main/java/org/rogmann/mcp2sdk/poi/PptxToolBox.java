@@ -13,10 +13,15 @@ import org.openxmlformats.schemas.drawingml.x2006.main.STLineEndWidth;
 import org.openxmlformats.schemas.presentationml.x2006.main.CTShape;
 import org.apache.poi.xslf.usermodel.XMLSlideShow;
 import org.apache.poi.xslf.usermodel.XSLFAutoShape;
+import org.apache.poi.xslf.usermodel.XSLFConnectorShape;
 import org.apache.poi.xslf.usermodel.XSLFGroupShape;
+import org.apache.poi.xslf.usermodel.XSLFPictureShape;
 import org.apache.poi.xslf.usermodel.XSLFShape;
 import org.apache.poi.xslf.usermodel.XSLFSimpleShape;
 import org.apache.poi.xslf.usermodel.XSLFSlide;
+import org.apache.poi.xslf.usermodel.XSLFTable;
+import org.apache.poi.xslf.usermodel.XSLFTableCell;
+import org.apache.poi.xslf.usermodel.XSLFTableRow;
 import org.apache.poi.xslf.usermodel.XSLFSlideLayout;
 import org.apache.poi.xslf.usermodel.XSLFSlideMaster;
 import org.apache.poi.xslf.usermodel.XSLFTextBox;
@@ -401,6 +406,95 @@ public class PptxToolBox {
     }
 
     /**
+     * Reads the content of a table shape as a JSON-compatible structure.
+     * <p>
+     * The returned map contains {@code rowCount}, {@code colCount} and {@code rows}
+     * (each row with {@code rowNum} and {@code cells}). Each cell is a text-shape map
+     * with {@code text} and {@code paragraphs}/{@code runs} (including run handles and
+     * styling), plus its {@code col} index.
+     * </p>
+     * @param shapeHandle handle of a table shape (shapeType "TABLE")
+     * @return Map with the table content
+     * @throws PoiUserRuntimeException if the shape is not a table
+     */
+    public Map<String, Object> getTableData(String shapeHandle) {
+        XSLFShape shape = getShape(shapeHandle);
+        if (!(shape instanceof XSLFTable table)) {
+            throw new PoiUserRuntimeException(
+                    "Shape is not a table: " + shapeHandle
+                    + " (type: " + shape.getClass().getSimpleName() + ")");
+        }
+        String showHandle = shapeShow.get(shapeHandle);
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("table", shapeHandle);
+        result.put("rowCount", table.getNumberOfRows());
+        result.put("colCount", table.getNumberOfColumns());
+
+        List<XSLFTableRow> tableRows = table.getRows();
+        List<Map<String, Object>> rowsList = new ArrayList<>();
+        for (int r = 0; r < tableRows.size(); r++) {
+            XSLFTableRow row = tableRows.get(r);
+            List<XSLFTableCell> rowCells = row.getCells();
+            Map<String, Object> rowMap = new LinkedHashMap<>();
+            rowMap.put("rowNum", r);
+            List<Map<String, Object>> cellsList = new ArrayList<>();
+            for (int c = 0; c < table.getNumberOfColumns(); c++) {
+                XSLFTableCell cell = c < rowCells.size() ? rowCells.get(c) : null;
+                Map<String, Object> cellMap;
+                if (cell != null) {
+                    cellMap = textShapeToMap(cell, showHandle);
+                } else {
+                    cellMap = new LinkedHashMap<>();
+                    cellMap.put("text", "");
+                }
+                cellMap.put("col", c);
+                cellsList.add(cellMap);
+            }
+            rowMap.put("cells", cellsList);
+            rowsList.add(rowMap);
+        }
+        result.put("rows", rowsList);
+        return result;
+    }
+
+    /**
+     * Reads only the cell texts of a table shape as a 2D structure.
+     * <p>
+     * The returned map contains {@code rowCount}, {@code colCount} and {@code rows}
+     * (a list of rows, each a list of cell texts). Empty/merged cells are represented
+     * as empty strings.
+     * </p>
+     * @param shapeHandle handle of a table shape (shapeType "TABLE")
+     * @return Map with the cell texts as a 2D list under key "rows"
+     * @throws PoiUserRuntimeException if the shape is not a table
+     */
+    public Map<String, Object> getTableText(String shapeHandle) {
+        XSLFShape shape = getShape(shapeHandle);
+        if (!(shape instanceof XSLFTable table)) {
+            throw new PoiUserRuntimeException(
+                    "Shape is not a table: " + shapeHandle
+                    + " (type: " + shape.getClass().getSimpleName() + ")");
+        }
+        List<List<String>> data = new ArrayList<>();
+        List<XSLFTableRow> tableRows = table.getRows();
+        for (XSLFTableRow row : tableRows) {
+            List<XSLFTableCell> rowCells = row.getCells();
+            List<String> rowList = new ArrayList<>();
+            for (int c = 0; c < table.getNumberOfColumns(); c++) {
+                XSLFTableCell cell = c < rowCells.size() ? rowCells.get(c) : null;
+                rowList.add(cell != null && cell.getText() != null ? cell.getText() : "");
+            }
+            data.add(rowList);
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("rowCount", table.getNumberOfRows());
+        result.put("colCount", table.getNumberOfColumns());
+        result.put("rows", data);
+        return result;
+    }
+
+    /**
      * Replaces the whole text of a text shape.
      * @param shapeHandle shape handle
      * @param text new text
@@ -704,6 +798,14 @@ public class PptxToolBox {
                 pptx.getShapeText(sp)          - Text of a text shape (null if none)
                 pptx.setShapeText(sp, txt)     - Replace the text of a text shape
                 pptx.appendParagraph(sp, txt)  - Append a text paragraph
+                pptx.getTableData(sp)          - Read a table (sp of shapeType "TABLE") as
+                                                   {rowCount, colCount, rows:[{rowNum,cells:
+                                                   [{col,text,paragraphs,runs}]}]}
+                pptx.getTableText(sp)          - Read only the cell texts of a table as
+                                                   {rowCount, colCount, rows:[[...],...]}
+                Note: shapes expose a semantic "shapeType" (TABLE, GROUP, PICTURE, CHART,
+                CONNECTOR, TEXT_BOX, AUTO_SHAPE, SIMPLE_SHAPE) plus the raw "javaClass".
+                For tables, combine getSlides (find shapeType "TABLE") with getTableData/getTableText.
 
                 --- More shape operations ---
                 pptx.addTextBox(slide,t,w,h,h)  - Create a positioned text box
@@ -739,6 +841,89 @@ public class PptxToolBox {
     // ========================================================================
 
     /**
+     * Classifies a shape into a stable, language-independent semantic type name.
+     * <p>
+     * The raw Java class name remains available via the {@code javaClass} field.
+     * </p>
+     */
+    private static String classifyShapeType(XSLFShape shape) {
+        if (shape instanceof XSLFTable) {
+            return "TABLE";
+        }
+        if (shape instanceof XSLFGroupShape) {
+            return "GROUP";
+        }
+        if (shape instanceof XSLFPictureShape) {
+            return "PICTURE";
+        }
+        if (shape instanceof XSLFConnectorShape) {
+            return "CONNECTOR";
+        }
+        if (shape instanceof XSLFTextBox) {
+            return "TEXT_BOX";
+        }
+        if (shape instanceof XSLFAutoShape) {
+            return "AUTO_SHAPE";
+        }
+        if (shape instanceof XSLFSimpleShape) {
+            return "SIMPLE_SHAPE";
+        }
+        return shape.getClass().getSimpleName();
+    }
+
+    /**
+     * Extracts the text content of a text shape (including paragraphs and runs with
+     * styling) into a JSON-compatible map with keys {@code text} and {@code paragraphs}.
+     * <p>
+     * Shared by {@link #shapeToMap(XSLFShape, String, int)} (for text shapes) and
+     * {@link #getTableData(String)} (for table cells, since a cell is a text shape).
+     * </p>
+     */
+    private Map<String, Object> textShapeToMap(XSLFTextShape textShape, String showHandle) {
+        Map<String, Object> textMap = new LinkedHashMap<>();
+        textMap.put("text", textShape.getText());
+        List<Map<String, Object>> paraList = new ArrayList<>();
+        for (XSLFTextParagraph para : textShape.getTextParagraphs()) {
+            List<Map<String, Object>> runList = new ArrayList<>();
+            for (XSLFTextRun run : para.getTextRuns()) {
+                Map<String, Object> rm = new LinkedHashMap<>();
+                String rH = generateHandle("tr");
+                runs.put(rH, run);
+                runShow.put(rH, showHandle);
+                rm.put("h", rH);
+                rm.put("text", run.getRawText());
+                // Font / color info for comparing and copying run styling
+                Double fontSize = run.getFontSize();
+                if (fontSize != null) {
+                    rm.put("fontSize", fontSize);
+                }
+                boolean bold = run.isBold();
+                rm.put("bold", bold);
+                boolean italic = run.isItalic();
+                rm.put("italic", italic);
+                String fontFamily = run.getFontFamily();
+                if (fontFamily != null) {
+                    rm.put("fontFamily", fontFamily);
+                }
+                PaintStyle fontPaint = run.getFontColor();
+                if (fontPaint instanceof PaintStyle.SolidPaint solid) {
+                    java.awt.Color fontColor =
+                            DrawPaint.applyColorTransform(solid.getSolidColor());
+                    if (fontColor != null) {
+                        rm.put("fontColor", PoiColorUtil.toHex(fontColor));
+                    }
+                }
+                runList.add(rm);
+            }
+            Map<String, Object> pm = new LinkedHashMap<>();
+            pm.put("runs", runList);
+            paraList.add(pm);
+        }
+        textMap.put("paragraphs", paraList);
+        return textMap;
+    }
+
+    /**
      * Builds a JSON-compatible map for a shape, including position/size/rotation,
      * geometry, colors and (for text shapes) paragraphs/runs.
      */
@@ -750,7 +935,8 @@ public class PptxToolBox {
         shapeMap.put("h", spH);
         shapeMap.put("name", shape.getShapeName());
         shapeMap.put("shapeId", shape.getShapeId());
-        shapeMap.put("shapeType", shape.getClass().getSimpleName());
+        shapeMap.put("shapeType", classifyShapeType(shape));
+        shapeMap.put("javaClass", shape.getClass().getSimpleName());
 
         // Position / size / rotation (only shapes implementing PlaceableShape)
         if (shape instanceof PlaceableShape<?, ?> ps) {
@@ -778,48 +964,13 @@ public class PptxToolBox {
                 shapeMap.put("lineColor", PoiColorUtil.toHex(line));
             }
         }
+        if (shape instanceof XSLFTable) {
+            shapeMap.put("table", true);
+        }
 
         // Text content
         if (shape instanceof XSLFTextShape textShape) {
-            shapeMap.put("text", textShape.getText());
-            List<Map<String, Object>> paraList = new ArrayList<>();
-            for (XSLFTextParagraph para : textShape.getTextParagraphs()) {
-                List<Map<String, Object>> runList = new ArrayList<>();
-                for (XSLFTextRun run : para.getTextRuns()) {
-                    Map<String, Object> rm = new LinkedHashMap<>();
-                    String rH = generateHandle("tr");
-                    runs.put(rH, run);
-                    runShow.put(rH, showHandle);
-                    rm.put("h", rH);
-                    rm.put("text", run.getRawText());
-                    // Font / color info for comparing and copying run styling
-                    Double fontSize = run.getFontSize();
-                    if (fontSize != null) {
-                        rm.put("fontSize", fontSize);
-                    }
-                    boolean bold = run.isBold();
-                    rm.put("bold", bold);
-                    boolean italic = run.isItalic();
-                    rm.put("italic", italic);
-                    String fontFamily = run.getFontFamily();
-                    if (fontFamily != null) {
-                        rm.put("fontFamily", fontFamily);
-                    }
-                    PaintStyle fontPaint = run.getFontColor();
-                    if (fontPaint instanceof PaintStyle.SolidPaint solid) {
-                        java.awt.Color fontColor =
-                                DrawPaint.applyColorTransform(solid.getSolidColor());
-                        if (fontColor != null) {
-                            rm.put("fontColor", PoiColorUtil.toHex(fontColor));
-                        }
-                    }
-                    runList.add(rm);
-                }
-                Map<String, Object> pm = new LinkedHashMap<>();
-                pm.put("runs", runList);
-                paraList.add(pm);
-            }
-            shapeMap.put("paragraphs", paraList);
+            shapeMap.putAll(textShapeToMap(textShape, showHandle));
         }
 
         // Nested shapes of groups (bounded depth)
