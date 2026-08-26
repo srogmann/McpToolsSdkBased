@@ -65,6 +65,7 @@ public class McpServerMain {
                 "io.modelcontextprotocol.spec.McpServerSession",
                 "reactor.core.Exceptions",
                 "reactor.core.publisher.FluxFlatMap",
+                "reactor.core.publisher.FluxIterable",
                 "reactor.core.publisher.FluxOnErrorReturn",
                 "reactor.core.publisher.LambdaMonoSubscriber",
                 "reactor.core.publisher.MonoPeekTerminal",
