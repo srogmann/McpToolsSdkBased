@@ -134,7 +134,13 @@ public class GraalProxies {
 
         @Override
         public Object getMemberKeys() {
-            return data.keySet().toArray(new String[0]);
+            // Deliberately a ProxyArray and not a String[]/Collection: the polyglot layer wraps
+            // a Java array (or collection) as a *host* object, and a sandbox whose HostAccess
+            // denies array access then rejects getMemberKeys() as a whole. That breaks
+            // Object.keys(), for-in and JSON.stringify() on every proxy object - which is the
+            // common way an LLM inspects structured results. A ProxyArray has native interop
+            // array semantics and is accepted independently of the HostAccess policy.
+            return new KeyArray(data.keySet().toArray(new String[0]));
         }
 
         @Override
@@ -170,6 +176,39 @@ public class GraalProxies {
                 return new NestedProxyArray(Arrays.asList(arrVal));
             }
             return val;
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Key list with native interop array semantics
+    // ---------------------------------------------------------------
+
+    /**
+     * Immutable list of member keys used by {@link NestedProxyObject#getMemberKeys()}.
+     *
+     * @see NestedProxyObject#getMemberKeys() for why this is not a plain {@code String[]}
+     */
+    private static final class KeyArray implements ProxyArray {
+
+        private final String[] keys;
+
+        KeyArray(String[] keys) {
+            this.keys = keys;
+        }
+
+        @Override
+        public Object get(long index) {
+            return index >= 0 && index < keys.length ? keys[(int) index] : null;
+        }
+
+        @Override
+        public long getSize() {
+            return keys.length;
+        }
+
+        @Override
+        public void set(long index, Value value) {
+            throw new UnsupportedOperationException("Read-only key list");
         }
     }
 
