@@ -45,6 +45,7 @@ public class McpServerMain {
                 "org.apache.catalina.Lifecycle$SingleUse",
                 "org.apache.catalina.util.RequestUtil",
                 "org.apache.catalina.webresources.WarResourceSet",
+                "org.apache.tomcat.util.net.SocketBufferHandler"
         };
         Arrays.stream(classes).forEach(c -> LOG.debug("preload: {}", c));
         final ClassLoader cl = McpServerMain.class.getClassLoader();
