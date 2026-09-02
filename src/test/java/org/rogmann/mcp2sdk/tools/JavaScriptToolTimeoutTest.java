@@ -1,9 +1,8 @@
-package org.rogmann.mcp2sdk.examples;
+package org.rogmann.mcp2sdk.tools;
 
 import io.modelcontextprotocol.server.McpServerFeatures;
 import io.modelcontextprotocol.spec.McpSchema;
 import org.junit.jupiter.api.Test;
-import org.rogmann.mcp2sdk.ToolSpecWithState;
 
 import java.util.List;
 import java.util.Map;

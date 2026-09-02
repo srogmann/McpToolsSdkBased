@@ -8,8 +8,7 @@ import io.modelcontextprotocol.server.transport.HttpServletStreamableServerTrans
 import io.modelcontextprotocol.server.transport.HttpServletSseServerTransportProvider;
 import io.modelcontextprotocol.spec.McpSchema;
 
-import org.rogmann.mcp2sdk.examples.*;
-import org.rogmann.mcp2sdk.examples.ReadDependencyClassSourceTool;
+import org.rogmann.mcp2sdk.tools.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.web.servlet.ServletRegistrationBean;

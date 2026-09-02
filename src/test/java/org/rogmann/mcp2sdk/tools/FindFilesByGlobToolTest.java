@@ -1,4 +1,4 @@
-package org.rogmann.mcp2sdk.examples;
+package org.rogmann.mcp2sdk.tools;
 
 import org.junit.jupiter.api.Test;
 
