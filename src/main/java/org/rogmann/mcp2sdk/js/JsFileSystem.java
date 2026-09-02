@@ -720,8 +720,10 @@ public class JsFileSystem {
     /**
      * Patches/overwrites bytes at an offset in an existing file (in-place).
      * <p>
-     * The file must exist and {@code offset} must be within {@code [0, size]};
-     * writing may extend the file beyond its current size (e.g. at {@code offset == size}).
+     * {@code offset == 0} on a not-yet-existing file creates it (equivalent to
+     * {@link #writeBytes(String, byte[])}); for {@code offset > 0} the file must exist and
+     * {@code offset} must be within {@code [0, size]}; writing may extend the file beyond its
+     * current size (e.g. at {@code offset == size}).
      * </p>
      * @param filePath path relative to the base directory
      * @param data bytes to write (must not be null)
@@ -741,7 +743,15 @@ public class JsFileSystem {
         }
         Path path = resolveSafePath(filePath);
         if (!Files.isRegularFile(path)) {
-            throw new JsUserRuntimeException("File not found: " + toRelative(path));
+            if (offset == 0) {
+                // Offset 0 on a not-yet-existing file is equivalent to creating it
+                // (LLMs often pass the offset out of habit, e.g. from Node's fs.write).
+                writeBytes(filePath, data);
+                return;
+            }
+            throw new JsUserRuntimeException("File not found: " + toRelative(path)
+                    + " (fs.writeBytes(path, data, offset) patches an EXISTING file at an offset;"
+                    + " to create a new file use fs.writeBytes(path, data) without an offset)");
         }
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
             long fileSize = channel.size();
@@ -1012,8 +1022,10 @@ public class JsFileSystem {
                 fs.writeBytes(path, data)                 - Create/overwrite a file with binary data.
                                                             data: Uint8Array or array of numbers 0-255
                                                             (e.g. a generated PNG/PPM).
-                fs.writeBytes(path, data, offset)         - Patch bytes at an offset in an existing file
+                fs.writeBytes(path, data, offset)         - Patch bytes at an offset in an EXISTING file
                                                             (offset 0..size; extends the file if needed).
+                                                            offset 0 on a missing file creates it; for
+                                                            offset > 0 the file must already exist.
 
                 --- Help ---
                 fs.help()                                 - This help text.
