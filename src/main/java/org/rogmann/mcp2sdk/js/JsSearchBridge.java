@@ -216,6 +216,19 @@ public class JsSearchBridge implements JsModuleInterface {
             try {
                 regex = createFn.execute(source, flags);
             } catch (PolyglotException e) {
+                if (isMissingRegexLanguage(e)) {
+                    // The pattern is fine - GraalJS compiles RegExp via the internal TRegex
+                    // ("regex") language, which is not available in this server at all. Do NOT
+                    // report this as an invalid pattern; that would mislead script authors
+                    // (and LLMs) into debugging the pattern instead of the deployment.
+                    throw new IllegalStateException("The internal GraalVM 'regex' language (TRegex), "
+                            + "which GraalJS needs to compile any regular expression, is not "
+                            + "available in this server: " + e.getMessage()
+                            + " This is a deployment/classpath problem (e.g. the artifact"
+                            + " org.graalvm.regex:regex is missing, or a fat JAR did not merge the"
+                            + " META-INF/services/com.oracle.truffle.api.TruffleLanguage$Provider"
+                            + " entries), not an invalid pattern: /" + source + "/" + flags);
+                }
                 throw new IllegalArgumentException("Invalid regular expression /" + source + "/"
                         + flags + ": " + e.getMessage()
                         + " (patterns use JavaScript, not Java, syntax)");
@@ -231,6 +244,28 @@ public class JsSearchBridge implements JsModuleInterface {
                         + "/" + flags);
             }
             return regex;
+        }
+
+        /**
+         * Detects a {@link PolyglotException} caused by the internal TRegex language being
+         * unavailable. GraalJS delegates RegExp compilation to the internal language
+         * {@code regex}; if that language is missing from the server's classpath (or its
+         * service-loader registration was lost, e.g. in a non-merging fat JAR), the polyglot
+         * runtime reports {@code IllegalStateException: No language for id regex found}.
+         * This is an environment error and must not be reported as an invalid pattern.
+         * @param e the exception thrown while compiling the pattern
+         * @return true if the exception indicates the missing 'regex' language
+         */
+        static boolean isMissingRegexLanguage(PolyglotException e) {
+            if (!e.isHostException()) {
+                return false;
+            }
+            Throwable host = e.asHostException();
+            if (!(host instanceof IllegalStateException)) {
+                return false;
+            }
+            String message = host.getMessage();
+            return message != null && message.startsWith("No language for id ");
         }
 
         /**
