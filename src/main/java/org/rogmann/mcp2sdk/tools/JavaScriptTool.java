@@ -20,12 +20,15 @@ import org.rogmann.mcp2sdk.js.JsArchiveBridge;
 import org.rogmann.mcp2sdk.js.JsCryptoBridge;
 import org.rogmann.mcp2sdk.js.JsFileSystem;
 import org.rogmann.mcp2sdk.js.JsFileSystemBridge;
+import org.rogmann.mcp2sdk.js.JsJavapBridge;
 import org.rogmann.mcp2sdk.js.JsMcpProxyBridge;
 import org.rogmann.mcp2sdk.js.JsModuleInterface;
 import org.rogmann.mcp2sdk.js.JsSearchBridge;
 import org.rogmann.mcp2sdk.poi.DocxToolBoxJsBridge;
 import org.rogmann.mcp2sdk.poi.PoiToolBoxJsBridge;
 import org.rogmann.mcp2sdk.poi.PptxToolBoxJsBridge;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
@@ -46,8 +49,6 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 
 /**
  * MCP tool implementation for writing and executing small JavaScript scripts.
@@ -71,7 +72,7 @@ import java.util.logging.Logger;
  */
 public class JavaScriptTool {
 
-    private static final Logger LOGGER = Logger.getLogger(JavaScriptTool.class.getName());
+    private static final Logger LOGGER = LoggerFactory.getLogger(JavaScriptTool.class);
 
     private static final String NAME = "javascript_tool";
 
@@ -149,6 +150,7 @@ public class JavaScriptTool {
         // Grep-like search over files, directories and archives (docs/js/search.md).
         // Uses the same path rules as `fs` and the same archive formats as `archive`.
         modules.put("search", new JsSearchBridge());
+        modules.put("javap", new JsJavapBridge());
         modules.put("poi", new PoiToolBoxJsBridge());
         modules.put("docx", new DocxToolBoxJsBridge());
         modules.put("pptx", new PptxToolBoxJsBridge());
@@ -360,15 +362,15 @@ public class JavaScriptTool {
         try {
             long seconds = Long.parseLong(value.trim());
             if (seconds < MIN_TIMEOUT_SECONDS || seconds > MAX_TIMEOUT_SECONDS) {
-                LOGGER.warning("Ignoring out-of-range '" + PROP_TIMEOUT_SECONDS + "' value '" + value
-                        + "' (allowed " + MIN_TIMEOUT_SECONDS + ".." + MAX_TIMEOUT_SECONDS
-                        + "); using default " + DEFAULT_TIMEOUT_SECONDS + " seconds.");
+                LOGGER.warn("Ignoring out-of-range '{}' value '{}' (allowed {}..{}); using default {} seconds.",
+                        PROP_TIMEOUT_SECONDS, value, MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS,
+                        DEFAULT_TIMEOUT_SECONDS);
                 return DEFAULT_TIMEOUT_SECONDS;
             }
             return seconds;
         } catch (NumberFormatException e) {
-            LOGGER.warning("Ignoring invalid '" + PROP_TIMEOUT_SECONDS + "' value '" + value
-                    + "' (not a number); using default " + DEFAULT_TIMEOUT_SECONDS + " seconds.");
+            LOGGER.warn("Ignoring invalid '{}' value '{}' (not a number); using default {} seconds.",
+                    PROP_TIMEOUT_SECONDS, value, DEFAULT_TIMEOUT_SECONDS);
             return DEFAULT_TIMEOUT_SECONDS;
         }
     }
@@ -393,8 +395,7 @@ public class JavaScriptTool {
      * @return the tool call result
      */
     private CallToolResult runScript(String script, String sourceName, long timeoutSeconds) {
-        LOGGER.info("Executing JavaScript (" + sourceName + ", timeout " + timeoutSeconds
-                + " s): " + script);
+        LOGGER.info("Executing JavaScript ({}, timeout {} s): {}", sourceName, timeoutSeconds, script);
 
         // The stdout capture buffer is created here (not in the worker) so that the output written
         // so far can be attached to the timeout message. ByteArrayOutputStream is synchronized,
@@ -424,7 +425,7 @@ public class JavaScriptTool {
             future.cancel(true);
             String message = "Error during JavaScript execution: The call was interrupted while "
                     + "waiting for the script (" + sourceName + ").";
-            LOGGER.log(Level.SEVERE, message, e);
+            LOGGER.error(message, e);
             return CallToolResult.builder()
                 .isError(true)
                 .addTextContent(message)
@@ -433,8 +434,7 @@ public class JavaScriptTool {
             // Only reachable for errors the worker does not handle itself (e.g. OutOfMemoryError).
             Throwable cause = (e.getCause() != null) ? e.getCause() : e;
             String message = "Error during JavaScript execution: " + cause;
-            LOGGER.log(Level.SEVERE, "Error during JavaScript execution (" + sourceName + "): "
-                    + message, cause);
+            LOGGER.error("Error during JavaScript execution ({}): {}", sourceName, message, cause);
             return CallToolResult.builder()
                 .isError(true)
                 .addTextContent(message)
@@ -459,16 +459,16 @@ public class JavaScriptTool {
             AtomicBoolean cancelRequested, AtomicReference<Thread> workerRef, ByteArrayOutputStream outCapture,
             String sourceName, long timeoutSeconds) {
 
-        LOGGER.warning("JavaScript execution (" + sourceName + ") exceeded its timeout of "
-                + timeoutSeconds + " s, requesting cancellation.");
+        LOGGER.warn("JavaScript execution ({}) exceeded its timeout of {} s, requesting cancellation.",
+                sourceName, timeoutSeconds);
         cancelExecution(contextRef, cancelRequested);
 
         try {
             CallToolResult result = future.get(CANCEL_GRACE_SECONDS, TimeUnit.SECONDS);
             if (!Boolean.TRUE.equals(result.isError())) {
                 // The script finished in the moment between the deadline and the cancellation.
-                LOGGER.warning("JavaScript execution (" + sourceName + ") exceeded the timeout but "
-                        + "completed before the cancellation took effect; returning its result.");
+                LOGGER.warn("JavaScript execution ({}) exceeded the timeout but completed before "
+                        + "the cancellation took effect; returning its result.", sourceName);
             }
             return result;
         } catch (InterruptedException e) {
@@ -481,7 +481,7 @@ public class JavaScriptTool {
             String message = "Error during JavaScript execution: The script was cancelled after "
                     + timeoutSeconds + " s (source: " + sourceName + "), but its worker thread "
                     + "reported: " + cause;
-            LOGGER.log(Level.SEVERE, message, cause);
+            LOGGER.error(message, cause);
             return CallToolResult.builder()
                 .isError(true)
                 .addTextContent(message)
@@ -518,7 +518,7 @@ public class JavaScriptTool {
         appendPartialOutput(sb, outCapture);
         String message = sb.toString();
 
-        LOGGER.log(Level.SEVERE, message + "\nJava stack of thread '"
+        LOGGER.error(message + "\nJava stack of thread '"
                 + ((worker != null) ? worker.getName() : "?") + "':\n" + workerStack, cause);
 
         return CallToolResult.builder()
@@ -549,7 +549,7 @@ public class JavaScriptTool {
         try {
             context.close(true);
         } catch (RuntimeException e) {
-            LOGGER.log(Level.WARNING, "Cancelling the JavaScript execution failed", e);
+            LOGGER.warn("Cancelling the JavaScript execution failed", e);
         }
     }
 
@@ -626,11 +626,11 @@ public class JavaScriptTool {
             Map<String, Value> requireTargets = new HashMap<>();
             for (JsModuleInterface m : modules.values()) {
                 if (!m.isEnabled()) {
-                    LOGGER.info("Module '" + m.getNamespace() + "' disabled, skipped");
+                    LOGGER.info("Module '{}' disabled, skipped", m.getNamespace());
                     continue;
                 }
                 AutoCloseable resource = m.wireApi(jsBindings);
-                LOGGER.info("Module '" + m.getNamespace() + "' bound to JavaScript context");
+                LOGGER.debug("Module '{}' bound to JavaScript context", m.getNamespace());
                 if (resource != null) {
                     callResources.add(resource);
                 }
@@ -665,8 +665,8 @@ public class JavaScriptTool {
                 return target;
             };
             context.getBindings("js").putMember("require", requireFunc);
-            LOGGER.info("CommonJS 'require' shim bound to JavaScript context (modules: "
-                    + String.join(", ", requireNames) + ")");
+            LOGGER.info("CommonJS 'require' shim bound to JavaScript context (modules: {})",
+                    String.join(", ", requireNames));
 
             checkNotCancelled(cancelRequested, sourceName);
 
@@ -704,10 +704,10 @@ public class JavaScriptTool {
 
             // Log stderr output (e.g. Truffle warnings) to the server log, not to the MCP result
             if (!capturedErr.isEmpty()) {
-                LOGGER.warning("JavaScript stderr output: " + capturedErr);
+                LOGGER.warn("JavaScript stderr output: {}", capturedErr);
             }
 
-            LOGGER.info("JavaScript executed successfully, output: " + capturedOutput);
+            LOGGER.info("JavaScript executed successfully, output: {}", capturedOutput);
 
             state.callsOk().incrementAndGet();
 
@@ -747,8 +747,7 @@ public class JavaScriptTool {
             String errorMessage = sbMsg.toString();
             // The exception (and with it the Java stack trace, GraalVM also prints the JavaScript
             // frames) goes to the error log, not to the caller.
-            LOGGER.log(Level.SEVERE, "Error during JavaScript execution (" + sourceName + "): "
-                    + errorMessage, e);
+            LOGGER.error("Error during JavaScript execution ({}): {}", sourceName, errorMessage, e);
             return CallToolResult.builder()
                 .isError(true)
                 .addTextContent(errorMessage)
@@ -763,7 +762,7 @@ public class JavaScriptTool {
                 try {
                     ac.close();
                 } catch (Exception e) {
-                    LOGGER.warning("Error closing a per-call module resource: " + e.getMessage());
+                    LOGGER.warn("Error closing a per-call module resource: {}", e.getMessage());
                 }
             }
         }
@@ -826,8 +825,8 @@ public class JavaScriptTool {
           .append(MAX_TIMEOUT_SECONDS).append(" s).");
 
         String message = sb.toString();
-        LOGGER.log(Level.SEVERE, "JavaScript execution timed out after " + timeoutSeconds
-                + " s (" + sourceName + "):\n" + message, cause);
+        LOGGER.error("JavaScript execution timed out after {} s ({}):\n{}",
+                timeoutSeconds, sourceName, message, cause);
 
         return CallToolResult.builder()
             .isError(true)
@@ -873,7 +872,7 @@ public class JavaScriptTool {
                 frames.add(snippet.isEmpty() ? text : text + "  |  " + snippet);
             }
         } catch (RuntimeException e) {
-            LOGGER.log(Level.FINE, "The JavaScript stack of the cancelled script could not be read", e);
+            LOGGER.debug("The JavaScript stack of the cancelled script could not be read", e);
         }
         sb.append("\nJavaScript stack at the cancellation point:");
         if (frames.isEmpty()) {
@@ -965,7 +964,7 @@ public class JavaScriptTool {
         try {
             context.close();
         } catch (RuntimeException e) {
-            LOGGER.log(Level.FINE, "Closing the JavaScript context failed", e);
+            LOGGER.debug("Closing the JavaScript context failed", e);
         }
     }
 

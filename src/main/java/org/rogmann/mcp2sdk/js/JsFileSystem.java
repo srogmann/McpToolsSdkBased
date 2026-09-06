@@ -1,6 +1,7 @@
 package org.rogmann.mcp2sdk.js;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
@@ -10,6 +11,7 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
@@ -22,6 +24,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 import org.rogmann.mcp2sdk.WorkProject;
 import org.slf4j.Logger;
@@ -69,6 +72,36 @@ public class JsFileSystem {
 
     private JsFileSystem() {
         // Utility class
+    }
+
+    // ========================================================================
+    // Executable lookup (PATH)
+    // ========================================================================
+
+    /**
+     * Locates an executable on the {@code PATH} environment variable.
+     *
+     * @param command the command name (e.g. {@code javap})
+     * @return the path of the executable, or null if not found
+     */
+    public static Path findOnPath(String command) {
+        String pathEnv = System.getenv("PATH");
+        if (pathEnv == null || pathEnv.isBlank()) {
+            return null;
+        }
+        for (String dir : pathEnv.split(Pattern.quote(File.pathSeparator))) {
+            if (dir == null || dir.isBlank()) {
+                continue;
+            }
+            Path base = Paths.get(dir);
+            for (String candidate : new String[]{command, command + ".exe"}) {
+                Path exe = base.resolve(candidate);
+                if (Files.isRegularFile(exe) && Files.isExecutable(exe)) {
+                    return exe;
+                }
+            }
+        }
+        return null;
     }
 
     // ========================================================================
