@@ -43,7 +43,7 @@ webui:
 # Tool Configuration
 tools:
   # Comma-separated list of tool names to activate on startup
-  active: "glossary_tool,find_files_by_glob,get_file_text_by_path,edit_file"
+  active: "glossary_tool,find_files_by_glob,get_file_text_by_path,edit_file_tool"
   
   # Maven-related tool configuration
   maven:

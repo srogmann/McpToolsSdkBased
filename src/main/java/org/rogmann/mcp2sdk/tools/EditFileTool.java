@@ -28,7 +28,10 @@ import java.util.Optional;
 public class EditFileTool {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(EditFileTool.class);
-    private static final String NAME = "edit_file";
+    private static final String NAME = "edit_file_tool";
+
+    /** number of characters to display a context in case of a mismatch */
+    private static final int CONTEXT_RANGE = 10;
 
     /** tool state (active-flag, statistics) */
     private final ToolState state;
@@ -230,6 +233,8 @@ public class EditFileTool {
                     structuredContent.put("longestPrefixLength", prefixInfo.get("longestPrefixLength"));
                     structuredContent.put("searchedChar", prefixInfo.get("searchedChar"));
                     structuredContent.put("actualChar", prefixInfo.get("actualChar"));
+                    structuredContent.put("oldStringContext", prefixInfo.get("oldStringContext"));
+                    structuredContent.put("fileContext", prefixInfo.get("fileContext"));
 
                     return CallToolResult.builder()
                             .isError(false)
@@ -255,9 +260,21 @@ public class EditFileTool {
         }
     }
 
+    /**
+     * Finds the longest matching prefix of oldString within the content and
+     * collects diagnostic information about the mismatch position.
+     * If several positions share the longest prefix length, the earliest one wins.
+     * @param projectDir project base directory (for relative paths in the message)
+     * @param targetFile target file (for relative paths in the message)
+     * @param content file content
+     * @param oldString string searched for (guaranteed to have no occurrence in content)
+     * @return message and diagnostic fields (longestPrefixLength, searchedChar,
+     *     actualChar, oldStringContext, fileContext)
+     */
     private static Map<String, Object> findLongestPrefix(Path projectDir, Path targetFile, String content, String oldString) {
         Map<String, Object> result = new HashMap<>();
-        int maxPrefixLength = 0;
+        int maxPrefixLength = -1;
+        int bestIndex = 0;
         char searchedChar = 0;
         char actualChar = 0;
         int searchedCharUnicode = 0;
@@ -268,13 +285,14 @@ public class EditFileTool {
             for (int j = 0; j < oldString.length() && (i + j) < content.length(); j++) {
                 char oldChar = oldString.charAt(j);
                 char contentChar = content.charAt(i + j);
-                
+
                 if (oldChar == contentChar) {
                     prefixLen++;
                 } else {
                     // Mismatch found
-                    if (prefixLen >= maxPrefixLength) {
+                    if (prefixLen > maxPrefixLength) {
                         maxPrefixLength = prefixLen;
+                        bestIndex = i;
                         searchedChar = oldChar;
                         actualChar = contentChar;
                         searchedCharUnicode = (int) oldChar;
@@ -288,17 +306,93 @@ public class EditFileTool {
                 break;
             }
         }
+        int reportedPrefixLength = Math.max(0, maxPrefixLength);
 
-        String message = "No occurrences of oldString found in file: " + projectDir.relativize(targetFile) + 
-            ". Longest matching prefix length: " + maxPrefixLength + 
-            ", searched char: '" + searchedChar + "' (U+" + String.format("%04X", searchedCharUnicode) + ")" +
-            ", actual char: '" + actualChar + "' (U+" + String.format("%04X", actualCharUnicode) + ")";
-        
+        // The mismatch in the file is at (bestIndex + reportedPrefixLength), the
+        // corresponding position in the searched string is (reportedPrefixLength).
+        String oldStringContext = contextExcerpt(oldString, reportedPrefixLength);
+        String fileContext = contextExcerpt(content, bestIndex + reportedPrefixLength);
+
+        String message = "No occurrences of oldString found in file: " + projectDir.relativize(targetFile) +
+            ". Longest matching prefix length: " + reportedPrefixLength +
+            ", searched char: " + charDescription(searchedChar) +
+            ", actual char: " + charDescription(actualChar) +
+            ", context at the mismatch (arrow marks the position): oldString: \"" + oldStringContext +
+            "\" | file: \"" + fileContext + "\"";
+
         result.put("message", message);
-        result.put("longestPrefixLength", maxPrefixLength);
-        result.put("searchedChar", "'" + searchedChar + "' (U+" + String.format("%04X", searchedCharUnicode) + ")");
-        result.put("actualChar", "'" + actualChar + "' (U+" + String.format("%04X", actualCharUnicode) + ")");
-        
+        result.put("longestPrefixLength", reportedPrefixLength);
+        result.put("searchedChar", charDescription(searchedChar));
+        result.put("actualChar", charDescription(actualChar));
+        result.put("oldStringContext", oldStringContext);
+        result.put("fileContext", fileContext);
+
         return result;
+    }
+
+    /**
+     * Builds a single-line context excerpt around the given code-unit position.
+     * The position itself is marked with an arrow, up to {@link #CONTEXT_RANGE}
+     * characters are shown on each side, clipped by "..." if shortened.
+     * Window boundaries are adjusted so that surrogate pairs are not split;
+     * non-printable characters (and unpaired surrogates) are escaped as \\uHHHH.
+     * @param s string to excerpt from
+     * @param pos code-unit index of the marked position (0..s.length())
+     * @return context excerpt
+     */
+    private static String contextExcerpt(String s, int pos) {
+        int from = Math.max(0, pos - CONTEXT_RANGE);
+        int to = Math.min(s.length(), pos + CONTEXT_RANGE);
+        // Do not split surrogate pairs at the window boundaries
+        if (from > 0 && from < s.length() && Character.isLowSurrogate(s.charAt(from))) {
+            from--;
+        }
+        if (to < s.length() && to > from && Character.isLowSurrogate(s.charAt(to))) {
+            to++; // include the low surrogate together with its high surrogate at (to - 1)
+        }
+        StringBuilder sb = new StringBuilder();
+        if (from > 0) {
+            sb.append("...");
+        }
+        sb.append(escapeNonPrintable(s.substring(from, pos)));
+        sb.append('\u2190');
+        sb.append(escapeNonPrintable(s.substring(pos, to)));
+        if (to < s.length()) {
+            sb.append("...");
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Escapes characters that would disturb a single-line log/JSON output:
+     * ISO-control characters (e.g. newline), U+2028/U+2029 and unpaired
+     * surrogates are rendered as \\uHHHH; valid surrogate pairs are kept as-is.
+     * @param s input string
+     * @return escaped string
+     */
+    private static String escapeNonPrintable(String s) {
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (Character.isHighSurrogate(c) && i + 1 < s.length() && Character.isLowSurrogate(s.charAt(i + 1))) {
+                sb.append(c).append(s.charAt(i + 1));
+                i++;
+            } else if (Character.isISOControl(c) || c == '\u2028' || c == '\u2029' || Character.isSurrogate(c)) {
+                sb.append(String.format("\\u%04X", (int) c));
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Describes a character for the diagnostic message: printable characters
+     * are shown as-is, non-printable ones and unpaired surrogates as \\uHHHH.
+     * @param c character to describe
+     * @return description in the form 'c' (U+HHHH)
+     */
+    private static String charDescription(char c) {
+        return "'" + escapeNonPrintable(String.valueOf(c)) + "' (U+" + String.format("%04X", (int) c) + ")";
     }
 }
