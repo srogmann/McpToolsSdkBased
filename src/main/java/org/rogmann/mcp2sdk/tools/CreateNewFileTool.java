@@ -12,7 +12,9 @@ import org.rogmann.mcp2sdk.WorkProject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -31,6 +33,10 @@ public class CreateNewFileTool {
     private static final Logger LOGGER = LoggerFactory.getLogger(CreateNewFileTool.class);
 
     private static final String NAME = "create_new_file";
+
+    /** maximum number of lines counted for the size metrics (keeps the error
+     *  path cheap even for very large files) */
+    private static final int MAX_COUNTED_LINES = 100_000;
 
     /** tool state (active-flag, statistics) */
     private final ToolState state;
@@ -136,7 +142,11 @@ public class CreateNewFileTool {
         }
 
         if (Files.exists(targetFile) && !overwrite) {
-            String errorMsg = "File already exists and overwrite is not allowed: " + projectBaseDir.relativize(targetFile);
+            String errorMsg = "File already exists and overwrite is not allowed: "
+                + projectBaseDir.relativize(targetFile)
+                + " (existing file: " + describeFileMetrics(targetFile)
+                + "; submitted text: " + describeTextMetrics(text)
+                + "; set overwrite=true to replace the file)";
             LOGGER.info("File exists, overwrite=false: " + targetFile);
             return CallToolResult.builder()
                 .isError(true)
@@ -173,5 +183,52 @@ public class CreateNewFileTool {
                 .addTextContent(errorMsg)
                 .build();
         }
+    }
+
+    /**
+     * Describes the size metrics of an existing file (byte size plus line
+     * count, capped at {@link #MAX_COUNTED_LINES} lines).
+     * @param file existing file
+     * @return human-readable metrics, e.g. "1234 lines / 56789 bytes"
+     */
+    private static String describeFileMetrics(Path file) {
+        try {
+            long bytes = Files.size(file);
+            long lines = 0;
+            boolean capped = false;
+            try (BufferedReader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+                while (reader.readLine() != null) {
+                    lines++;
+                    if (lines >= MAX_COUNTED_LINES) {
+                        capped = true;
+                        break;
+                    }
+                }
+            }
+            return (capped ? ">" + lines : String.valueOf(lines)) + " lines / " + bytes + " bytes";
+        } catch (IOException e) {
+            LOGGER.warn("Could not read metrics of {}", file, e);
+            return "? lines / ? bytes";
+        }
+    }
+
+    /**
+     * Describes the size metrics of the submitted text (byte size in UTF-8
+     * plus line count; a trailing line break does not open an extra line).
+     * @param text submitted text
+     * @return human-readable metrics, e.g. "42 lines / 12345 bytes"
+     */
+    private static String describeTextMetrics(String text) {
+        if (text == null || text.isEmpty()) {
+            return "0 lines / 0 bytes";
+        }
+        long newlines = 0;
+        for (int i = 0; i < text.length(); i++) {
+            if (text.charAt(i) == '\n') {
+                newlines++;
+            }
+        }
+        long lines = newlines + (text.endsWith("\n") ? 0 : 1);
+        return lines + " lines / " + text.getBytes(StandardCharsets.UTF_8).length + " bytes";
     }
 }
