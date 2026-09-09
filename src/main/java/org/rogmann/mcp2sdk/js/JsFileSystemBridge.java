@@ -53,12 +53,12 @@ public class JsFileSystemBridge implements JsModuleInterface {
 
     @Override
     public String getSummary() {
-        return "`fs.help()` explains controlled file access";
+        return "`fs.help()` explains controlled file access (incl. text encodings)";
     }
 
     @Override
     public String getHelpTip() {
-        return "fs.help() (files)";
+        return "fs.help() (files, encodings)";
     }
 
     @Override
@@ -80,23 +80,91 @@ public class JsFileSystemBridge implements JsModuleInterface {
 
         // ---- Read ----
         methods.put("readFile", (ProxyExecutable) args -> {
-            requireArgs(args, 1, "readFile(path)");
-            return JsFileSystem.readFile(args[0].asString());
+            requireArgs(args, 1, "readFile(path[, encoding|options])");
+            String path = args[0].asString();
+            EncodingArg enc = encodingArg(args.length > 1 ? args[1] : null);
+            if (enc.isBuffer()) {
+                // Node habit: fs.readFileSync(path, 'buffer')
+                return GraalProxies.toUint8Array(uint8ArrayCtor,
+                        JsFileSystem.readBytes(path, 0, wholeFileReadLength(path)));
+            }
+            return JsFileSystem.readFile(path, enc.encoding(), enc.errors());
         });
 
         methods.put("readLines", (ProxyExecutable) args -> {
-            requireArgs(args, 1, "readLines(path, startLine, endLine)");
+            requireArgs(args, 1, "readLines(path[, startLine[, endLine[, encoding|options]]])");
             String path = args[0].asString();
-            int startLine = args.length > 1 && !args[1].isNull() ? args[1].asInt() : 1;
-            int endLine = args.length > 2 && !args[2].isNull() ? args[2].asInt()
-                    : startLine + JsFileSystem.DEFAULT_MAX_LINES - 1;
-            return JsFileSystem.readLines(path, startLine, endLine);
+            int startLine = 1;
+            int endLine = 0; // 0 lets JsFileSystem apply the default range
+            EncodingArg enc = EncodingArg.DEFAULT;
+            if (args.length > 1 && !args[1].isNull()) {
+                Value second = args[1];
+                if (second.isNumber()) {
+                    startLine = second.asInt();
+                } else if (second.hasMembers()) {
+                    Integer start = memberInt(second, "startLine");
+                    if (start == null) {
+                        start = memberInt(second, "start");
+                    }
+                    if (start != null) {
+                        startLine = start;
+                    }
+                    Integer end = memberInt(second, "endLine");
+                    if (end == null) {
+                        end = memberInt(second, "end");
+                    }
+                    if (end != null) {
+                        endLine = end;
+                    }
+                    enc = encodingArg(second);
+                } else {
+                    throw new IllegalArgumentException("Usage: fs.readLines(path[, startLine[, endLine"
+                            + "[, encoding|options]]]) - startLine must be a number or an options object"
+                            + " {startLine, endLine, encoding, errors}");
+                }
+            }
+            if (args.length > 2 && !args[2].isNull()) {
+                endLine = args[2].asInt();
+            }
+            if (args.length > 3 && !args[3].isNull()) {
+                enc = encodingArg(args[3]);
+            }
+            return JsFileSystem.readLines(path, startLine, endLine, enc.encoding(), enc.errors());
         });
 
         methods.put("createLineReader", (ProxyExecutable) args -> {
-            requireArgs(args, 1, "createLineReader(path)");
-            JsFileSystem.LineReader reader = JsFileSystem.createLineReader(args[0].asString());
+            requireArgs(args, 1, "createLineReader(path[, encoding|options])");
+            EncodingArg enc = encodingArg(args.length > 1 ? args[1] : null);
+            JsFileSystem.LineReader reader = JsFileSystem.createLineReader(args[0].asString(),
+                    enc.encoding(), enc.errors());
             return createLineReaderProxy(reader);
+        });
+
+        // ---- Character sets ----
+        methods.put("detectCharset", (ProxyExecutable) args -> {
+            requireArgs(args, 1, "detectCharset(path[, maxBytes])");
+            int maxBytes = args.length > 1 && !args[1].isNull()
+                    ? args[1].asInt() : JsFileSystem.DEFAULT_SNIFF_BYTES;
+            return GraalProxies.toProxyObject(JsFileSystem.detectCharset(args[0].asString(), maxBytes));
+        });
+
+        methods.put("decode", (ProxyExecutable) args -> {
+            requireArgs(args, 1, "decode(bytes[, encoding|options])");
+            byte[] data = GraalProxies.toByteArray(args[0]);
+            EncodingArg enc = encodingArg(args.length > 1 ? args[1] : null);
+            return JsFileSystem.decode(data, enc.encoding(), enc.errors());
+        });
+
+        methods.put("decodeHex", (ProxyExecutable) args -> {
+            requireArgs(args, 1, "decodeHex(hex[, encoding|options])");
+            EncodingArg enc = encodingArg(args.length > 1 ? args[1] : null);
+            return JsFileSystem.decode(JsFileSystem.fromHex(args[0].asString()), enc.encoding(), enc.errors());
+        });
+        methods.put("encode", (ProxyExecutable) args -> {
+            requireArgs(args, 1, "encode(text[, encoding|options])");
+            EncodingArg enc = encodingArg(args.length > 1 ? args[1] : null);
+            return GraalProxies.toUint8Array(uint8ArrayCtor,
+                    JsFileSystem.encode(toStringValue(args[0]), enc.encoding(), enc.errors()));
         });
 
         // ---- Binary read / stream ----
@@ -165,14 +233,16 @@ public class JsFileSystemBridge implements JsModuleInterface {
 
         // ---- Write / edit ----
         methods.put("writeFile", (ProxyExecutable) args -> {
-            requireArgs(args, 2, "writeFile(path, content)");
-            JsFileSystem.writeFile(args[0].asString(), toStringValue(args[1]));
+            requireArgs(args, 2, "writeFile(path, content[, encoding|options])");
+            EncodingArg enc = encodingArg(args.length > 2 ? args[2] : null);
+            JsFileSystem.writeFile(args[0].asString(), toStringValue(args[1]), enc.encoding(), enc.errors());
             return null;
         });
 
         methods.put("appendFile", (ProxyExecutable) args -> {
-            requireArgs(args, 2, "appendFile(path, content)");
-            JsFileSystem.appendFile(args[0].asString(), toStringValue(args[1]));
+            requireArgs(args, 2, "appendFile(path, content[, encoding|options])");
+            EncodingArg enc = encodingArg(args.length > 2 ? args[2] : null);
+            JsFileSystem.appendFile(args[0].asString(), toStringValue(args[1]), enc.encoding(), enc.errors());
             return null;
         });
 
@@ -220,7 +290,9 @@ public class JsFileSystemBridge implements JsModuleInterface {
         // LLMs often write Node.js-style code like
         //   const fs = require('fs'); fs.readFileSync("a.txt");
         // Map the synchronous Node fs API names onto the same implementations so such
-        // scripts run unchanged. Extra arguments (e.g. an encoding option) are ignored.
+        // scripts run unchanged. Encoding arguments work as in Node - fs.readFileSync(p, 'latin1'),
+        // fs.readFileSync(p, {encoding: 'cp1252'}), fs.readFileSync(p, 'buffer') - and other
+        // options (mode, flag, flush) are ignored.
         methods.put("readFileSync", methods.get("readFile"));
         methods.put("readdirSync", methods.get("readdir"));
         methods.put("statSync", methods.get("stat"));
@@ -278,6 +350,133 @@ public class JsFileSystemBridge implements JsModuleInterface {
     }
 
     /**
+     * Charset name and error policy as passed from JavaScript.
+     * <p>
+     * Both parts are optional; {@code null} means "use the default" (UTF-8 / strict).
+     * {@code encoding} may also be the Node-style pseudo-name {@code "buffer"}, which asks for
+     * raw bytes instead of text.
+     * </p>
+     * @param encoding charset name (or {@code "buffer"}), may be null
+     * @param errors error policy ({@code strict}, {@code replace}, {@code ignore}), may be null
+     */
+    private record EncodingArg(String encoding, String errors) {
+
+        /** The defaults: UTF-8, strict. */
+        static final EncodingArg DEFAULT = new EncodingArg(null, null);
+
+        /**
+         * Whether the caller asked for raw bytes instead of decoded text.
+         * @return true for {@code "buffer"} / {@code "bytes"} / {@code "uint8array"}
+         */
+        boolean isBuffer() {
+            if (encoding == null) {
+                return false;
+            }
+            String key = encoding.trim();
+            return key.equalsIgnoreCase("buffer") || key.equalsIgnoreCase("bytes")
+                    || key.equalsIgnoreCase("uint8array");
+        }
+    }
+
+    /**
+     * Parses an optional encoding argument.
+     * <p>
+     * Accepted forms: nothing / {@code null} (defaults), a charset name as string
+     * ({@code fs.readFileSync(path, 'latin1')}), or an options object
+     * ({@code {encoding: 'CP-1252', errors: 'replace'}}; {@code charset} and {@code onMalformed}
+     * are accepted as aliases). Unknown members (e.g. Node's {@code flag}) are ignored.
+     * </p>
+     * @param value the JS argument value (may be null or undefined)
+     * @return the parsed argument, never null
+     * @throws IllegalArgumentException for a non-string, non-object value or an object without
+     *         any recognized member
+     */
+    private static EncodingArg encodingArg(Value value) {
+        if (value == null || value.isNull()) {
+            return EncodingArg.DEFAULT;
+        }
+        if (value.isString()) {
+            return new EncodingArg(value.asString(), null);
+        }
+        if (value.hasMembers()) {
+            String enc = memberString(value, "encoding");
+            if (enc == null) {
+                enc = memberString(value, "charset");
+            }
+            String errors = memberString(value, "errors");
+            if (errors == null) {
+                errors = memberString(value, "onMalformed");
+            }
+            if (enc == null && errors == null) {
+                throw new IllegalArgumentException("The options object has no 'encoding' and no 'errors' member."
+                        + " Usage: fs.readFile(path, {encoding: 'CP-1252', errors: 'replace'})"
+                        + " or fs.readFile(path, 'CP-1252').");
+            }
+            return new EncodingArg(enc, errors);
+        }
+        throw new IllegalArgumentException("encoding must be a charset name (a string such as 'UTF-8',"
+                + " 'ISO-8859-1', 'CP-1252', 'UTF-16LE') or an options object {encoding, errors}");
+    }
+
+    /**
+     * Reads a string member of an options object.
+     * @param obj the object value
+     * @param name member name
+     * @return the string value, or null if absent or null
+     * @throws IllegalArgumentException if the member exists but is not a string
+     */
+    private static String memberString(Value obj, String name) {
+        if (!obj.hasMember(name)) {
+            return null;
+        }
+        Value v = obj.getMember(name);
+        if (v == null || v.isNull()) {
+            return null;
+        }
+        if (!v.isString()) {
+            throw new IllegalArgumentException("option '" + name + "' must be a string (e.g. 'CP-1252')");
+        }
+        return v.asString();
+    }
+
+    /**
+     * Reads an integer member of an options object.
+     * @param obj the object value
+     * @param name member name
+     * @return the value, or null if absent or null
+     * @throws IllegalArgumentException if the member exists but is not a number
+     */
+    private static Integer memberInt(Value obj, String name) {
+        if (!obj.hasMember(name)) {
+            return null;
+        }
+        Value v = obj.getMember(name);
+        if (v == null || v.isNull()) {
+            return null;
+        }
+        if (!v.isNumber()) {
+            throw new IllegalArgumentException("option '" + name + "' must be a number");
+        }
+        return v.asInt();
+    }
+
+    /**
+     * Returns the whole file length as an int, rejecting files above the single-read limit.
+     * @param path path relative to the base directory
+     * @return file size in bytes
+     * @throws IllegalArgumentException if the file is larger than {@link JsFileSystem#MAX_READ_BYTES}
+     */
+    private static int wholeFileReadLength(String path) {
+        long remaining = JsFileSystem.size(path);
+        if (remaining > JsFileSystem.MAX_READ_BYTES) {
+            throw new IllegalArgumentException("File is " + remaining + " bytes; that exceeds the single-read"
+                    + " limit of " + JsFileSystem.MAX_READ_BYTES + " bytes. Read ranges with fs.readBytes(path,"
+                    + " offset, length) or stream it with fs.createBlockReader(path, blockSize).");
+        }
+        return (int) remaining;
+    }
+
+    /**
      * Resolves an optional read length.
      * <p>
      * If the length argument is omitted, the remainder of the file (from the offset) is
@@ -332,6 +531,7 @@ public class JsFileSystemBridge implements JsModuleInterface {
             return reader.readLines(maxLines);
         });
         methods.put("lineNumber", (ProxyExecutable) args -> reader.getLineNumber());
+        methods.put("encoding", (ProxyExecutable) args -> reader.getEncoding());
         methods.put("close", (ProxyExecutable) args -> {
             reader.close();
             return null;

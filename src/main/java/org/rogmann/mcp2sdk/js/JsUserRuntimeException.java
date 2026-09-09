@@ -1,5 +1,7 @@
 package org.rogmann.mcp2sdk.js;
 
+import java.io.Serial;
+
 /**
  * Runtime exception for file-system-related errors that can be shown to the user (LLM).
  * <p>
@@ -8,6 +10,8 @@ package org.rogmann.mcp2sdk.js;
  * </p>
  */
 public class JsUserRuntimeException extends RuntimeException {
+    @Serial
+    private static final long serialVersionUID = 20260905L;
 
     /**
      * Creates a new JsUserRuntimeException with a user-friendly message.

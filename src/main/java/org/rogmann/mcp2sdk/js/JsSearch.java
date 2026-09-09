@@ -1,6 +1,7 @@
 package org.rogmann.mcp2sdk.js;
 
 import java.io.BufferedInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.FilterInputStream;
 import java.io.IOException;
@@ -48,6 +49,7 @@ import java.util.zip.ZipInputStream;
  *   <li>{@code search.grep(pattern, target[, options])} - formatted text output</li>
  *   <li>{@code search.find(pattern, target[, options])} - structured result object</li>
  *   <li>{@code search.files(pattern, target[, options])} - array of matching display paths</li>
+ *   <li>{@code search.hexgrep(hexPattern, target[, options])} - hex pattern, byte search</li>
  * </ul>
  *
  * <h3>Design</h3>
@@ -58,13 +60,20 @@ import java.util.zip.ZipInputStream;
  * the display path ({@code a.ear#b.war#WEB-INF/web.xml}).
  * </p>
  * <p>
+ * There are two scans. Text search reads lines and asks a {@link LineMatcher} (a boolean per
+ * line). Byte search ({@code binary: "bytes"}, spec 18.1) reads windows of bytes, never
+ * decodes and never splits lines, and asks a {@link SpanMatcher} for start and length of each
+ * match, so results can carry {@code byteOffset} instead of a line number.
+ * </p>
+ * <p>
  * Content matching uses JavaScript {@code RegExp} semantics: the caller (see
- * {@link JsSearchBridge}) provides a {@link LineMatcher} backed by a real JS regular
+ * {@link JsSearchBridge}) provides a {@link PatternFactory} that compiles a real JS regular
  * expression, so pattern behaviour is what a JavaScript author expects, not Java's.
  * </p>
  * <p>
- * The Java API is polyglot-free ({@link LineMatcher}, {@link PathFilter}, plain option maps),
- * which keeps the engine unit-testable without a JavaScript context.
+ * The Java API is polyglot-free ({@link SearchPattern}, {@link LineMatcher},
+ * {@link PathFilter}, plain option maps), which keeps the engine unit-testable without a
+ * JavaScript context.
  * </p>
  */
 public final class JsSearch {
@@ -107,6 +116,388 @@ public final class JsSearch {
         default LineMatcher withPatternOptions(String extraFlags, boolean caseInsensitive) {
             return this;
         }
+    }
+
+    /**
+     * A match inside a scanned window: window-relative start and length, counted in
+     * <em>bytes</em> (the window string holds one character per byte, so both are the same).
+     *
+     * @param start window-relative start index, 0-based
+     * @param length length of the match in bytes, always {@code >= 1} as produced by the engine
+     */
+    public record MatchSpan(int start, int length) {
+    }
+
+    /**
+     * Finds matches in a window of the byte carrier of {@link #BINARY_WINDOW_BYTES} sized
+     * reads: a {@link String} in which every character is exactly one byte (values 0..255).
+     * <p>
+     * This is what makes byte search (spec 18.1) possible without giving up JavaScript pattern
+     * semantics: the regular expression runs over a lossless one-byte-per-character carrier, so
+     * the guest {@code RegExp} of the calling context does the matching while the engine keeps
+     * ownership of offsets, windows, limits and output. A {@link LineMatcher} cannot express
+     * this - it reports a boolean only, without offset, length or per-file accounting.
+     * </p>
+     */
+    public interface SpanMatcher {
+
+        /**
+         * Finds the next match at or after {@code from}.
+         * @param window carrier string of the current window (1 char = 1 byte)
+         * @param from window-relative index to start searching from, 0-based
+         * @return the match, or {@code null} if there is none
+         */
+        MatchSpan find(String window, int from);
+    }
+
+    /**
+     * Compiles a regular expression into a {@link SpanMatcher}. The JavaScript bridge supplies
+     * one that builds a real guest {@code RegExp} (JavaScript semantics, spec 10.2); the engine
+     * itself never compiles expressions, it only hands over the effective flags - the user flags
+     * plus {@code g} for iterating a window (see {@link #binaryFlags(String)}).
+     */
+    public interface PatternFactory {
+        /**
+         * @param source regular expression source (ASCII, checked by the engine for byte search)
+         * @param flags effective flags, already merged with the pattern options
+         * @return a matcher for that expression
+         */
+        SpanMatcher compile(String source, String flags);
+    }
+
+    /**
+     * The pattern of one search, in exactly one of three kinds:
+     * <ul>
+     *   <li>{@link #byteLiteral(byte[])} - a byte literal, byte search only (spec 10.4),</li>
+     *   <li>{@link #regExp(String, String, boolean, PatternFactory)} - a regular expression,
+     *       usable in text and in byte search,</li>
+     *   <li>{@link #of(LineMatcher)} / {@link #of(SpanMatcher)} - a matcher supplied by a host
+     *       side caller (the shape the engine used before byte search existed).</li>
+     * </ul>
+     * Instances are immutable; {@link #withPatternOptions(String, boolean)} returns a new one.
+     */
+    public static final class SearchPattern {
+
+        /** What the pattern is made of. */
+        enum Kind { BYTE_LITERAL, REGEX, MATCHER }
+
+        private final Kind kind;
+        private final byte[] literalBytes;
+        private final String literalCarrier;
+        private final String regexSource;
+        private final String regexFlags;
+        private final boolean fromRegExp;
+        private final PatternFactory factory;
+        private final SpanMatcher fixedSpan;
+        private final LineMatcher fixedLine;
+        /** Lazily compiled matcher of a REGEX pattern (one search per pattern instance). */
+        private SpanMatcher compiled;
+
+        private SearchPattern(Kind kind, byte[] literalBytes, String literalCarrier,
+                              String regexSource, String regexFlags, boolean fromRegExp,
+                              PatternFactory factory, SpanMatcher fixedSpan, LineMatcher fixedLine) {
+            this.kind = kind;
+            this.literalBytes = literalBytes;
+            this.literalCarrier = literalCarrier;
+            this.regexSource = regexSource;
+            this.regexFlags = regexFlags;
+            this.fromRegExp = fromRegExp;
+            this.factory = factory;
+            this.fixedSpan = fixedSpan;
+            this.fixedLine = fixedLine;
+        }
+
+        /**
+         * A byte literal: these bytes, in this order, nothing else (spec 10.4).
+         * @param bytes the bytes to find, must not be empty
+         * @return a pattern for {@code binary: "bytes"}
+         */
+        public static SearchPattern byteLiteral(byte[] bytes) {
+            if (bytes == null) {
+                throw new IllegalArgumentException("pattern is required (string, RegExp or byte array)");
+            }
+            if (bytes.length == 0) {
+                throw new IllegalArgumentException("pattern must not be empty");
+            }
+            byte[] copy = bytes.clone();
+            return new SearchPattern(Kind.BYTE_LITERAL, copy,
+                    new String(copy, StandardCharsets.ISO_8859_1),
+                    null, "", false, null, null, null);
+        }
+
+        /**
+         * A regular expression.
+         * @param source expression source (JavaScript syntax)
+         * @param flags flags of the pattern itself (a RegExp object's flags, or empty for a
+         *              string pattern)
+         * @param fromRegExp true if the pattern came from a RegExp object (its own flags win,
+         *                   the {@code flags} option is ignored - spec 10.2)
+         * @param factory compiles the expression (a real JS {@code RegExp} in the bridge)
+         * @return the pattern
+         */
+        public static SearchPattern regExp(String source, String flags, boolean fromRegExp,
+                                           PatternFactory factory) {
+            if (source == null || source.isEmpty()) {
+                throw new IllegalArgumentException("pattern must not be empty");
+            }
+            if (factory == null) {
+                throw new IllegalArgumentException("a regular expression pattern needs a pattern factory");
+            }
+            return new SearchPattern(Kind.REGEX, null, null, source,
+                    flags == null ? "" : flags, fromRegExp, factory, null, null);
+        }
+
+        /**
+         * A pattern from a caller-provided line matcher (text search; byte search is not
+         * possible because a boolean says nothing about offsets).
+         * @param matcher the matcher
+         * @return the pattern
+         */
+        public static SearchPattern of(LineMatcher matcher) {
+            if (matcher == null) {
+                throw new IllegalArgumentException("pattern is required (string, RegExp or byte array)");
+            }
+            return new SearchPattern(Kind.MATCHER, null, null, null, "", false, null, null, matcher);
+        }
+
+        /**
+         * A pattern from a caller-provided span matcher (usable in both modes; line semantics
+         * are derived: a line matches if the matcher finds a span in it).
+         * @param matcher the matcher
+         * @return the pattern
+         */
+        public static SearchPattern of(SpanMatcher matcher) {
+            if (matcher == null) {
+                throw new IllegalArgumentException("pattern is required (string, RegExp or byte array)");
+            }
+            return new SearchPattern(Kind.MATCHER, null, null, null, "", false, null, matcher, null);
+        }
+
+        /** @return what this pattern is made of */
+        public Kind kind() {
+            return kind;
+        }
+
+        /** @return true for a byte-array pattern (spec 10.4) */
+        public boolean isByteLiteral() {
+            return kind == Kind.BYTE_LITERAL;
+        }
+
+        /** @return the bytes of a byte literal, {@code null} for other patterns */
+        public byte[] bytes() {
+            return literalBytes;
+        }
+
+        /** @return the source of a regular expression pattern, {@code null} otherwise */
+        public String regexSource() {
+            return regexSource;
+        }
+
+        /** @return the flags of a regular expression pattern (empty for the other kinds) */
+        public String regexFlags() {
+            return regexFlags;
+        }
+
+        @Override
+        public String toString() {
+            return switch (kind) {
+                case BYTE_LITERAL -> "Uint8Array(" + literalBytes.length + " bytes)";
+                case REGEX -> "RegExp /" + regexSource + "/" + regexFlags;
+                case MATCHER -> "matcher";
+            };
+        }
+
+        /**
+         * Applies the pattern options, see {@link LineMatcher#withPatternOptions(String, boolean)}:
+         * only the owner of a pattern can honour them. A byte literal has no flags and a bare
+         * {@link SpanMatcher} cannot rebuild itself, so both are returned unchanged; a wrapped
+         * {@link LineMatcher} keeps its own contract - the engine applies the options through it
+         * exactly the way it did before byte search existed.
+         */
+        public SearchPattern withPatternOptions(String extraFlags, boolean caseInsensitive) {
+            if (kind == Kind.MATCHER && fixedLine != null) {
+                LineMatcher rebuilt = fixedLine.withPatternOptions(extraFlags, caseInsensitive);
+                return rebuilt == fixedLine ? this
+                        : new SearchPattern(Kind.MATCHER, null, null, null, "", false, null,
+                                fixedSpan, rebuilt);
+            }
+            if (kind != Kind.REGEX) {
+                return this;
+            }
+            String merged = regexFlags;
+            if (!fromRegExp && extraFlags != null && !extraFlags.isEmpty()) {
+                merged = mergeFlags(merged, extraFlags);
+            }
+            if (caseInsensitive) {
+                merged = mergeFlags(merged, "i");
+            }
+            return merged.equals(regexFlags) ? this
+                    : new SearchPattern(Kind.REGEX, null, null, regexSource, merged,
+                            fromRegExp, factory, null, null);
+        }
+
+        /** Appends every flag of {@code extra} that {@code flags} does not carry yet. */
+        private static String mergeFlags(String flags, String extra) {
+            StringBuilder sb = new StringBuilder(flags);
+            for (int i = 0; i < extra.length(); i++) {
+                char c = extra.charAt(i);
+                if (sb.indexOf(String.valueOf(c)) < 0) {
+                    sb.append(c);
+                }
+            }
+            return sb.toString();
+        }
+
+        /** @return true if a byte search ({@code binary: "bytes"}) can be run with this pattern */
+        public boolean supportsByteSearch() {
+            return kind != Kind.MATCHER || fixedSpan != null;
+        }
+
+        /**
+         * The matcher of this pattern for byte search.
+         * @return the matcher
+         * @throws IllegalArgumentException if the pattern cannot produce offsets (a plain
+         *         {@link LineMatcher}) - the caller turns that into a user-facing message
+         */
+        public SpanMatcher spanMatcher() {
+            switch (kind) {
+                case BYTE_LITERAL:
+                    final String carrier = literalCarrier;
+                    return (window, from) -> {
+                        int at = window.indexOf(carrier, Math.max(0, from));
+                        return at < 0 ? null : new MatchSpan(at, carrier.length());
+                    };
+                case REGEX:
+                    if (compiled == null) {
+                        String effective = binaryFlags(regexFlags);
+                        compiled = factory.compile(regexSource, effective);
+                        if (compiled == null) {
+                            throw new IllegalArgumentException("the pattern factory returned no matcher"
+                                    + " for /" + regexSource + "/" + effective);
+                        }
+                    }
+                    return compiled;
+                case MATCHER:
+                default:
+                    if (fixedSpan != null) {
+                        return fixedSpan;
+                    }
+                    throw new IllegalArgumentException("A byte array pattern or a regular expression is"
+                            + " needed for binary: \"bytes\" (the given pattern reports lines only)");
+            }
+        }
+
+        /**
+         * The matcher of this pattern for text search.
+         * @return a line matcher
+         * @throws IllegalArgumentException if none can be derived (a byte literal)
+         */
+        public LineMatcher lineMatcher() {
+            switch (kind) {
+                case MATCHER:
+                    if (fixedLine != null) {
+                        return fixedLine;
+                    }
+                    final SpanMatcher spans = fixedSpan;
+                    return line -> spans.find(line, 0) != null;
+                case REGEX:
+                    // Line semantics are derived from the same matcher: find(line, 0) != null is
+                    // exactly RegExp.prototype.test for a matcher whose lastIndex is set per call.
+                    final SpanMatcher regexSpans = spanMatcher();
+                    return line -> regexSpans.find(line, 0) != null;
+                case BYTE_LITERAL:
+                default:
+                    throw new IllegalArgumentException("A byte array pattern needs binary: \"bytes\""
+                            + " (a byte literal has no line semantics, see search.help())");
+            }
+        }
+    }
+
+    /**
+     * Flags the byte scan compiles a regular expression with: {@code g} (iterate all matches of
+     * a window, driven by {@code lastIndex}) is added, {@code y} is dropped like in text mode
+     * (spec 10.2 and 18.1).
+     * <p>
+     * {@code d} is deliberately <em>not</em> added: the offsets come from {@code result.index}
+     * plus the length of {@code result[0]}, which is portable. Measured on this GraalVM,
+     * {@code result.indices} is {@code [[start, end]]} rather than the flat
+     * {@code [start, end, ...]} of the specification, so a matcher that trusted it would report
+     * wrong offsets.
+     * </p>
+     * @param flags user flags of the pattern
+     * @return the effective flags
+     */
+    static String binaryFlags(String flags) {
+        StringBuilder sb = new StringBuilder(flags == null ? "" : flags);
+        for (int i = sb.length() - 1; i >= 0; i--) {
+            if (sb.charAt(i) == 'y') {
+                sb.deleteCharAt(i);
+            }
+        }
+        if (indexOf(sb, 'g') < 0) {
+            sb.append('g');
+        }
+        return sb.toString();
+    }
+
+    private static int indexOf(CharSequence cs, char c) {
+        for (int i = 0; i < cs.length(); i++) {
+            if (cs.charAt(i) == c) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Rejects a non-ASCII regular expression source in byte search (spec 18.1): outside the
+     * byte domain a pattern is a typo, and {@code \xNN} escapes always ASCII.
+     * @param source expression source
+     * @throws IllegalArgumentException naming the character and its index
+     */
+    static void requireAsciiRegexSource(String source) {
+        for (int i = 0; i < source.length(); i++) {
+            char c = source.charAt(i);
+            if (c > 0x7F) {
+                throw new IllegalArgumentException("binary regex source must be ASCII"
+                        + " (use \\xNN escapes); found U+"
+                        + String.format("%04X", (int) c) + " at index " + i);
+            }
+        }
+    }
+
+    /**
+     * A {@link SpanMatcher} over {@link java.util.regex.Pattern} for host-side callers and unit
+     * tests. Production code (the bridge) always compiles a JavaScript {@code RegExp}, because
+     * spec 10.2 asks for JavaScript pattern semantics - this helper exists so that the engine can
+     * be tested without a JavaScript context. It cannot reproduce ECMAScript anchor behaviour at
+     * a scan offset exactly (a Java matcher anchors {@code ^} at the region start).
+     * @param source expression source
+     * @param flags ECMAScript flags; {@code g}, {@code d} and {@code y} are ignored, the others
+     *              are mapped to their Java counterparts
+     * @return a matcher over the byte carrier
+     */
+    public static SpanMatcher javaRegexSpanMatcher(String source, String flags) {
+        int javaFlags = 0;
+        String f = flags == null ? "" : flags;
+        for (int i = 0; i < f.length(); i++) {
+            switch (f.charAt(i)) {
+                case 'i' -> javaFlags |= Pattern.CASE_INSENSITIVE;
+                case 'm' -> javaFlags |= Pattern.MULTILINE;
+                case 's' -> javaFlags |= Pattern.DOTALL;
+                case 'u' -> javaFlags |= Pattern.UNICODE_CASE;
+                case 'x' -> javaFlags |= Pattern.COMMENTS;
+                default -> { /* g, d, y, v: no Java equivalent needed here */ }
+            }
+        }
+        final Pattern pattern = Pattern.compile(source, javaFlags);
+        return (window, from) -> {
+            Matcher m = pattern.matcher(window);
+            if (!m.find(Math.max(0, from))) {
+                return null;
+            }
+            return new MatchSpan(m.start(), m.end() - m.start());
+        };
     }
 
     /**
@@ -161,12 +552,26 @@ public final class JsSearch {
     /** Separator between archive levels in a display path. */
     public static final String ARCHIVE_SEPARATOR = "#";
 
+    /** Lowercase hex digits (canonical byte representation, spec 18.2). */
+    private static final String HEX_DIGITS = "0123456789abcdef";
+
+    /**
+     * Bytes in one mebibyte. All size limits are expressed in this unit so that the numeric
+     * value and the human-readable value shown in {@link #help()} cannot drift apart; use
+     * {@link #mebibytes(long)} for the readable form.
+     */
+    private static final long MEBIBYTE = 1024L * 1024L;
+
     /** Default limit for the number of collected matches. */
     public static final int DEFAULT_MAX_MATCHES = 2000;
-    /** Default size limit for a plain file in bytes (320 MiB). */
-    public static final long DEFAULT_MAX_FILE_BYTES = 320 * 1048576L;
-    /** Default size limit for an archive entry in bytes (320 MiB). */
-    public static final long DEFAULT_MAX_ENTRY_BYTES = 320 * 1048576L;
+    /**
+     * Default size limit for a plain file in bytes (320 MiB). Single source of truth:
+     * docs/js/search.md and {@link #help()} derive from this constant, guarded by
+     * {@code JsSearchLimitConsistencyTest}.
+     */
+    public static final long DEFAULT_MAX_FILE_BYTES = 320 * MEBIBYTE;
+    /** Default size limit for an archive entry in bytes (320 MiB), see {@link #DEFAULT_MAX_FILE_BYTES}. */
+    public static final long DEFAULT_MAX_ENTRY_BYTES = 320 * MEBIBYTE;
     /** Default output limit of the string methods in bytes. */
     public static final int DEFAULT_MAX_OUTPUT_BYTES = 200000;
     /** Default archive nesting limit when {@code recursiveArchives} is enabled. */
@@ -194,6 +599,41 @@ public final class JsSearch {
     public static final String MODE_FILES_WITH_MATCHES = "filesWithMatches";
     /** Mode of {@code search.find()}. */
     public static final String MODE_STRUCTURED = "structured";
+    /** Mode of the byte search: one {@code path:0xoffset+length} line per match (spec 19.4). */
+    public static final String MODE_OFFSETS = "offsets";
+    /** Mode of the byte search: one {@code path:count} line per file (spec 19.5). */
+    public static final String MODE_COUNTS = "counts";
+
+    /** Value of the {@code binary} option: skip binary files (default, unchanged behaviour). */
+    public static final String BINARY_SKIP = "skip";
+    /** Value of the {@code binary} option: byte-exact scan without lines (spec 18.1). */
+    public static final String BINARY_BYTES = "bytes";
+
+    /** Value of the {@code render} option: escaped ASCII (spec 18.2). */
+    public static final String RENDER_ESCAPED = "escaped";
+    /** Value of the {@code render} option: canonical lowercase hex, like {@code fs.readHex}. */
+    public static final String RENDER_HEX = "hex";
+
+    /**
+     * Bytes read per window in byte search. The data of a file or entry is never materialized
+     * (the size limits default to 320 MiB, which as a String plus copies would be a heap risk).
+     */
+    public static final int BINARY_WINDOW_BYTES = 1024 * 1024;
+    /**
+     * Bytes carried over from one byte-search window to the next for a regular expression
+     * (decision D4). A match longer than this that crosses a window boundary can be missed or
+     * reported shorter - documented in spec 18.1. Byte literals carry their pattern length
+     * instead and are therefore exact.
+     */
+    public static final int BINARY_REGEX_OVERLAP_BYTES = 32 * 1024;
+    /** Largest buffer the byte scan is willing to allocate for a pathological pattern. */
+    private static final int BINARY_BUFFER_HARD_CAP = 64 * 1024 * 1024;
+    /** Highest accepted value of the {@code preview} option. */
+    public static final int MAX_PREVIEW_BYTES = 256;
+    /** Default {@code preview} of a byte literal: the offset is the whole information (D5). */
+    public static final int DEFAULT_PREVIEW_LITERAL = 0;
+    /** Default {@code preview} of a regular expression: a short hex dump helps (D5). */
+    public static final int DEFAULT_PREVIEW_REGEX = 16;
 
     /** Valid JavaScript regular expression flags (also accepted by the {@code flags} option). */
     private static final String VALID_REGEX_FLAGS = "dgimsuvy";
@@ -202,10 +642,18 @@ public final class JsSearch {
     private static final Set<String> OPTION_NAMES = new LinkedHashSet<>(List.of(
             "recursive", "mode", "filename", "lineNumbers",
             "before", "after", "context", "B", "A", "C",
-            "flags", "caseInsensitive", "encoding", "binary",
+            "flags", "caseInsensitive", "encoding", "binary", "preview", "render",
             "include", "exclude",
             "archives", "recursiveArchives", "maxArchiveDepth",
-            "maxMatches", "maxFileBytes", "maxEntryBytes", "maxOutputBytes"));
+            "maxMatches", "maxMatchesPerFile", "maxFileBytes", "maxEntryBytes", "maxOutputBytes"));
+
+    /**
+     * Options that describe lines and are therefore rejected for {@code binary: "bytes"}
+     * (decision D3). Only an explicitly supplied option triggers the error: {@code lineNumbers}
+     * has a default of {@code true}, which byte search simply ignores.
+     */
+    private static final Set<String> LINE_ONLY_OPTIONS = new LinkedHashSet<>(List.of(
+            "lineNumbers", "before", "after", "context", "B", "A", "C"));
 
     /** Option names in declaration order, used in error messages. */
     private static final String OPTION_LIST = String.join(", ", OPTION_NAMES);
@@ -294,16 +742,34 @@ public final class JsSearch {
         String flags = "";
         boolean caseInsensitive;
         String encoding = "UTF-8";
-        String binary = "skip";
+        String binary = BINARY_SKIP;
+        /** Bytes of context around a byte match, {@code null} = decide by pattern kind (D5). */
+        Integer preview;
+        String render = RENDER_ESCAPED;
         List<PathFilter> include = List.of();
         List<PathFilter> exclude = List.of();
         boolean archives;
         boolean recursiveArchives;
         Integer maxArchiveDepth;
         int maxMatches = DEFAULT_MAX_MATCHES;
+        /** Matches per file in byte search, {@code null} = unlimited (spec 18.1). */
+        Integer maxMatchesPerFile;
         long maxFileBytes = DEFAULT_MAX_FILE_BYTES;
         long maxEntryBytes = DEFAULT_MAX_ENTRY_BYTES;
         int maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES;
+
+        /** True if the scan is the byte-exact one ({@code binary: "bytes"}). */
+        boolean binaryBytes() {
+            return BINARY_BYTES.equals(binary);
+        }
+
+        /** Effective {@code preview}: explicit value, else 0 for a byte literal, 16 for regex. */
+        int effectivePreview(boolean byteLiteral) {
+            if (preview != null) {
+                return preview;
+            }
+            return byteLiteral ? DEFAULT_PREVIEW_LITERAL : DEFAULT_PREVIEW_REGEX;
+        }
 
         /** Effective archive nesting limit (spec section 28.3). */
         int effectiveMaxArchiveDepth() {
@@ -358,11 +824,29 @@ public final class JsSearch {
                 }
                 case "binary" -> {
                     String bin = toStringOption(name, v, false);
-                    if (!"skip".equals(bin)) {
-                        throw new IllegalArgumentException(
-                                "Option 'binary' only supports 'skip' (got '" + bin + "')");
+                    if (!BINARY_SKIP.equals(bin) && !BINARY_BYTES.equals(bin)) {
+                        throw new IllegalArgumentException("Option 'binary' only supports '"
+                                + BINARY_SKIP + "' or '" + BINARY_BYTES + "' (got '" + bin + "')");
                     }
                     o.binary = bin;
+                }
+                case "preview" -> {
+                    if (v != null) {
+                        int p = toNonNegativeInt(name, v);
+                        if (p > MAX_PREVIEW_BYTES) {
+                            throw new IllegalArgumentException("Option 'preview' must be at most "
+                                    + MAX_PREVIEW_BYTES + " (got " + p + ")");
+                        }
+                        o.preview = p;
+                    }
+                }
+                case "render" -> {
+                    String r = toStringOption(name, v, false);
+                    if (!RENDER_ESCAPED.equals(r) && !RENDER_HEX.equals(r)) {
+                        throw new IllegalArgumentException("Option 'render' only supports '"
+                                + RENDER_ESCAPED + "' or '" + RENDER_HEX + "' (got '" + r + "')");
+                    }
+                    o.render = r;
                 }
                 case "include" -> o.include = toFilters(name, v, o.caseInsensitive);
                 case "exclude" -> o.exclude = toFilters(name, v, o.caseInsensitive);
@@ -370,6 +854,7 @@ public final class JsSearch {
                 case "recursiveArchives" -> o.recursiveArchives = toBool(name, v);
                 case "maxArchiveDepth" -> o.maxArchiveDepth = toNullablePositiveInt(name, v);
                 case "maxMatches" -> o.maxMatches = toNonNegativeInt(name, v);
+                case "maxMatchesPerFile" -> o.maxMatchesPerFile = toNullablePositiveInt(name, v);
                 case "maxOutputBytes" -> o.maxOutputBytes = toNonNegativeInt(name, v);
                 case "maxFileBytes" -> o.maxFileBytes = toNonNegativeLong(name, v);
                 case "maxEntryBytes" -> o.maxEntryBytes = toNonNegativeLong(name, v);
@@ -382,16 +867,38 @@ public final class JsSearch {
                         + "' in flags '" + o.flags + "' (valid flags: " + VALID_REGEX_FLAGS + ")");
             }
         }
+        // Byte search has no lines: an option that asks for line numbers or line context is a
+        // contradiction, not something to ignore silently (decision D3).
+        if (o.binaryBytes()) {
+            for (String name : LINE_ONLY_OPTIONS) {
+                if (raw.get(name) != null) {
+                    throw new IllegalArgumentException("Option '" + name + "' is not supported with"
+                            + " binary: \"" + BINARY_BYTES + "\" (a byte search has no lines;"
+                            + " byte context is called 'preview', see search.help())");
+                }
+            }
+        }
         o.before = resolveContext(raw, "before", "B");
         o.after = resolveContext(raw, "after", "A");
         if (o.recursiveArchives && !o.archives) {
             throw new IllegalArgumentException("recursiveArchives requires archives: true");
         }
         parseMode(raw.get("mode"), modeContext, o);
+        if (MODE_COUNTS.equals(o.mode) && !o.filename) {
+            throw new IllegalArgumentException("Option 'filename' cannot be false with mode '"
+                    + MODE_COUNTS + "': a line of bare numbers could not be traced back to a file");
+        }
         return o;
     }
 
-    /** Mode validation per entry point (spec section 19.3). */
+    /**
+     * Mode validation per entry point (spec section 19.3, modes of the byte search 19.4/19.5).
+     * <ul>
+     *   <li>{@code search.grep}: content, filesWithMatches, offsets, counts</li>
+     *   <li>{@code search.find}: structured, offsets (counts is string-only)</li>
+     *   <li>{@code search.files}: filesWithMatches (that is all it returns)</li>
+     * </ul>
+     */
     private static void parseMode(Object v, String context, Options o) {
         if (v == null) {
             o.mode = MODE_STRUCTURED.equals(context) ? MODE_STRUCTURED
@@ -402,13 +909,17 @@ public final class JsSearch {
             throw new IllegalArgumentException("Option 'mode' must be a string");
         }
         if ("search.grep".equals(context)) {
-            if (!MODE_CONTENT.equals(s) && !MODE_FILES_WITH_MATCHES.equals(s)) {
-                throw new IllegalArgumentException("search.grep() supports mode '" + MODE_CONTENT + "' or '"
-                        + MODE_FILES_WITH_MATCHES + "' only");
+            if (!MODE_CONTENT.equals(s) && !MODE_FILES_WITH_MATCHES.equals(s)
+                    && !MODE_OFFSETS.equals(s) && !MODE_COUNTS.equals(s)) {
+                throw new IllegalArgumentException("search.grep() supports mode '" + MODE_CONTENT
+                        + "', '" + MODE_FILES_WITH_MATCHES + "', '" + MODE_OFFSETS + "' or '"
+                        + MODE_COUNTS + "'");
             }
         } else if ("search.find".equals(context)) {
-            if (!MODE_STRUCTURED.equals(s)) {
-                throw new IllegalArgumentException("search.find() supports mode '" + MODE_STRUCTURED + "' only");
+            if (!MODE_STRUCTURED.equals(s) && !MODE_OFFSETS.equals(s)) {
+                throw new IllegalArgumentException("search.find() supports mode '" + MODE_STRUCTURED
+                        + "' or '" + MODE_OFFSETS + "' only ('" + MODE_COUNTS + "' is a string mode"
+                        + " of search.grep())");
             }
         } else if (!MODE_FILES_WITH_MATCHES.equals(s)) {
             throw new IllegalArgumentException("search.files() supports mode '" + MODE_FILES_WITH_MATCHES
@@ -754,8 +1265,7 @@ public final class JsSearch {
      *         {@code truncatedReason}, {@code warnings}
      */
     public static Map<String, Object> find(LineMatcher matcher, Object target, Map<String, Object> rawOptions) {
-        Options options = parseOptions(rawOptions, "search.find");
-        return run(matcher, target, options).toStructured();
+        return find(SearchPattern.of(matcher), target, rawOptions);
     }
 
     /**
@@ -766,9 +1276,7 @@ public final class JsSearch {
      * @return formatted output, possibly ending with a truncation marker
      */
     public static String grep(LineMatcher matcher, Object target, Map<String, Object> rawOptions) {
-        Options options = parseOptions(rawOptions, "search.grep");
-        Engine engine = run(matcher, target, options);
-        return engine.toText(options);
+        return grep(SearchPattern.of(matcher), target, rawOptions);
     }
 
     /**
@@ -779,8 +1287,162 @@ public final class JsSearch {
      * @return unique, sorted display paths
      */
     public static List<String> files(LineMatcher matcher, Object target, Map<String, Object> rawOptions) {
+        return files(SearchPattern.of(matcher), target, rawOptions);
+    }
+
+    /**
+     * Structured result of a {@link SearchPattern} - the entry point that supports byte search
+     * ({@code binary: "bytes"}, spec 18.1), because only a pattern can provide offsets.
+     * @param pattern byte literal, regular expression or matcher
+     * @param target target, see {@link #find(LineMatcher, Object, Map)}
+     * @param rawOptions raw option map, may be null
+     * @return structured result, see {@link #find(LineMatcher, Object, Map)}
+     */
+    public static Map<String, Object> find(SearchPattern pattern, Object target,
+                                           Map<String, Object> rawOptions) {
+        Options options = parseOptions(rawOptions, "search.find");
+        return run(pattern, target, options).toStructured();
+    }
+
+    /**
+     * Text result of a {@link SearchPattern} (see {@link #find(SearchPattern, Object, Map)}).
+     * @param pattern byte literal, regular expression or matcher
+     * @param target target, see {@link #find(LineMatcher, Object, Map)}
+     * @param rawOptions raw option map, may be null
+     * @return formatted output, possibly ending with a truncation marker
+     */
+    public static String grep(SearchPattern pattern, Object target, Map<String, Object> rawOptions) {
+        Options options = parseOptions(rawOptions, "search.grep");
+        Engine engine = run(pattern, target, options);
+        return engine.toText(options);
+    }
+
+    /**
+     * Matching display paths of a {@link SearchPattern} (see {@link #find(SearchPattern, Object, Map)}).
+     * @param pattern byte literal, regular expression or matcher
+     * @param target target, see {@link #find(LineMatcher, Object, Map)}
+     * @param rawOptions raw option map, may be null
+     * @return unique, sorted display paths
+     */
+    public static List<String> files(SearchPattern pattern, Object target, Map<String, Object> rawOptions) {
         Options options = parseOptions(rawOptions, "search.files");
-        return run(matcher, target, options).matchedPaths();
+        return run(pattern, target, options).matchedPaths();
+    }
+
+    /**
+     * Runs {@code search.hexgrep()} (spec 18.3): a hex pattern such as {@code "4d5a 9000"} with
+     * {@code .} for any byte, searched with the same target and option rules as
+     * {@link #grep(LineMatcher, Object, Map)} (use it with {@code binary: "bytes"}). Parsing
+     * lives here (not in the bridge) so that it stays polyglot-free and unit testable.
+     *
+     * @param hexPattern hex digits, spaces/underscores (ignored) and {@code .} for one byte
+     * @param target target, see {@link #find(LineMatcher, Object, Map)}
+     * @param rawOptions raw option map, may be null
+     * @param factory compiles the expression built from a hex pattern containing {@code .}
+     * @return formatted output, like {@code search.grep()}
+     */
+    public static String hexgrep(String hexPattern, Object target, Map<String, Object> rawOptions,
+                                 PatternFactory factory) {
+        return grep(hexToPattern(hexPattern, factory), target, rawOptions);
+    }
+
+    /**
+     * Converts a hex pattern (spec 18.3) into a search pattern: without a {@code .} wildcard the
+     * result is an exact byte literal, with one it is a regular expression over byte escapes.
+     *
+     * @param hexPattern e.g. {@code "4d5a 9000"} or {@code "4d.5a"}
+     * @param factory only needed for patterns containing {@code .}
+     * @return the pattern
+     * @throws IllegalArgumentException for an empty pattern, an odd number of hex digits or any
+     *         other character (naming it and its index)
+     */
+    public static SearchPattern hexToPattern(String hexPattern, PatternFactory factory) {
+        if (hexPattern == null || hexPattern.isEmpty()) {
+            throw new IllegalArgumentException("hex pattern must not be empty"
+                    + " (e.g. \"4d5a 9000\", \".\" matches any byte)");
+        }
+        List<Byte> fixed = new ArrayList<>();      // bytes before the first wildcard
+        List<String> parts = new ArrayList<>();    // regex parts once a wildcard appeared
+        boolean wildcard = false;
+        int nibble = -1;
+        for (int i = 0; i < hexPattern.length(); i++) {
+            char c = hexPattern.charAt(i);
+            if (c == ' ' || c == '_' || c == '\t') {
+                continue; // readability separators
+            }
+            if (c == '.') {
+                if (nibble >= 0) {
+                    throw new IllegalArgumentException("Invalid hex pattern \"" + hexPattern
+                            + "\": a byte must be two hex digits, \".\" stands for a whole byte"
+                            + " (at index " + i + ")");
+                }
+                wildcard = true;
+                if (parts.isEmpty()) {
+                    for (byte b : fixed) {
+                        parts.add(byteEscape(b));
+                    }
+                }
+                parts.add("[\\x00-\\xff]");
+                continue;
+            }
+            int value = Character.digit(c, 16);
+            if (value < 0) {
+                throw new IllegalArgumentException("Invalid hex pattern \"" + hexPattern
+                        + "\": unexpected character '" + c + "' at index " + i
+                        + " (hex digits, spaces, \"_\" and \".\" are allowed)");
+            }
+            if (nibble < 0) {
+                nibble = value;
+            } else {
+                int combined = (nibble << 4) | value;
+                nibble = -1;
+                if (wildcard) {
+                    parts.add(byteEscape((byte) combined));
+                } else {
+                    fixed.add((byte) combined);
+                }
+            }
+        }
+        if (nibble >= 0) {
+            throw new IllegalArgumentException("Invalid hex pattern \"" + hexPattern
+                    + "\": odd number of hex digits - bytes are pairs, use \".\" for a whole byte");
+        }
+        if (!wildcard) {
+            if (fixed.isEmpty()) {
+                throw new IllegalArgumentException("hex pattern must not be empty"
+                        + " (e.g. \"4d5a 9000\", \".\" matches any byte)");
+            }
+            byte[] bytes = new byte[fixed.size()];
+            for (int i = 0; i < bytes.length; i++) {
+                bytes[i] = fixed.get(i);
+            }
+            return SearchPattern.byteLiteral(bytes);
+        }
+        if (factory == null) {
+            throw new IllegalArgumentException("A hex pattern with \".\" needs a pattern factory"
+                    + " to build the expression");
+        }
+        return SearchPattern.regExp(String.join("", parts), "", false, factory);
+    }
+
+    /** {@code \xnn} escape of one byte (lowercase, JavaScript and Java compatible). */
+    static String byteEscape(byte b) {
+        return String.format("\\x%02x", b & 0xFF);
+    }
+
+    /** Convenience overload without options. */
+    public static Map<String, Object> find(SearchPattern pattern, Object target) {
+        return find(pattern, target, null);
+    }
+
+    /** Convenience overload without options. */
+    public static String grep(SearchPattern pattern, Object target) {
+        return grep(pattern, target, null);
+    }
+
+    /** Convenience overload without options. */
+    public static List<String> files(SearchPattern pattern, Object target) {
+        return files(pattern, target, null);
     }
 
     /** Convenience overload without options. */
@@ -930,16 +1592,34 @@ public final class JsSearch {
 
     /** Runs the traversal shared by find/grep/files. */
     private static Engine run(LineMatcher matcher, Object target, Options options) {
-        if (matcher == null) {
+        return run(SearchPattern.of(matcher), target, options);
+    }
+
+    /** Runs the traversal shared by find/grep/files for a {@link SearchPattern}. */
+    private static Engine run(SearchPattern pattern, Object target, Options options) {
+        if (pattern == null) {
             throw new IllegalArgumentException("pattern is required");
         }
         if (target == null) {
             throw new IllegalArgumentException("target is required");
         }
         // flags/caseInsensitive describe the pattern, so they are applied by the pattern owner
-        // (see LineMatcher.withPatternOptions); a matcher that cannot rebuild itself keeps them.
-        matcher = matcher.withPatternOptions(options.flags, options.caseInsensitive);
-        Engine engine = new Engine(matcher, options);
+        // (see LineMatcher.withPatternOptions); a pattern that cannot rebuild itself keeps them.
+        SearchPattern applied = pattern.withPatternOptions(options.flags, options.caseInsensitive);
+        if (options.binaryBytes()) {
+            // Fail before the first byte is read: a non-ASCII regex source cannot match bytes,
+            // and a matcher that only reports booleans cannot report offsets (spec 18.1).
+            if (!applied.supportsByteSearch()) {
+                throw new IllegalArgumentException("A byte array pattern or a regular expression is"
+                        + " needed for binary: \"" + BINARY_BYTES + "\" (the given pattern reports"
+                        + " lines only)");
+            }
+            requireByteSearchable(applied);
+        } else if (applied.isByteLiteral()) {
+            throw new IllegalArgumentException("A byte array pattern needs binary: \"" + BINARY_BYTES
+                    + "\" (a byte literal has no line semantics, see search.help())");
+        }
+        Engine engine = new Engine(applied, options);
         if (options.maxMatches == 0) {
             engine.truncated = true;
             engine.truncatedReason = REASON_MAX_MATCHES;
@@ -955,10 +1635,25 @@ public final class JsSearch {
     }
 
     /**
+     * Fails fast on a pattern that cannot be used for a byte search, before any file is
+     * opened: in byte search a regular expression source must be ASCII (spec 18.1). A byte
+     * literal is always fine; a plain {@link LineMatcher} fails where it is used, in
+     * {@link #scanOrSkipBinary(Source, boolean)}, because only there the source is known.
+     * @param pattern the pattern to check
+     */
+    private static void requireByteSearchable(SearchPattern pattern) {
+        if (pattern.kind() == SearchPattern.Kind.REGEX) {
+            requireAsciiRegexSource(pattern.regexSource());
+        }
+    }
+
+    /**
      * Engine state of a single search: traversal, counting and result collection.
      */
     private static final class Engine {
 
+        private final SearchPattern pattern;
+        /** Line matcher of {@link #pattern}; {@code null} for a byte literal (no lines). */
         private final LineMatcher matcher;
         private final Options opts;
         /** Matches per display path, sorted by display path. */
@@ -979,8 +1674,11 @@ public final class JsSearch {
         /** Chain index the {@link #lastEntryNames} belong to, -1 if none was visited yet. */
         private int hintChainIndex = -1;
 
-        Engine(LineMatcher matcher, Options opts) {
-            this.matcher = matcher;
+        Engine(SearchPattern pattern, Options opts) {
+            this.pattern = pattern;
+            // The line matcher is derived lazily-ish here: a byte literal has none, and asking
+            // for one would throw. Text scanning is never reached in that case (spec 10.4).
+            this.matcher = pattern.isByteLiteral() ? null : pattern.lineMatcher();
             this.opts = opts;
         }
 
@@ -1340,9 +2038,16 @@ public final class JsSearch {
         // Text sources
         // ----------------------------------------------------------------
 
-        /** Scans one virtual text file (plain file, archive entry or gzipped text). */
+        /**
+         * Scans one virtual file - either byte-exactly ({@code binary: "bytes"}, spec 18.1) or
+         * as text (lines, UTF-8, binary detection).
+         */
         private void scanSource(Source src, boolean explicit) {
             if (stopRequested) {
+                return;
+            }
+            if (opts.binaryBytes()) {
+                scanBinary(src, explicit);
                 return;
             }
             long maxBytes = maxBytesFor(src.depth);
@@ -1384,8 +2089,8 @@ public final class JsSearch {
         private void oversized(Source src, boolean explicit, long maxBytes) {
             if (explicit) {
                 throw new JsUserRuntimeException("File exceeds "
-                        + (src.depth > 0 ? "maxEntryBytes" : "maxFileBytes") + " (" + maxBytes + " bytes): "
-                        + src.displayPath);
+                        + (src.depth > 0 ? "maxEntryBytes" : "maxFileBytes") + " (" + maxBytes
+                        + " bytes" + sizeHint(maxBytes) + "): " + src.displayPath);
             }
             counts.skipped++;
             addWarning("Skipped large file " + src.displayPath + ": size exceeds "
@@ -1394,6 +2099,221 @@ public final class JsSearch {
 
         private long maxBytesFor(int depth) {
             return depth > 0 ? opts.maxEntryBytes : opts.maxFileBytes;
+        }
+
+        // ----------------------------------------------------------------
+        // Byte sources (binary: "bytes", spec 18.1)
+        // ----------------------------------------------------------------
+
+        /**
+         * Scans one virtual file byte-exactly: no binary detection, no line splitting, no
+         * character decoding. The data is read in windows into a reused buffer, so even a
+         * 320 MiB source costs a constant amount of memory; offsets are absolute (entry-relative
+         * in the decompressed stream).
+         */
+        private void scanBinary(Source src, boolean explicit) {
+            long maxBytes = maxBytesFor(src.depth);
+            if (src.knownSize > maxBytes) {
+                oversized(src, explicit, maxBytes);
+                return;
+            }
+            SpanMatcher matcher = pattern.spanMatcher();
+            int preview = opts.effectivePreview(pattern.isByteLiteral());
+            try (InputStream raw = src.opener.open();
+                 InputStream content = src.gzipped
+                         ? new GZIPInputStream(new BufferedInputStream(raw)) : raw) {
+                BinaryScan scan = scanBinaryContent(content, matcher, maxBytes, preview,
+                        src.displayPath, src.knownSize);
+                counts.bytesScanned += scan.bytesScanned;
+                if (scan.oversized) {
+                    // Read past the configured limit: hard error for an explicit target, warning
+                    // plus "skipped" in a recursive scan; found matches are dropped either way.
+                    oversized(src, explicit, maxBytes);
+                    return;
+                }
+                FileScan asFileScan = new FileScan();
+                asFileScan.matches.addAll(scan.matches);
+                commit(src, asFileScan);
+                if (scan.perFileLimitCut && !truncated) {
+                    // maxMatchesPerFile dropped at least one match: the result is cut, and
+                    // maxMatches is the closest documented reason.
+                    truncated = true;
+                    truncatedReason = REASON_MAX_MATCHES;
+                }
+            } catch (JsUserRuntimeException e) {
+                throw e;
+            } catch (IOException e) {
+                if (explicit) {
+                    throw new JsUserRuntimeException(
+                            "Failed to read file: " + src.displayPath + " (" + e.getMessage() + ")", e);
+                }
+                counts.errors++;
+                counts.skipped++;
+                addWarning("Failed to read " + src.displayPath + ": " + e.getMessage());
+            }
+        }
+
+        /**
+         * The window loop itself. Buffer layout of one window: first the bytes carried over from
+         * the previous window (their absolute offsets start at {@code windowBase}), then the
+         * freshly read data. The carry is {@code overlap + 2 * preview}, and
+         * {@code overlap} is the <em>pattern length</em> for a byte literal and {@code R} for a
+         * regular expression:
+         * <ul>
+         *   <li>a match is reported in the first window that holds it completely <em>including
+         *       its preview</em>; a match that reaches the window end is deferred, because a
+         *       greedy expression may extend it - the carry brings those bytes back, so nothing
+         *       is reported twice and nothing is lost (as long as the match fits into the
+         *       carry, which a byte literal always does and a regular expression does up to
+         *       {@code R});</li>
+         *   <li>{@code preview} bytes of context on both sides must survive the carry as well,
+         *       so a {@code previewHex} is identical no matter where the window borders fall.</li>
+         * </ul>
+         */
+        private BinaryScan scanBinaryContent(InputStream in, SpanMatcher matcher, long maxBytes,
+                                             int preview, String display, long knownSize)
+                throws IOException {
+            BinaryScan out = new BinaryScan();
+            long overlap = pattern.isByteLiteral()
+                    ? (long) pattern.bytes().length            // exact for a byte literal
+                    : BINARY_REGEX_OVERLAP_BYTES;              // R for a regex (D4)
+            long carryWanted = overlap + 2L * preview;
+            int bufSize = binaryBufferSize(overlap, preview);
+            if (knownSize >= 0) {
+                // A 4 KiB file does not need a 1 MiB buffer. Never shrink below "carry plus one
+                // byte", otherwise a full window could no longer read anything and the loop
+                // would never advance.
+                long needed = knownSize + 1;
+                if (needed > carryWanted + 1 && needed < bufSize) {
+                    bufSize = (int) needed;
+                }
+            }
+            byte[] buf = new byte[bufSize];
+            long windowBase = 0;     // absolute offset of buf[0]
+            int carryLen = 0;        // bytes of the previous window at the front of buf
+            long prevWindowEnd = 0;  // exclusive end of the previous window
+            long readLimit = maxBytes + 1; // one byte more shows that the source is too large
+            while (true) {
+                int filled = carryLen;
+                boolean lastWindow = false;
+                while (filled < buf.length && out.bytesScanned < readLimit) {
+                    int budget = (int) Math.min((long) buf.length - filled, readLimit - out.bytesScanned);
+                    int n = in.read(buf, filled, budget);
+                    if (n < 0) {
+                        lastWindow = true;
+                        break;
+                    }
+                    filled += n;
+                    out.bytesScanned += n;
+                }
+                if (filled <= 0) {
+                    return finishBinary(out, maxBytes);
+                }
+                if (out.bytesScanned >= readLimit) {
+                    lastWindow = true; // the limit is reached: this is the last window we scan
+                }
+                String window = new String(buf, 0, filled, StandardCharsets.ISO_8859_1);
+                scanBinaryWindow(window, windowBase, windowBase + filled, prevWindowEnd, matcher,
+                        preview, lastWindow, display, out);
+                if (lastWindow) {
+                    return finishBinary(out, maxBytes);
+                }
+                int nextCarry = (int) Math.min(carryWanted, filled);
+                if (nextCarry <= 0) {
+                    windowBase += filled;
+                    carryLen = 0;
+                } else {
+                    System.arraycopy(buf, filled - nextCarry, buf, 0, nextCarry);
+                    windowBase = windowBase + filled - nextCarry;
+                    carryLen = nextCarry;
+                }
+                prevWindowEnd = windowBase + nextCarry; // = end of the window just scanned
+            }
+        }
+
+        /** Turns an oversized byte scan into its final state. */
+        private static BinaryScan finishBinary(BinaryScan out, long maxBytes) {
+            if (out.bytesScanned > maxBytes) {
+                out.oversized = true;
+                out.matches.clear();
+            }
+            return out;
+        }
+
+        /**
+         * Scans one window of the carrier string and collects the matches it can report.
+         * <p>
+         * The three skip rules (validated against a whole-input reference scan over every
+         * window size, preview and needle position - see the model check in the plan document):
+         * </p>
+         * <ul>
+         *   <li>a zero-length match is skipped (flood and the classic {@code lastIndex} dead
+         *       end, spec 18.1);</li>
+         *   <li>a match that starts inside or overlaps an already reported match is skipped -
+         *       the scan continues behind that match, like {@code grep};</li>
+         *   <li>a match that was already completely visible (with preview) in the previous
+         *       window is skipped; a match that reached the previous window end was deferred
+         *       there and is reported now.</li>
+         * </ul>
+         */
+        private void scanBinaryWindow(String window, long windowBase, long windowEnd,
+                                      long prevWindowEnd, SpanMatcher matcher, int preview,
+                                      boolean lastWindow, String display, BinaryScan out) {
+            int from = 0;
+            Integer perFile = opts.maxMatchesPerFile;
+            while (from <= window.length()) {
+                MatchSpan span = matcher.find(window, from);
+                if (span == null) {
+                    return;
+                }
+                int start = span.start();
+                int length = span.length();
+                if (length <= 0) {
+                    // Zero-length matches are skipped: they would flood the output and are the
+                    // classic lastIndex dead end (spec 18.1).
+                    from = start + 1;
+                    continue;
+                }
+                long startAbs = windowBase + start;
+                long endAbs = startAbs + length;
+                if (startAbs < out.lastEndAbs) {
+                    // Inside or overlapping an already reported match: not a new match. Continue
+                    // behind that match, but never behind `start` (guaranteed progress).
+                    from = (int) Math.max((long) start + 1, out.lastEndAbs - windowBase);
+                    continue;
+                }
+                if (endAbs + preview < prevWindowEnd) {
+                    // Strictly smaller: this match was already reported in an earlier window.
+                    // (Equality is the deferred case - it is reported now.)
+                    from = start + 1;
+                    continue;
+                }
+                if (!lastWindow && endAbs + preview >= windowEnd) {
+                    // The match reaches the window end: a greedy expression may extend it, so
+                    // it is reported from the next window on - the carry brings these bytes back.
+                    from = start + 1;
+                    continue;
+                }
+                if (perFile != null && out.matches.size() >= perFile) {
+                    out.perFileLimitCut = true;
+                    return;
+                }
+                out.matches.add(MatchRecord.ofBytes(display, startAbs, start, length, window,
+                        preview, opts.render));
+                out.lastEndAbs = endAbs;
+                from = (int) (endAbs - windowBase); // non-overlapping: continue after the match
+            }
+        }
+
+        /** Matches of one byte scan plus the state the window loop needs. */
+        private static final class BinaryScan {
+            final List<MatchRecord> matches = new ArrayList<>(4);
+            /** Bytes read from the stream (carried bytes are not counted twice). */
+            long bytesScanned;
+            /** End of the last reported match; keeps offsets unique and non-overlapping. */
+            long lastEndAbs;
+            boolean oversized;
+            boolean perFileLimitCut;
         }
 
         /** Binary detection heuristic: NUL byte or invalid UTF-8 in the first bytes. */
@@ -1521,16 +2441,11 @@ public final class JsSearch {
         }
 
         Map<String, Object> toStructured() {
+            boolean reduced = MODE_OFFSETS.equals(opts.mode);
             List<Object> matches = new ArrayList<>();
             for (List<MatchRecord> list : byPath.values()) {
                 for (MatchRecord m : list) {
-                    Map<String, Object> map = new LinkedHashMap<>();
-                    map.put("displayPath", m.displayPath);
-                    map.put("line", m.line);
-                    map.put("text", m.text);
-                    map.put("before", lineRefs(m.before));
-                    map.put("after", lineRefs(m.after));
-                    matches.add(map);
+                    matches.add(m.byteOffset >= 0 ? byteMatchMap(m, reduced) : lineMatchMap(m));
                 }
             }
             Map<String, Object> countsMap = new LinkedHashMap<>();
@@ -1542,6 +2457,7 @@ public final class JsSearch {
             countsMap.put("skipped", counts.skipped);
             countsMap.put("excluded", counts.excluded);
             countsMap.put("errors", counts.errors);
+            countsMap.put("bytesScanned", counts.bytesScanned);
 
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("matches", matches);
@@ -1551,6 +2467,40 @@ public final class JsSearch {
             result.put("truncatedReason", truncatedReason);
             result.put("warnings", new ArrayList<Object>(warnings));
             return result;
+        }
+
+        /** Match object of a text search (spec 8.2). */
+        private static Map<String, Object> lineMatchMap(MatchRecord m) {
+            Map<String, Object> map = new LinkedHashMap<>();
+            map.put("displayPath", m.displayPath);
+            map.put("line", m.line);
+            map.put("text", m.text);
+            map.put("before", lineRefs(m.before));
+            map.put("after", lineRefs(m.after));
+            return map;
+        }
+
+        /**
+         * Match object of a byte search (spec 18.1); in {@code mode: "offsets"} the text and
+         * preview fields are left out (spec 19.4).
+         */
+        private static Map<String, Object> byteMatchMap(MatchRecord m, boolean reduced) {
+            Map<String, Object> map = new LinkedHashMap<>();
+            map.put("displayPath", m.displayPath);
+            map.put("byteOffset", m.byteOffset);
+            map.put("length", m.length);
+            map.put("hex", m.hex);
+            if (!reduced) {
+                map.put("text", m.text);
+            }
+            map.put("line", null);   // never a line number in byte search (decision D3)
+            map.put("before", lineRefs(m.before));
+            map.put("after", lineRefs(m.after));
+            if (!reduced && m.previewHex != null) {
+                map.put("previewHex", m.previewHex);
+                map.put("previewAscii", m.previewAscii);
+            }
+            return map;
         }
 
         private static List<Object> lineRefs(List<LineRef> refs) {
@@ -1579,6 +2529,11 @@ public final class JsSearch {
                     }
                 }
                 return finish(sb, limiter);
+            }
+            if (opts.binaryBytes()) {
+                // Byte search has no lines: content, offsets and counts all come from the byte
+                // formatter (spec 19.4, 19.5 and 19.6).
+                return byteModeText(sb, limiter, options);
             }
             // Separator lines only make sense with context (GNU grep behaviour): without
             // context every match would be its own group and the output would be flooded.
@@ -1618,6 +2573,56 @@ public final class JsSearch {
                 }
             }
             return finish(sb, limiter);
+        }
+
+        /**
+         * Output of every byte-search mode: {@code path:count} (spec 19.5),
+         * {@code path:0xoffset+length[  hex  |ascii|]} (spec 19.4) and the same line plus the
+         * text column for content mode (spec 19.6).
+         */
+        private String byteModeText(StringBuilder sb, OutputLimiter limiter, Options options) {
+            boolean countsOnly = MODE_COUNTS.equals(opts.mode);
+            boolean offsetsOnly = MODE_OFFSETS.equals(opts.mode);
+            for (Map.Entry<String, List<MatchRecord>> pathEntry : byPath.entrySet()) {
+                List<MatchRecord> records = pathEntry.getValue();
+                if (records.isEmpty()) {
+                    continue;
+                }
+                if (countsOnly) {
+                    if (!limiter.append(sb, pathPrefix(pathEntry.getKey()) + records.size())) {
+                        return finish(sb, limiter);
+                    }
+                    continue;
+                }
+                for (MatchRecord m : records) {
+                    if (!limiter.append(sb, formatByteLine(pathEntry.getKey(), m, options, offsetsOnly))) {
+                        return finish(sb, limiter);
+                    }
+                }
+            }
+            return finish(sb, limiter);
+        }
+
+        /** {@code displayPath:} prefix (empty when {@code filename: false}). */
+        private String pathPrefix(String displayPath) {
+            return opts.filename ? displayPath + ":" : "";
+        }
+
+        /** One byte-search line (spec 19.4 and 19.6). */
+        private String formatByteLine(String displayPath, MatchRecord m, Options options,
+                                      boolean offsetsOnly) {
+            StringBuilder sb = new StringBuilder();
+            sb.append(pathPrefix(displayPath))
+                    .append("0x").append(Long.toString(m.byteOffset, 16))
+                    .append('+').append(m.length);
+            if (!offsetsOnly) {
+                sb.append("  ").append(m.text);
+            }
+            if (m.previewHex != null) {
+                sb.append("  ").append(m.previewHex)
+                        .append("  |").append(m.previewAscii).append('|');
+            }
+            return sb.toString();
         }
 
         /** One output line: {@code path:line:text} for matches, {@code path-line-text} for context. */
@@ -1835,19 +2840,185 @@ public final class JsSearch {
     // Result data types
     // ========================================================================
 
-    /** One matching line with its context. */
+    /**
+     * One match: a matching line (text search) or a byte range (byte search, spec 18.1).
+     * The two modes share the record so that sorting, truncation and the counts stay one code
+     * path; {@code line} is {@code -1} and {@code byteOffset} {@code >= 0} in byte search.
+     */
     private static final class MatchRecord {
         final String displayPath;
+        /** 1-based line number in text mode, -1 in byte search (where {@code line} is null). */
         final int line;
+        /** Text mode: the matched line. Byte search: escaped bytes, or hex (spec 18.2). */
         final String text;
+        /** 0-based byte offset in the (decompressed) source, -1 in text mode. */
+        final long byteOffset;
+        /** Matched bytes in byte search, 0 in text mode. */
+        final int length;
+        /** Matched bytes as canonical lowercase hex (byte search), else {@code null}. */
+        final String hex;
+        /** Hex of the preview range (byte search with {@code preview > 0}), else {@code null}. */
+        final String previewHex;
+        /** One character per byte of {@link #previewHex}, non-printable as {@code '.'}. */
+        final String previewAscii;
         final List<LineRef> before = new ArrayList<>(2);
         final List<LineRef> after = new ArrayList<>(2);
 
         MatchRecord(String displayPath, int line, String text) {
+            this(displayPath, line, text, -1L, 0, null, null, null);
+        }
+
+        private MatchRecord(String displayPath, int line, String text, long byteOffset, int length,
+                            String hex, String previewHex, String previewAscii) {
             this.displayPath = displayPath;
             this.line = line;
             this.text = text;
+            this.byteOffset = byteOffset;
+            this.length = length;
+            this.hex = hex;
+            this.previewHex = previewHex;
+            this.previewAscii = previewAscii;
         }
+
+        /**
+         * A byte-search match. All representations are derived here, from the carrier window,
+         * so escaping rules (spec 18.2) live in exactly one place.
+         *
+         * @param displayPath display path of the source
+         * @param byteOffset  absolute (entry-relative) offset of the match
+         * @param matchStart  window-relative index of the match inside {@code carrier}
+         * @param length      match length in bytes
+         * @param carrier     the window (one character per byte)
+         * @param preview     requested context bytes on each side; {@code 0} means no preview
+         *                    fields at all - the match itself is never mistaken for one (D5)
+         * @param render      {@code "escaped"} or {@code "hex"}
+         * @return the record
+         */
+        static MatchRecord ofBytes(String displayPath, long byteOffset, int matchStart, int length,
+                                   String carrier, int preview, String render) {
+            String hex = hexOf(carrier, matchStart, matchStart + length);
+            String text = RENDER_HEX.equals(render) ? hex : escapeBytes(carrier, matchStart,
+                    matchStart + length);
+            String previewHex = null;
+            String previewAscii = null;
+            if (preview > 0) {
+                int previewStart = Math.max(0, matchStart - preview);
+                int previewEnd = Math.min(carrier.length(), matchStart + length + preview);
+                previewHex = hexOf(carrier, previewStart, previewEnd);
+                previewAscii = asciiSidebar(carrier, previewStart, previewEnd);
+            }
+            return new MatchRecord(displayPath, -1, text, byteOffset, length, hex,
+                    previewHex, previewAscii);
+        }
+    }
+
+    // ========================================================================
+    // Byte representation (spec 18.2)
+    // ========================================================================
+
+    /**
+     * Canonical lowercase hex of a range of the carrier, like {@code fs.readHex}.
+     * @param carrier one character per byte
+     * @param from start index
+     * @param to exclusive end index
+     * @return hex string (two digits per byte)
+     */
+    static String hexOf(CharSequence carrier, int from, int to) {
+        StringBuilder sb = new StringBuilder(Math.max(0, to - from) * 2);
+        for (int i = from; i < to; i++) {
+            int b = carrier.charAt(i) & 0xFF;
+            sb.append(HEX_DIGITS.charAt(b >>> 4)).append(HEX_DIGITS.charAt(b & 0xF));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Lossless, injection-preserving ASCII rendering of bytes (spec 18.2): only
+     * {@code 0x20..0x7E} appear unchanged, {@code \n}, {@code \r} and {@code \t} keep their
+     * names, everything else becomes {@code \xnn} with lowercase digits, and a backslash is
+     * doubled. Doubling is what makes the mapping injective - the four bytes {@code 5c 78 66 66}
+     * (the text {@code \xff}) must not look like the single byte {@code 0xff}.
+     *
+     * @param carrier one character per byte
+     * @param from start index
+     * @param to exclusive end index
+     * @return pure ASCII representation
+     */
+    static String escapeBytes(CharSequence carrier, int from, int to) {
+        StringBuilder sb = new StringBuilder(Math.max(0, to - from) + 8);
+        for (int i = from; i < to; i++) {
+            int b = carrier.charAt(i) & 0xFF;
+            switch (b) {
+                case '\n' -> sb.append("\\n");
+                case '\r' -> sb.append("\\r");
+                case '\t' -> sb.append("\\t");
+                case '\\' -> sb.append("\\\\");
+                default -> {
+                    if (b >= 0x20 && b <= 0x7E) {
+                        sb.append((char) b);
+                    } else {
+                        sb.append("\\x").append(HEX_DIGITS.charAt(b >>> 4))
+                                .append(HEX_DIGITS.charAt(b & 0xF));
+                    }
+                }
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Display-only sidebar of a preview: one character per byte, {@code '.'} for anything that
+     * is not printable ASCII. It is never the authoritative column - the hex next to it is.
+     *
+     * @param carrier one character per byte
+     * @param from start index
+     * @param to exclusive end index
+     * @return the sidebar text (without the surrounding {@code |})
+     */
+    static String asciiSidebar(CharSequence carrier, int from, int to) {
+        StringBuilder sb = new StringBuilder(Math.max(0, to - from));
+        for (int i = from; i < to; i++) {
+            int b = carrier.charAt(i) & 0xFF;
+            sb.append(b >= 0x20 && b <= 0x7E ? (char) b : '.');
+        }
+        return sb.toString();
+    }
+
+    /** The reverse of {@link #escapeBytes(CharSequence, int, int)} - used by the round-trip test. */
+    public static byte[] unescapeBytes(String escaped) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(escaped.length());
+        for (int i = 0; i < escaped.length(); i++) {
+            char c = escaped.charAt(i);
+            if (c != '\\' || i + 1 >= escaped.length()) {
+                out.write(c);
+                continue;
+            }
+            char n = escaped.charAt(++i);
+            switch (n) {
+                case 'n' -> out.write('\n');
+                case 'r' -> out.write('\r');
+                case 't' -> out.write('\t');
+                case '\\' -> out.write('\\');
+                case 'x' -> {
+                    if (i + 2 >= escaped.length()) {
+                        out.write('\\');
+                        i -= 1;
+                    } else {
+                        int hi = Character.digit(escaped.charAt(i + 1), 16);
+                        int lo = Character.digit(escaped.charAt(i + 2), 16);
+                        if (hi < 0 || lo < 0) {
+                            out.write('\\');
+                            i -= 1;
+                        } else {
+                            out.write((hi << 4) | lo);
+                            i += 2;
+                        }
+                    }
+                }
+                default -> out.write(n);
+            }
+        }
+        return out.toByteArray();
     }
 
     /** One context line (1-based line number and text). */
@@ -1884,6 +3055,8 @@ public final class JsSearch {
         int skipped;
         int excluded;
         int errors;
+        /** Bytes read by the byte search (spec 18.1); 0 in text mode. */
+        long bytesScanned;
     }
 
     /** Matches of one scanned source. */
@@ -2153,6 +3326,47 @@ public final class JsSearch {
     // ========================================================================
 
     /**
+     * Buffer size of one byte-scan window: {@link #BINARY_WINDOW_BYTES} bytes of data plus the
+     * carried bytes in front of them ({@code overlap + 2 * preview}, see the window loop in
+     * {@code Engine}). Package private because the window-boundary tests are built around
+     * exactly this geometry instead of guessing it.
+     *
+     * @param overlap bytes that must be carried so that the pattern can match across a border
+     * @param preview requested context bytes on each side of a match
+     * @return the buffer size in bytes
+     */
+    static int binaryBufferSize(long overlap, int preview) {
+        long wanted = (long) BINARY_WINDOW_BYTES + Math.max(0L, overlap)
+                + 2L * Math.max(0, preview);
+        return (int) Math.min(Math.max((long) BINARY_WINDOW_BYTES + 1L, wanted),
+                BINARY_BUFFER_HARD_CAP);
+    }
+
+    /**
+     * Formats a byte count the way the help text and size errors state it, e.g.
+     * {@code 335544320 -> "320 MiB"}. Keeps numbers and units in sync (single source: the
+     * {@code DEFAULT_*_BYTES} constants).
+     *
+     * @param bytes byte count
+     * @return human readable size, e.g. {@code "320 MiB"}
+     */
+    static String mebibytes(long bytes) {
+        return (bytes / MEBIBYTE) + " MiB";
+    }
+
+    /**
+     * Human readable hint for a limit value, e.g. {@code " (320 MiB)"}. Empty for values that
+     * are not a whole number of mebibytes (a caller-chosen {@code maxFileBytes: 100} must not
+     * be described as {@code "0 MiB"}).
+     *
+     * @param bytes byte count
+     * @return the hint including the leading space, or an empty string
+     */
+    static String sizeHint(long bytes) {
+        return bytes > 0 && bytes % MEBIBYTE == 0 ? " (" + mebibytes(bytes) + ")" : "";
+    }
+
+    /**
      * Returns the help text of the search module.
      * @return help text
      */
@@ -2178,13 +3392,16 @@ public final class JsSearch {
             "search.grep(pattern, target[, options])    - formatted text output (String)",
             "search.find(pattern, target[, options])    - structured result (Object)",
             "search.files(pattern, target[, options])   - array of display paths with matches",
+            "search.hexgrep(hex, target[, options])     - hex pattern such as \"4d5a . 9000\"",
             "",
             "--- Patterns ---",
-            "pattern is a string (JavaScript regular expression source) or a RegExp object.",
-            "Matching is line by line with JavaScript RegExp semantics; 'g'/'y' are dropped",
-            "internally. An empty pattern throws. Example:",
+            "pattern is a string (JavaScript regular expression source), a RegExp object or a",
+            "byte array (Uint8Array / number[] 0-255, byte search only). Matching in text mode is",
+            "line by line with JavaScript RegExp semantics; 'g'/'y' are dropped internally. An",
+            "empty pattern throws. Hex is never guessed from a string - use search.hexgrep().",
             "    search.grep(\"TODO\", \"src\", { recursive: true })",
             "    search.grep(/password|secret/i, \"config\", { recursive: true, archives: true })",
+            "    search.grep(new Uint8Array([0x4d,0x5a]), \"boot.bin\", { binary: \"bytes\" })",
             "",
             "--- Targets ---",
             "target is a path, an archive display path, an array of targets or an object:",
@@ -2198,22 +3415,42 @@ public final class JsSearch {
             "",
             "--- Options (strict: unknown options are rejected) ---",
             "Scope:      recursive=false",
-            "Output:     mode=\"content\"|\"filesWithMatches\" (find: \"structured\"),",
+            "Output:     mode=\"content\"|\"filesWithMatches\"|\"offsets\"|\"counts\" (grep);",
+            "            \"structured\"|\"offsets\" (find); \"filesWithMatches\" (files);",
             "            filename=true, lineNumbers=true",
             "Context:    before=0, after=0, context=0 (aliases B, A, C; conflicts are errors)",
             "Pattern:    flags=\"\" (any of " + VALID_REGEX_FLAGS + "), caseInsensitive=false",
-            "Text:       encoding=\"UTF-8\" (only), binary=\"skip\" (only)",
+            "Text:       encoding=\"UTF-8\" (only), binary=\"skip\"|\"bytes\"",
+            "Byte scan:  preview=" + MAX_PREVIEW_BYTES + " max (0 for a byte literal, "
+                    + DEFAULT_PREVIEW_REGEX + " for a regex), render=\"escaped\"|\"hex\"",
             "Filtering:  include=[], exclude=[] (arrays of glob strings or RegExp objects)",
             "Archives:   archives=false, recursiveArchives=false, maxArchiveDepth=null",
-            "Limits:     maxMatches=" + DEFAULT_MAX_MATCHES + ", maxFileBytes=" + DEFAULT_MAX_FILE_BYTES
-                    + ",",
-            "            maxEntryBytes=" + DEFAULT_MAX_ENTRY_BYTES + ", maxOutputBytes="
-                    + DEFAULT_MAX_OUTPUT_BYTES,
+            "Limits:     maxMatches=" + DEFAULT_MAX_MATCHES + ", maxMatchesPerFile=null (byte scan),",
+            "            maxFileBytes=" + DEFAULT_MAX_FILE_BYTES + " ("
+                    + mebibytes(DEFAULT_MAX_FILE_BYTES) + "),",
+            "            maxEntryBytes=" + DEFAULT_MAX_ENTRY_BYTES + " ("
+                    + mebibytes(DEFAULT_MAX_ENTRY_BYTES) + "), maxOutputBytes=" + DEFAULT_MAX_OUTPUT_BYTES,
             "",
             "Content output: 'displayPath:line:text' for matches, 'displayPath-line-text' for",
             "context lines; filename:false drops the path, lineNumbers:false the number. With",
             "context, overlapping groups are merged and separated by a '--' line. String output",
             "is cut at maxOutputBytes and ends with a '-- truncated by search limit: ...' marker.",
+            "",
+            "--- Byte search (binary: \"bytes\") ---",
+            "No binary detection, no lines, no decoding: the stream (a file, an archive entry or",
+            "a gzipped entry) is scanned byte-exactly in windows of " + BINARY_WINDOW_BYTES / 1024 + " KiB, offsets are",
+            "entry-relative in the DECOMPRESSED stream. lineNumbers/before/after/context/B/A/C",
+            "are rejected; 'preview' is the byte context instead.",
+            "A byte array pattern is exact; a regex runs over a byte carrier ('g' is added,",
+            "source must be ASCII, \\xNN escapes are byte values, with 's' a dot also",
+            "matches 0x0A). Matches never overlap, zero-length matches are skipped. A regex",
+            "match longer than " + BINARY_REGEX_OVERLAP_BYTES / 1024 + " KiB across a window boundary may be missed.",
+            "Output is always ASCII: printable bytes as themselves, \\n \\r \\t by name, a",
+            "backslash doubled, everything else \\xnn (lowercase). Modes: content shows",
+            "'path:0xoffset+length  text', mode:\"offsets\" shows 'path:0xoffset+length'",
+            "(plus '  hex  |ascii|' when preview > 0), mode:\"counts\" shows 'path:count'.",
+            "    search.grep([0x68,0x00,0x61], \"utf16.txt\", { binary: \"bytes\", preview: 8 })",
+            "    search.hexgrep(\"4d5a .. 9000\", \"image.bin\", { mode: \"counts\" })",
             "",
             "--- Globs (include/exclude strings) ---",
             "* (never matches /), ? (one character, never /), [abc], [a-z], [!a-z],",
@@ -2228,10 +3465,13 @@ public final class JsSearch {
             "{ matches: [{ displayPath, line, text, before: [{line,text}], after: [...] }],",
             "  files: [displayPath],",
             "  counts: { filesScanned, filesMatched, matches, archivesOpened,",
-            "            archiveEntriesScanned, skipped, excluded, errors },",
+            "            archiveEntriesScanned, skipped, excluded, errors, bytesScanned },",
             "  truncated: boolean, truncatedReason: \"maxMatches\"|null,",
             "  warnings: [string] }",
             "Paths are sorted by Unicode code point, line numbers are 1-based.",
+            "Byte search instead: { displayPath, byteOffset, length, hex, text, line: null,",
+            "before: [], after: [] } plus previewHex/previewAscii when preview > 0; with",
+            "mode:\"offsets\" the match keeps only displayPath, byteOffset, length, hex, line.",
             "",
             "--- Archives ---",
             "Recognized by extension: .zip .jar .war .ear .aar .apk .xlsx .docx .pptx",
@@ -2246,10 +3486,16 @@ public final class JsSearch {
             "    console.log(m.displayPath + \":\" + m.line + \": \" + m.text);",
             "}",
             "",
-            "--- Limitations (v1) ---",
-            "- encoding only \"UTF-8\"; binary files are skipped (NUL byte or invalid UTF-8 in the",
-            "  first " + BINARY_SNIFF_BYTES + " bytes); an explicit binary or oversized target throws,",
-            "- no invertMatch / wholeWord / multiline / per-file match limits,",
+            "--- Limitations ---",
+            "- text mode decodes UTF-8 only; a file is binary when the first " + BINARY_SNIFF_BYTES + " bytes",
+            "  contain NUL or invalid UTF-8. binary:\"skip\" (default) skips it - an explicit",
+            "  binary or oversized target throws - and binary:\"bytes\" searches it exactly,",
+            "- byte search: regex source must be ASCII, characters above 0xFF never match, a regex",
+            "  match longer than " + BINARY_REGEX_OVERLAP_BYTES / 1024 + " KiB over a window boundary may be missed,",
+            "- UTF-16 text is bytes, not characters: search \"h\\x00a\\x00l\\x00l\\x00o\\x00\", the",
+            "  bytes 68 00 61 00 6c 00 6c 00 6f 00, or search.hexgrep(\"680061006c006c006f00\");",
+            "  a comfortable 'encoding' for text search is planned, not built,",
+            "- no invertMatch / wholeWord / multiline; maxMatchesPerFile works in byte search only,",
             "- symbolic links are never followed (such files and directories are skipped),",
             "- link entries in archives: tar links are skipped, ZIP symlink entries are searched",
             "  as text (their content is the link target; the file system is never touched),",

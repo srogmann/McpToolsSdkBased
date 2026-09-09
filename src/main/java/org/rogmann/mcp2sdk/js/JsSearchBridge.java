@@ -27,6 +27,9 @@ import java.util.Map;
  * var out    = search.grep("TODO", "src", { recursive: true });
  * var result = search.find(/password/i, "config", { recursive: true, archives: true });
  * var paths  = search.files("servlet", "example.ear#admin.war#WEB-INF/web.xml");
+ * var hits   = search.grep(new Uint8Array([0x4d, 0x5a]), "boot.bin",
+ *                          { binary: "bytes", mode: "offsets" });
+ * var hex    = search.hexgrep("4d5a .. 9000", "image.bin", { mode: "counts" });
  * console.log(search.help());
  * }</pre>
  *
@@ -35,10 +38,14 @@ import java.util.Map;
  * The specification requires JavaScript regular expression semantics, so matching is
  * delegated to a real JS {@code RegExp}: {@link #wireApi(Value)} evaluates a small helper
  * object once per call inside the JavaScript context (see {@link RegExpSupport}), and
- * {@link #toLineMatcher(RegExpSupport, Value)} builds the expression either from a string
- * pattern (plus {@code flags} / {@code caseInsensitive}) or from a RegExp object. The flags
- * {@code g} and {@code y} are always removed, because line-by-line matching must not carry
- * state between lines (the same applies to RegExp items of include/exclude).
+ * {@link #toPattern(RegExpSupport, Value)} builds the {@link JsSearch.SearchPattern} either
+ * from a string pattern (plus {@code flags} / {@code caseInsensitive}), from a RegExp object
+ * or from a byte array ({@code Uint8Array}, byte search only). The engine asks the
+ * {@link JsSearch.PatternFactory} of this bridge to compile the expression, which is where
+ * the flags of the byte scan ({@code g} and {@code d}) come in. For text matching the flags
+ * {@code g} and {@code y} never change the result: a span lookup sets {@code lastIndex}
+ * explicitly before every {@code exec} (the same applies to RegExp items of
+ * include/exclude).
  * </p>
  *
  * <h3>Why {@link RegExpSupport} instead of {@code Value.isRegExp()}</h3>
@@ -62,7 +69,10 @@ public class JsSearchBridge implements JsModuleInterface {
             + "  var tag = Object.prototype.toString;"
             + "  return {"
             + "    create: function (source, flags) { return new RegExp(source, flags); },"
-            + "    isRegExp: function (value) { return tag.call(value) === '[object RegExp]'; }"
+            + "    isRegExp: function (value) { return tag.call(value) === '[object RegExp]'; },"
+            + "    typeName: function (value) {"
+            + "      var s = tag.call(value); return s.slice(8, s.length - 1);"
+            + "    }"
             + "  };"
             + "})";
 
@@ -95,7 +105,8 @@ public class JsSearchBridge implements JsModuleInterface {
      * @return ProxyObject with the search methods
      */
     public static ProxyObject createSearchNamespace(RegExpSupport regexps) {
-        final RegExpSupport re = regexps != null ? regexps : new RegExpSupport(null, null);
+        final RegExpSupport re = regexps != null ? regexps : new RegExpSupport(null, null, null);
+        final JsSearch.PatternFactory factory = spanFactory(re);
         Map<String, Object> methods = new HashMap<>();
 
         methods.put("help", (ProxyExecutable) args -> JsSearch.help());
@@ -103,25 +114,51 @@ public class JsSearchBridge implements JsModuleInterface {
         methods.put("grep", (ProxyExecutable) args -> {
             requireArgs(args, 2, "grep(pattern, target[, options])");
             Map<String, Object> options = toOptionMap(re, args, 2);
-            JsSearch.LineMatcher matcher = toLineMatcher(re, args[0]);
-            return JsSearch.grep(matcher, toTarget(args[1]), options);
+            JsSearch.SearchPattern pattern = toPattern(re, factory, args[0]);
+            return JsSearch.grep(pattern, toTarget(args[1]), options);
         });
 
         methods.put("find", (ProxyExecutable) args -> {
             requireArgs(args, 2, "find(pattern, target[, options])");
             Map<String, Object> options = toOptionMap(re, args, 2);
-            JsSearch.LineMatcher matcher = toLineMatcher(re, args[0]);
-            return GraalProxies.toProxyObject(JsSearch.find(matcher, toTarget(args[1]), options));
+            JsSearch.SearchPattern pattern = toPattern(re, factory, args[0]);
+            return GraalProxies.toProxyObject(JsSearch.find(pattern, toTarget(args[1]), options));
         });
 
         methods.put("files", (ProxyExecutable) args -> {
             requireArgs(args, 2, "files(pattern, target[, options])");
             Map<String, Object> options = toOptionMap(re, args, 2);
-            JsSearch.LineMatcher matcher = toLineMatcher(re, args[0]);
-            return createStringProxyArray(JsSearch.files(matcher, toTarget(args[1]), options));
+            JsSearch.SearchPattern pattern = toPattern(re, factory, args[0]);
+            return createStringProxyArray(JsSearch.files(pattern, toTarget(args[1]), options));
+        });
+
+        // Hex is never guessed: a string that looks like hex is still regex source in grep(),
+        // so the hex form lives in its own function (spec 18.3).
+        methods.put("hexgrep", (ProxyExecutable) args -> {
+            requireArgs(args, 2, "hexgrep(hexPattern, target[, options])");
+            Map<String, Object> options = toOptionMap(re, args, 2);
+            return JsSearch.hexgrep(requireHexPattern(args[0]), toTarget(args[1]), options, factory);
         });
 
         return ProxyObject.fromMap(methods);
+    }
+
+    /** The pattern factory of this bridge: compiles real JavaScript {@code RegExp}s. */
+    static JsSearch.PatternFactory spanFactory(RegExpSupport regexps) {
+        return (source, flags) -> new JsRegExpSpanMatcher(regexps.create(source, flags));
+    }
+
+    /** Reads the hex-pattern argument of {@code search.hexgrep()}. */
+    private static String requireHexPattern(Value value) {
+        if (value == null || value.isNull()) {
+            throw new IllegalArgumentException("hex pattern is required, e.g. \"4d5a 9000\""
+                    + " (use search.grep() for regular expressions)");
+        }
+        if (!value.isString()) {
+            throw new IllegalArgumentException("hex pattern must be a string such as \"4d5a 9000\""
+                    + " (use search.grep() for regular expressions or a Uint8Array for bytes)");
+        }
+        return value.asString();
     }
 
     // ========================================================================
@@ -144,10 +181,13 @@ public class JsSearchBridge implements JsModuleInterface {
         private final Value createFn;
         /** Guest function {@code (value) => boolean}, {@code true} for RegExps (may be {@code null}). */
         private final Value isRegExpFn;
+        /** Guest function {@code (value) => "Uint8Array"|"Array"|...} (may be {@code null}). */
+        private final Value typeNameFn;
 
-        private RegExpSupport(Value createFn, Value isRegExpFn) {
+        private RegExpSupport(Value createFn, Value isRegExpFn, Value typeNameFn) {
             this.createFn = createFn;
             this.isRegExpFn = isRegExpFn;
+            this.typeNameFn = typeNameFn;
         }
 
         /**
@@ -163,26 +203,29 @@ public class JsSearchBridge implements JsModuleInterface {
          */
         static RegExpSupport create(Context context) {
             if (context == null) {
-                return new RegExpSupport(null, null);
+                return new RegExpSupport(null, null, null);
             }
             Value createFn = null;
             Value isRegExpFn = null;
+            Value typeNameFn = null;
             try {
                 Value helpers = context.eval("js", REGEXP_HELPERS_SOURCE).execute();
                 if (helpers != null && !helpers.isNull()) {
                     createFn = asCallable(helpers, "create");
                     isRegExpFn = asCallable(helpers, "isRegExp");
+                    typeNameFn = asCallable(helpers, "typeName");
                 }
             } catch (RuntimeException e) {
                 // no (or a restricted) JS realm: work without the guest helpers
                 createFn = null;
                 isRegExpFn = null;
+                typeNameFn = null;
             }
             if (createFn == null) {
                 // Fallback: calling RegExp(source, flags) as a function equals new RegExp(...).
                 createFn = asCallable(context.getBindings("js"), "RegExp");
             }
-            return new RegExpSupport(createFn, isRegExpFn);
+            return new RegExpSupport(createFn, isRegExpFn, typeNameFn);
         }
 
         /**
@@ -288,6 +331,24 @@ public class JsSearchBridge implements JsModuleInterface {
             }
             return looksLikeRegExp(v);
         }
+
+        /**
+         * Names a value the way JavaScript sees it ({@code "Uint8Array"}, {@code "Array"},
+         * {@code "RegExp"}, ...). Realm-safe, because it uses {@code Object.prototype.toString}.
+         * @param v the value to name
+         * @return the type name, or {@code null} if the helper is unavailable or fails
+         */
+        String typeName(Value v) {
+            if (typeNameFn == null || v == null) {
+                return null;
+            }
+            try {
+                Value name = typeNameFn.execute(v);
+                return name != null && name.isString() ? name.asString() : null;
+            } catch (RuntimeException e) {
+                return null;
+            }
+        }
     }
 
     /**
@@ -345,104 +406,149 @@ public class JsSearchBridge implements JsModuleInterface {
     // ========================================================================
 
     /**
-     * Builds a {@link JsSearch.LineMatcher} from the JS pattern argument.
+     * Builds a {@link JsSearch.SearchPattern} from the JS pattern argument.
      * <p>
-     * A string pattern keeps its flags empty, a RegExp contributes its own {@code source} and
-     * {@code flags}. The pattern-level options {@code flags} and {@code caseInsensitive} are
-     * <em>not</em> applied here: the engine applies them through
-     * {@link JsSearch.LineMatcher#withPatternOptions(String, boolean)}, so their semantics live
-     * in exactly one place (see {@link JsRegExpMatcher}).
+     * Three forms are accepted: a string (regular expression source), a RegExp object (its own
+     * {@code source} and {@code flags}, spec 10.2) and a byte array - {@code Uint8Array} or an
+     * array of numbers 0..255 - which is a byte literal for the byte search (spec 10.4). The
+     * pattern-level options {@code flags} and {@code caseInsensitive} are <em>not</em> applied
+     * here: the engine applies them through
+     * {@link JsSearch.SearchPattern#withPatternOptions(String, boolean)}, so their semantics
+     * live in exactly one place.
      * </p>
      *
      * @param regexps the context's RegExp helpers
+     * @param factory compiles the expression when the engine needs a matcher
      * @param pattern the JS pattern value
-     * @return a matcher testing single lines
+     * @return the pattern of the search
      */
-    static JsSearch.LineMatcher toLineMatcher(RegExpSupport regexps, Value pattern) {
+    static JsSearch.SearchPattern toPattern(RegExpSupport regexps, JsSearch.PatternFactory factory,
+                                            Value pattern) {
         if (pattern == null || pattern.isNull()) {
-            throw new IllegalArgumentException("pattern is required (string or RegExp)");
+            throw new IllegalArgumentException("pattern is required (string, RegExp or byte array)");
         }
         if (regexps.isRegExp(pattern)) {
-            return new JsRegExpMatcher(regexps, memberAsString(pattern, "source"),
-                    memberAsString(pattern, "flags"), true);
+            return JsSearch.SearchPattern.regExp(memberAsString(pattern, "source"),
+                    memberAsString(pattern, "flags"), true, factory);
         }
         if (pattern.isString()) {
-            return new JsRegExpMatcher(regexps, pattern.asString(), "", false);
-        }
-        throw new IllegalArgumentException("pattern must be a string or a RegExp, but was "
-                + describe(pattern, regexps));
-    }
-
-    /**
-     * Line filter backed by a real JavaScript RegExp of the owning context.
-     * <p>
-     * The expression is compiled eagerly, so an invalid pattern fails before the first file is
-     * read instead of in the middle of a scan. {@link #withPatternOptions(String, boolean)}
-     * rebuilds the expression with the requested flags; the merge is idempotent, therefore the
-     * engine may apply the options again even though the caller already passed a complete
-     * matcher.
-     * </p>
-     */
-    private static final class JsRegExpMatcher implements JsSearch.LineMatcher {
-
-        private final RegExpSupport regexps;
-        private final String source;
-        private final String flags;
-        /** True for patterns that came from a RegExp object: its own flags win (spec 10.2). */
-        private final boolean fromRegExp;
-        private final Value regex;
-
-        private JsRegExpMatcher(RegExpSupport regexps, String source, String flags,
-                                boolean fromRegExp) {
-            this.regexps = regexps;
-            this.source = source;
-            this.flags = stripStatefulFlags(flags);
-            this.fromRegExp = fromRegExp;
+            String source = pattern.asString();
             if (source.isEmpty()) {
                 throw new IllegalArgumentException("pattern must not be empty");
             }
-            this.regex = createRegex(regexps, this.source, this.flags);
+            return JsSearch.SearchPattern.regExp(source, "", false, factory);
+        }
+        if (pattern.hasArrayElements()) {
+            return JsSearch.SearchPattern.byteLiteral(toByteArray(pattern, regexps));
+        }
+        throw new IllegalArgumentException("pattern must be a string, a RegExp or a byte array"
+                + " (Uint8Array), but was " + describe(pattern, regexps));
+    }
+
+    /**
+     * Converts a {@code Uint8Array} (or an array of numbers) into bytes with the errors an agent
+     * needs: element index, kind and range. {@link GraalProxies#toByteArray(Value)} accepts any
+     * number and truncates silently, which would turn {@code [0x1ff]} into {@code [0xff]}.
+     *
+     * @param value the JS array value
+     * @param regexps helpers for naming the offending element
+     * @return the bytes
+     * @throws IllegalArgumentException for an empty array, a non-number, a non-integer or a
+     *         value outside {@code 0..255}
+     */
+    static byte[] toByteArray(Value value, RegExpSupport regexps) {
+        long size = value.getArraySize();
+        if (size == 0) {
+            throw new IllegalArgumentException("pattern must not be empty"
+                    + " (a byte array pattern needs at least one byte)");
+        }
+        if (size > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("byte array pattern is too large: " + size + " bytes");
+        }
+        byte[] data = new byte[(int) size];
+        for (int i = 0; i < data.length; i++) {
+            Value el = value.getArrayElement(i);
+            if (el == null || el.isNull() || !el.isNumber()) {
+                throw new IllegalArgumentException("element " + i + " of the byte array pattern is"
+                        + " not a number (" + describe(el, regexps) + "); expected bytes 0..255");
+            }
+            if (!el.fitsInLong()) {
+                throw new IllegalArgumentException("element " + i + " of the byte array pattern is"
+                        + " not an integer; expected bytes 0..255");
+            }
+            long v = el.asLong();
+            if (v < 0 || v > 255) {
+                throw new IllegalArgumentException("element " + i + " of the byte array pattern is"
+                        + " out of range: " + v + " (expected 0..255)");
+            }
+            data[i] = (byte) v;
+        }
+        return data;
+    }
+
+    /**
+     * Span matcher backed by a real JavaScript RegExp of the owning context.
+     * <p>
+     * {@link #find(String, int)} sets {@code lastIndex} explicitly before every {@code exec},
+     * so scanning stays stateless across windows and lines even though the byte scan adds
+     * {@code g} (iterate all matches). The span is derived from {@code result.index} plus the
+     * length of {@code result[0]} - both defined by ECMAScript and identical to
+     * {@code RegExp.lastIndex} after the match.
+     * <p>
+     * Deliberately <em>not</em> derived from {@code result.indices}: measured on this GraalVM,
+     * {@code indices} is {@code [[start, end]]} (one nested pair) instead of the flat
+     * {@code [start, end, ...]} of the specification, so reading element 0 as a number would
+     * produce nonsense. The carrier holds one character per byte, so the string length of the
+     * match is its byte length.
+     * </p>
+     */
+    private static final class JsRegExpSpanMatcher implements JsSearch.SpanMatcher {
+
+        private final Value regex;
+
+        JsRegExpSpanMatcher(Value regex) {
+            this.regex = regex;
         }
 
         @Override
-        public boolean test(String line) {
+        public JsSearch.MatchSpan find(String window, int from) {
+            Value result;
             try {
-                return regex.invokeMember("test", line).asBoolean();
+                regex.putMember("lastIndex", from);
+                result = regex.invokeMember("exec", window);
             } catch (PolyglotException e) {
-                throw new JsUserRuntimeException("Regular expression failed on line \""
-                        + abbreviate(line) + "\": " + e.getMessage(), e);
+                throw new JsUserRuntimeException("Regular expression failed at offset " + from
+                        + " of a " + window.length() + "-byte window: " + e.getMessage(), e);
             }
-        }
-
-        @Override
-        public JsSearch.LineMatcher withPatternOptions(String extraFlags, boolean caseInsensitive) {
-            String merged = flags;
-            if (!fromRegExp && extraFlags != null && !extraFlags.isEmpty()) {
-                merged = mergeFlags(merged, extraFlags);
+            if (result == null || result.isNull()) {
+                return null;
             }
-            if (caseInsensitive) {
-                merged = mergeFlags(merged, "i");
+            try {
+                long start = result.getMember("index").asLong();
+                if (start < 0) {
+                    return null;
+                }
+                Value whole = result.getArrayElement(0);
+                if (whole == null || whole.isNull() || !whole.isString()) {
+                    throw new JsUserRuntimeException("The regular expression returned a match"
+                            + " without a match string, so its length is unknown");
+                }
+                long length = whole.asString().length();
+                if (length > Integer.MAX_VALUE) {
+                    throw new JsUserRuntimeException("A match of " + length
+                            + " bytes is too long to report");
+                }
+                return new JsSearch.MatchSpan((int) start, (int) length);
+            } catch (JsUserRuntimeException e) {
+                throw e;
+            } catch (RuntimeException e) {
+                throw new JsUserRuntimeException("Could not read the match of the regular"
+                        + " expression: " + e.getMessage(), e);
             }
-            if (merged.equals(flags)) {
-                return this;
-            }
-            return new JsRegExpMatcher(regexps, source, merged, fromRegExp);
         }
     }
 
-    /** Appends every flag of {@code extra} that {@code flags} does not carry yet. */
-    private static String mergeFlags(String flags, String extra) {
-        StringBuilder sb = new StringBuilder(flags);
-        for (int i = 0; i < extra.length(); i++) {
-            char c = extra.charAt(i);
-            if (sb.indexOf(String.valueOf(c)) < 0) {
-                sb.append(c);
-            }
-        }
-        return sb.toString();
-    }
-
-    /** Removes the stateful flags {@code g} and {@code y} (line matching must be stateless). */
+    /** Removes the stateful flags {@code g} and {@code y} (path filters must be stateless). */
     private static String stripStatefulFlags(String flags) {
         StringBuilder sb = new StringBuilder(flags.length());
         for (int i = 0; i < flags.length(); i++) {
@@ -670,7 +776,11 @@ public class JsSearchBridge implements JsModuleInterface {
         }
     }
 
-    /** Describes a JS value type for error messages. */
+    /**
+     * Describes a JS value type for error messages. Typed arrays are named the way JavaScript
+     * names them ({@code Uint8Array}, {@code Int8Array}, ...), because that is the word the
+     * caller used and the one that explains what to pass instead.
+     */
     private static String describe(Value v, RegExpSupport regexps) {
         if (v == null || v.isNull()) {
             return "null";
@@ -688,19 +798,17 @@ public class JsSearchBridge implements JsModuleInterface {
             return "RegExp";
         }
         if (v.hasArrayElements()) {
+            if (regexps != null) {
+                String name = regexps.typeName(v);
+                if (name != null && name.endsWith("Array") && !"Array".equals(name)) {
+                    return name;
+                }
+            }
             return "array";
         }
         if (v.hasMembers()) {
             return "object";
         }
         return "value";
-    }
-
-    /** Shortens a line for error messages. */
-    private static String abbreviate(String s) {
-        if (s == null) {
-            return "";
-        }
-        return s.length() <= 80 ? s : s.substring(0, 77) + "...";
     }
 }
