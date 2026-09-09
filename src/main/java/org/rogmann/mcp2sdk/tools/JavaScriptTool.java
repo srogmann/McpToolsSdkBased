@@ -24,6 +24,7 @@ import org.rogmann.mcp2sdk.js.JsJavapBridge;
 import org.rogmann.mcp2sdk.js.JsMcpProxyBridge;
 import org.rogmann.mcp2sdk.js.JsModuleInterface;
 import org.rogmann.mcp2sdk.js.JsSearchBridge;
+import org.rogmann.mcp2sdk.js.JsSQLiteBridge;
 import org.rogmann.mcp2sdk.poi.DocxToolBoxJsBridge;
 import org.rogmann.mcp2sdk.poi.PoiToolBoxJsBridge;
 import org.rogmann.mcp2sdk.poi.PptxToolBoxJsBridge;
@@ -31,14 +32,22 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Deque;
 import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -147,6 +156,9 @@ public class JavaScriptTool {
         modules.put("fs", new JsFileSystemBridge());
         modules.put("crypto", new JsCryptoBridge());
         modules.put("archive", new JsArchiveBridge());
+        // Read-only access to SQLite database files (tables/rows/forEachRow) with a small
+        // built-in parser - no sqlite-jdbc dependency.
+        modules.put("sqlite", new JsSQLiteBridge());
         // Grep-like search over files, directories and archives (docs/js/search.md).
         // Uses the same path rules as `fs` and the same archive formats as `archive`.
         modules.put("search", new JsSearchBridge());
@@ -182,6 +194,11 @@ public class JavaScriptTool {
           .append(EFFECTIVE_DEFAULT_TIMEOUT_SECONDS)
           .append(" s, override with 'timeoutSeconds'); a script exceeding it is cancelled and the")
           .append(" JavaScript stack of the cancellation point is reported.");
+        sb.append(" CommonJS-style project modules are supported: load('./lib.js') or")
+          .append(" load('./lib.js', {sha256: '<64 hex chars>'}) (also require('./lib.js'))")
+          .append(" evaluate .js files from the permitted directories; paths starting with")
+          .append(" './' or '../' are resolved relative to the file given as 'path' (project")
+          .append(" base for inline scripts).");
         return sb.toString();
     }
 
@@ -222,7 +239,8 @@ public class JavaScriptTool {
                 + "create_new_file/edit_file or fs.writeFile. It is read with the same controlled "
                 + "fs access and executed in exactly the same sandbox as 'script'. If 'script' is "
                 + "also given, the file runs after the inline script; otherwise the file alone is "
-                + "executed. At least one of 'script' or 'path' must be provided.");
+                + "executed. At least one of 'script' or 'path' must be provided. Relative paths "
+                + "in require('./x.js')/load('./x.js') are resolved against this file's directory.");
         properties.put("path", pathProp);
 
         Map<String, Object> timeoutProp = new HashMap<>();
@@ -319,7 +337,8 @@ public class JavaScriptTool {
                 sourceName = "inline+" + path;
             }
         }
-        return runScript(script, sourceName, timeoutSeconds);
+        return runScript(script, sourceName, timeoutSeconds,
+                (oPath != null) ? oPath.toString() : null);
     }
 
     /**
@@ -392,9 +411,12 @@ public class JavaScriptTool {
      * @param script the JavaScript source code to execute
      * @param sourceName a human-readable name for logging (e.g. "inline" or the file path)
      * @param timeoutSeconds maximum execution time in seconds
+     * @param basePath display path of the file executed via the 'path' parameter (null for
+     *        inline-only); the base for resolving relative paths in require()/load()
      * @return the tool call result
      */
-    private CallToolResult runScript(String script, String sourceName, long timeoutSeconds) {
+    private CallToolResult runScript(String script, String sourceName, long timeoutSeconds,
+            String basePath) {
         LOGGER.info("Executing JavaScript ({}, timeout {} s): {}", sourceName, timeoutSeconds, script);
 
         // The stdout capture buffer is created here (not in the worker) so that the output written
@@ -411,7 +433,8 @@ public class JavaScriptTool {
 
         Future<CallToolResult> future = JS_EXECUTOR.submit(() -> {
             workerRef.set(Thread.currentThread());
-            return executeInSandbox(script, sourceName, timeoutSeconds, baosOut, cancelRequested, contextRef);
+            return executeInSandbox(script, sourceName, timeoutSeconds, baosOut, cancelRequested,
+                    contextRef, basePath);
         });
 
         try {
@@ -567,10 +590,13 @@ public class JavaScriptTool {
      * @param baosOut the (caller-owned) stdout capture buffer
      * @param cancelRequested cancellation flag
      * @param contextRef reference to publish the created context
+     * @param basePath display path of the file executed via the 'path' parameter (null for
+     *        inline-only); the base for resolving relative paths in require()/load()
      * @return the tool call result
      */
     private CallToolResult executeInSandbox(String script, String sourceName, long timeoutSeconds,
-            ByteArrayOutputStream baosOut, AtomicBoolean cancelRequested, AtomicReference<Context> contextRef) {
+            ByteArrayOutputStream baosOut, AtomicBoolean cancelRequested, AtomicReference<Context> contextRef,
+            String basePath) {
 
         // Capture console.log output (stdout)
         PrintStream outCapture = new PrintStream(baosOut, true, StandardCharsets.UTF_8);
@@ -642,10 +668,19 @@ public class JavaScriptTool {
                 }
             }
 
+            // --- Wire the project-file module loader (CommonJS-style) ---
+            // load('./lib.js') / load('./lib.js', {sha256: '<hex>'}) and require('./lib.js')
+            // evaluate a '.js' file from the permitted directories as a CommonJS module and
+            // return its module.exports. The module cache lives for this execution only
+            // (the context - and with it the loader - is created fresh per tool call).
+            ModuleLoader moduleLoader = new ModuleLoader(context, cancelRequested, sourceName,
+                    basePath, jsBindings);
+
             // --- Wire CommonJS-style require for the provided namespaces ---
             // LLMs often write Node.js-style code and expect require('fs') to work.
             // Map the offered namespaces onto the bound proxy objects and produce a
-            // clear, actionable error for anything else.
+            // clear, actionable error for anything else. Relative paths and '.js' files
+            // are delegated to the project-file module loader.
             String requireList = "'" + String.join("', '", requireNames) + "'";
             ProxyExecutable requireFunc = (cArgs) -> {
                 if (cArgs == null || cArgs.length < 1 || cArgs[0].isNull()) {
@@ -655,10 +690,14 @@ public class JavaScriptTool {
                 String module = cArgs[0].asString();
                 Value target = requireTargets.get(module);
                 if (target == null) {
+                    if (moduleLoader.looksLikeModuleFile(module)) {
+                        return moduleLoader.load(module, null);
+                    }
                     throw new IllegalArgumentException(
                             "Cannot find module '" + module + "'. This sandbox provides only "
                             + requireList + " (also bound globally as "
-                            + String.join(", ", requireNames) + "). "
+                            + String.join(", ", requireNames) + "); project files can be loaded "
+                            + "with require('./file.js') or load('./file.js'). "
                             + "There is no Node.js require for arbitrary modules, no process, "
                             + "no Buffer and no network access.");
                 }
@@ -667,6 +706,28 @@ public class JavaScriptTool {
             context.getBindings("js").putMember("require", requireFunc);
             LOGGER.info("CommonJS 'require' shim bound to JavaScript context (modules: {})",
                     String.join(", ", requireNames));
+
+            // --- Wire load() for project files with optional sha256 pinning ---
+            ProxyExecutable loadFunc = (cArgs) -> {
+                if (cArgs == null || cArgs.length < 1 || cArgs[0].isNull()) {
+                    throw new IllegalArgumentException(
+                            "load(path) requires a module path, optionally followed by an options "
+                            + "object, e.g. load('./lib.js', {sha256: '<64 hex chars>'}).");
+                }
+                if (cArgs.length > 2) {
+                    throw new IllegalArgumentException("load(path, options) takes at most two "
+                            + "arguments, got " + cArgs.length + ".");
+                }
+                String expectedSha256 = null;
+                if (cArgs.length > 1 && cArgs[1] != null && !cArgs[1].isNull()) {
+                    expectedSha256 = moduleLoader.extractPinnedSha256(cArgs[1]);
+                }
+                return moduleLoader.load(cArgs[0].asString(), expectedSha256);
+            };
+            context.getBindings("js").putMember("load", loadFunc);
+            LOGGER.info("CommonJS module loader bound to JavaScript context "
+                    + "(require/load of '.js' project files, relative paths based on: {})",
+                    (basePath != null) ? basePath : "<project base>");
 
             checkNotCancelled(cancelRequested, sourceName);
 
@@ -990,8 +1051,9 @@ public class JavaScriptTool {
             sb.append(" or ").append(tips.get(tips.size() - 1));
         }
         sb.append(". The script runs in a sandboxed GraalVM JS context "
-                + "(no Node.js require for arbitrary modules, no process, no Buffer, "
-                + "no network); ");
+                + "(no Node.js require for arbitrary packages, no process, no Buffer, "
+                + "no network; '.js' project files can be loaded with "
+                + "require('./file.js') or load('./file.js')); ");
         if (names.isEmpty()) {
             sb.append("no modules are bound globally.");
         } else {
@@ -1133,6 +1195,253 @@ public class JavaScriptTool {
         return firstDot > 0
                 && firstDot < name.length() - 1
                 && Character.isLowerCase(name.charAt(0));
+    }
+
+    /**
+     * CommonJS-style loader for JavaScript files from the permitted directories.
+     * <p>
+     * {@code load('./lib.js')} (and {@code require('./lib.js')}) read a '.js' file through the
+     * controlled fs access (same path rules as {@code fs}: project-base relative,
+     * {@code /addonName/...} prefixes, no traversal, no escaping symbolic links), evaluate it as
+     * a CommonJS module and return its {@code module.exports}. Relative paths starting with
+     * {@code ./} or {@code ../} are resolved against the directory of the file passed as the
+     * tool's 'path' parameter (project base for inline scripts) and, for nested loads, against
+     * the directory of the loading module. Everything else is resolved relative to the project
+     * base directory.
+     * </p>
+     * <p>
+     * The optional second argument of {@code load} pins the file content: the SHA-256 of the
+     * file (identical to {@code crypto.sha256(path)}, i.e. over the raw UTF-8 file bytes) must
+     * match, otherwise the module is not executed. This lets a caller verify that exactly the
+     * reviewed source version runs, even when the file changed between writing the script and
+     * executing it.
+     * </p>
+     * <p>
+     * The module cache lives for one execution only (the loader is created per tool call), with
+     * Node.js semantics for cyclic requires (the still-initializing partial {@code exports}
+     * object is returned).
+     * </p>
+     */
+    private static final class ModuleLoader {
+
+        /** Maximum nesting depth of module loads (defensive bound; cycles are caught by the cache). */
+        private static final int MAX_MODULE_DEPTH = 32;
+
+        private final Context context;
+        private final AtomicBoolean cancelRequested;
+        private final String sourceName;
+
+        /** Display path of the file executed via the 'path' parameter (null for inline-only). */
+        private final String basePath;
+        /** JS bindings of the context, used to fetch the require shim for the modules. */
+        private final Value jsBindings;
+
+        /** Modules of this execution: display path -&gt; exports value. */
+        private final Map<String, Value> moduleCache = new HashMap<>();
+        /** SHA-256 (lowercase hex) of the file content at load time, keyed by display path. */
+        private final Map<String, String> moduleSha256 = new HashMap<>();
+        /** Modules currently being evaluated (innermost first), for relative path resolution. */
+        private final Deque<String> evaluationStack = new ArrayDeque<>();
+
+        /**
+         * Constructor.
+         * @param context the (sandboxed) GraalVM context
+         * @param cancelRequested cancellation flag of the enclosing execution
+         * @param sourceName human-readable name of the enclosing execution (for messages)
+         * @param basePath display path of the file executed via 'path' (null for inline-only)
+         * @param jsBindings the JS bindings, source of the require shim handed to the modules
+         */
+        ModuleLoader(Context context, AtomicBoolean cancelRequested, String sourceName,
+                String basePath, Value jsBindings) {
+            this.context = context;
+            this.cancelRequested = cancelRequested;
+            this.sourceName = sourceName;
+            this.basePath = basePath;
+            this.jsBindings = jsBindings;
+        }
+
+        /**
+         * Decides whether a require() argument that is not a provided namespace looks like a
+         * project-file module and should therefore be delegated to {@link #load}.
+         * @param module the require() argument
+         * @return true for relative paths, mount-prefixed paths and '.js' files
+         */
+        boolean looksLikeModuleFile(String module) {
+            return module.startsWith("./") || module.startsWith("../") || module.startsWith("/")
+                    || module.toLowerCase(Locale.ROOT).endsWith(".js");
+        }
+
+        /**
+         * Extracts and validates the optional 'sha256' pin from the load() options object.
+         * @param options the second load() argument (a JS object)
+         * @return the expected SHA-256 as 64 lowercase hex characters, or null if not given
+         */
+        String extractPinnedSha256(Value options) {
+            if (!options.hasMembers()) {
+                throw new IllegalArgumentException("load(path, options): options must be an object "
+                        + "with an optional 'sha256' member, got a non-object.");
+            }
+            for (String member : options.getMemberKeys()) {
+                if (!"sha256".equals(member)) {
+                    throw new IllegalArgumentException("load(path, options): unknown option '"
+                            + member + "' (supported: 'sha256').");
+                }
+            }
+            Value sha = options.getMember("sha256");
+            if (sha == null || sha.isNull()) {
+                return null;
+            }
+            if (!sha.isString()) {
+                throw new IllegalArgumentException("load(path, options): 'sha256' must be a "
+                        + "string of 64 hex characters.");
+            }
+            String pinned = sha.asString().trim().toLowerCase(Locale.ROOT);
+            if (!pinned.matches("[0-9a-f]{64}")) {
+                throw new IllegalArgumentException("load(path, options): 'sha256' must be a "
+                        + "string of 64 hex characters, got: " + sha.asString());
+            }
+            return pinned;
+        }
+
+        /**
+         * Loads (and evaluates) a project-file module.
+         * <p>
+         * The pin check happens strictly before evaluation, so a module whose content does not
+         * match the pinned SHA-256 never runs. On a cache hit the pin is compared against the
+         * hash recorded at load time - the pin refers to what was actually executed.
+         * </p>
+         * @param moduleArg the path as given by the caller
+         * @param expectedSha256 the pinned SHA-256 (64 lowercase hex characters) or null
+         * @return the module's exports (for a cyclic require: the partial exports object)
+         */
+        Value load(String moduleArg, String expectedSha256) {
+            if (moduleArg == null || moduleArg.isBlank()) {
+                throw new IllegalArgumentException("load(path): the module path must not be empty.");
+            }
+            String candidate;
+            if (moduleArg.startsWith("./") || moduleArg.startsWith("../")) {
+                candidate = currentDir() + "/" + moduleArg;
+            } else {
+                candidate = moduleArg;
+            }
+            // Same path rules as fs: containment, no traversal, no escaping symbolic links.
+            Path safePath = JsFileSystem.resolveSafePath(candidate);
+            String display = JsFileSystem.toRelative(safePath);
+            if (!display.toLowerCase(Locale.ROOT).endsWith(".js")) {
+                throw new IllegalArgumentException("Only '.js' files can be loaded as modules, "
+                        + "got: " + display + " (asked for '" + moduleArg + "')");
+            }
+
+            Value cached = moduleCache.get(display);
+            if (cached != null) {
+                // Cyclic require: the still-initializing module returns its partial exports.
+                if (expectedSha256 != null && !expectedSha256.equals(moduleSha256.get(display))) {
+                    throw new IllegalArgumentException(
+                            pinningMismatchMessage(display, expectedSha256, moduleSha256.get(display)));
+                }
+                LOGGER.debug("JavaScript module cache hit ({}), returning exports", display);
+                return cached;
+            }
+
+            String content = JsFileSystem.readFile(display);
+            String sha256 = sha256Hex(content);
+            if (expectedSha256 != null && !expectedSha256.equals(sha256)) {
+                throw new IllegalArgumentException(
+                        pinningMismatchMessage(display, expectedSha256, sha256));
+            }
+            if (evaluationStack.size() >= MAX_MODULE_DEPTH) {
+                throw new IllegalArgumentException("Module nesting deeper than " + MAX_MODULE_DEPTH
+                        + " while loading '" + display + "' (in " + sourceName + ").");
+            }
+            LOGGER.info("JavaScript module loaded: {} (sha256: {})", display, sha256);
+
+            Value exportsObj = context.eval("js", "({})");
+            // Inserted before the evaluation so that a cyclic require gets the partial exports.
+            moduleCache.put(display, exportsObj);
+            moduleSha256.put(display, sha256);
+            evaluationStack.push(display);
+            try {
+                checkNotCancelled(cancelRequested, sourceName);
+                Value moduleObj = context.eval("js", "({exports: null})");
+                moduleObj.putMember("exports", exportsObj);
+                // The source is named after the file, so JavaScript stack traces (e.g. in
+                // timeout messages) point into the module file.
+                String wrapped = "(function (exports, require, module, __filename, __dirname) {\n"
+                        + content + "\n})";
+                Source moduleSource = Source.newBuilder("js", wrapped, display).build();
+                Value moduleFn = context.eval(moduleSource);
+                Value requireValue = jsBindings.getMember("require");
+                moduleFn.execute(exportsObj, requireValue, moduleObj,
+                        context.asValue(display), context.asValue(dirOf(display)));
+                Value finalExports = moduleObj.getMember("exports");
+                moduleCache.put(display, finalExports);
+                return finalExports;
+            } catch (IOException e) {
+                // Do not leave a half-initialized module in the cache.
+                moduleCache.remove(display);
+                moduleSha256.remove(display);
+                throw new IllegalArgumentException("Cannot load module '" + display + "': " + e.getMessage(), e);
+            } catch (RuntimeException e) {
+                // Do not leave a half-initialized module in the cache.
+                moduleCache.remove(display);
+                moduleSha256.remove(display);
+                throw e;
+            } finally {
+                evaluationStack.pop();
+            }
+        }
+
+        /**
+         * Returns the directory (display path) of the module currently being evaluated, or the
+         * base directory of the execution (directory of the 'path' file, project base for
+         * inline scripts).
+         * @return directory display path ("." for the project base)
+         */
+        private String currentDir() {
+            String currentFile = evaluationStack.isEmpty() ? basePath : evaluationStack.peek();
+            return (currentFile != null) ? dirOf(currentFile) : ".";
+        }
+
+        /**
+         * Returns the directory part of a display path.
+         * @param displayPath a project-relative (or mount-prefixed) file path
+         * @return the directory part ("." if the path has no directory)
+         */
+        private static String dirOf(String displayPath) {
+            int slash = displayPath.lastIndexOf('/');
+            return (slash < 0) ? "." : displayPath.substring(0, slash);
+        }
+
+        /**
+         * Builds the error message for a sha256 pinning mismatch.
+         * @param display display path of the module
+         * @param expected the pinned hash
+         * @param actual the hash of the loaded content (or null on a cache hit without hash)
+         * @return the error message
+         */
+        private static String pinningMismatchMessage(String display, String expected, String actual) {
+            return "sha256 mismatch for module " + display + ": pinned " + expected
+                    + ", but the content hashes to " + ((actual != null) ? actual : "<unknown>")
+                    + ". The file changed after the hash was pinned - re-read it, re-pin the new "
+                    + "hash, or load it without a pin.";
+        }
+
+        /**
+         * Computes the SHA-256 of a module file's content. The content is the strict UTF-8
+         * decoding of the raw file bytes (see {@link JsFileSystem#readFile(String)}), so the
+         * hash is identical to {@code crypto.sha256(path)} over the raw file bytes.
+         * @param content the file content
+         * @return lowercase hex hash
+         */
+        private static String sha256Hex(String content) {
+            try {
+                MessageDigest digest = MessageDigest.getInstance("SHA-256");
+                byte[] hash = digest.digest(content.getBytes(StandardCharsets.UTF_8));
+                return HexFormat.of().formatHex(hash);
+            } catch (NoSuchAlgorithmException e) {
+                throw new IllegalStateException("SHA-256 is not available", e);
+            }
+        }
     }
 
     /**

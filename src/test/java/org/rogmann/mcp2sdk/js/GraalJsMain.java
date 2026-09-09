@@ -83,12 +83,6 @@ public class GraalJsMain {
             context.getBindings("js").putMember("archive", archiveObj);
             System.out.println("Archive namespace 'archive' bound to JavaScript context");
 
-            // --- Wire python namespace for compile-only Python syntax checks ---
-            // (requires IDE_PROJECT_DIR to be set, like fs.*; compile never executes the code)
-            ProxyObject pythonObj = JsPythonBridge.createPythonNamespace();
-            context.getBindings("js").putMember("python", pythonObj);
-            System.out.println("Python namespace 'python' bound to JavaScript context (compile/syntax check only)");
-
             // --- Wire MCP namespace if --mcp-url was provided ---
             if (mcpUrl != null) {
                 System.out.println("Connecting to MCP server: " + mcpUrl);
