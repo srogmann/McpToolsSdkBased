@@ -1299,8 +1299,10 @@ public class WebUiProxy {
             // Accept both JSON and SSE depending on backend capability
             connection.setRequestProperty("Accept", "application/json, text/event-stream");
             connection.setDoOutput(true);
-            // Important for streaming: disable expectation of 100-continue which can delay
-            connection.setRequestProperty("Expect", "");
+            // Note: do NOT send an Expect header at all. HttpURLConnection does not send
+            // "Expect: 100-continue" by default; explicitly setting an empty header value
+            // would still transmit "Expect:" and Tomcat rejects that with HTTP 417
+            // Expectation Failed.
 
             if (cookie != null) {
                 connection.setRequestProperty("Cookie", cookie);
