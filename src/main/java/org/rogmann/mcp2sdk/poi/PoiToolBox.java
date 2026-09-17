@@ -1,18 +1,34 @@
 package org.rogmann.mcp2sdk.poi;
 
+import org.apache.poi.ss.formula.FormulaParseException;
+import org.apache.poi.ss.formula.FormulaParser;
+import org.apache.poi.ss.formula.FormulaType;
+import org.apache.poi.ss.formula.function.FunctionMetadataRegistry;
 import org.apache.poi.ss.usermodel.Cell;
 import org.apache.poi.ss.usermodel.CellStyle;
 import org.apache.poi.ss.usermodel.CellType;
 import org.apache.poi.ss.usermodel.Color;
+import org.apache.poi.ss.usermodel.ColorScaleFormatting;
+import org.apache.poi.ss.usermodel.ComparisonOperator;
+import org.apache.poi.ss.usermodel.ConditionType;
+import org.apache.poi.ss.usermodel.ConditionalFormatting;
+import org.apache.poi.ss.usermodel.ConditionalFormattingRule;
+import org.apache.poi.ss.usermodel.ConditionalFormattingThreshold;
+import org.apache.poi.ss.usermodel.DataBarFormatting;
 import org.apache.poi.ss.usermodel.DateUtil;
 import org.apache.poi.ss.usermodel.FillPatternType;
 import org.apache.poi.ss.usermodel.Font;
+import org.apache.poi.ss.usermodel.FontFormatting;
+import org.apache.poi.ss.usermodel.IconMultiStateFormatting;
 import org.apache.poi.ss.usermodel.IndexedColors;
+import org.apache.poi.ss.usermodel.PatternFormatting;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
+import org.apache.poi.ss.usermodel.SheetConditionalFormatting;
 import org.apache.poi.ss.usermodel.Workbook;
 import org.apache.poi.ss.util.CellRangeAddress;
 import org.apache.poi.xssf.usermodel.XSSFColor;
+import org.apache.poi.xssf.usermodel.XSSFEvaluationWorkbook;
 import org.apache.poi.xssf.usermodel.XSSFFont;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 
@@ -25,13 +41,18 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.rogmann.mcp2sdk.WorkProject;
 import org.slf4j.Logger;
@@ -83,8 +104,14 @@ public class PoiToolBox {
     /** Map: sheet-handle -> Sheet */
     private final Map<String, Sheet> sheets = new ConcurrentHashMap<>();
 
+    /** Map: cf-handle -> registration of an added conditional format rule */
+    private final Map<String, CfRegistration> conditionalFormats = new ConcurrentHashMap<>();
+
     /** Counter for generating unique handles */
     private final AtomicLong handleCounter = new AtomicLong();
+
+    /** Registration of a conditional format rule (sheet handle + CF index) for removal. */
+    private record CfRegistration(String sheetHandle, int cfIndex) {}
 
     /**
      * Creates a PoiToolBox instance with its own isolated handle state.
@@ -264,6 +291,15 @@ public class PoiToolBox {
             LOG.warn("Workbook not found (already closed?): {}", wbHandle);
             return;
         }
+        // Remove conditional-format registrations of this workbook's sheets
+        Set<String> sheetHandlesOfWb = new HashSet<>();
+        for (Map.Entry<String, Sheet> entry : sheets.entrySet()) {
+            if (entry.getValue().getWorkbook() == wb) {
+                sheetHandlesOfWb.add(entry.getKey());
+            }
+        }
+        conditionalFormats.entrySet().removeIf(entry ->
+                sheetHandlesOfWb.contains(entry.getValue().sheetHandle()));
         // Remove associated sheet handles
         sheets.entrySet().removeIf(entry -> {
             Sheet sh = entry.getValue();
@@ -400,6 +436,16 @@ public class PoiToolBox {
                     + "'. Available sheets: " + String.join(", ", getSheetNames(wbHandle)));
         }
         wb.removeSheetAt(idx);
+        // Remove conditional-format registrations of the removed sheet
+        Set<String> removedSheetHandles = new HashSet<>();
+        for (Map.Entry<String, Sheet> entry : sheets.entrySet()) {
+            Sheet sh = entry.getValue();
+            if (sheetName.equals(sh.getSheetName()) && sh.getWorkbook() == wb) {
+                removedSheetHandles.add(entry.getKey());
+            }
+        }
+        conditionalFormats.entrySet().removeIf(entry ->
+                removedSheetHandles.contains(entry.getValue().sheetHandle()));
         // Remove associated sheet handles
         sheets.entrySet().removeIf(entry -> {
             Sheet sh = entry.getValue();
@@ -1104,6 +1150,577 @@ public class PoiToolBox {
     }
 
     // ========================================================================
+    // Conditional Formatting
+    // ========================================================================
+
+    /**
+     * Comparison operators accepted by {@link #addConditionalFormatCellIs}.
+     */
+    private static final Map<String, Byte> CF_COMPARISON_OPERATORS = Map.of(
+            "GT", ComparisonOperator.GT,
+            "LT", ComparisonOperator.LT,
+            "GTE", ComparisonOperator.GE,
+            "LTE", ComparisonOperator.LE,
+            "EQ", ComparisonOperator.EQUAL,
+            "NE", ComparisonOperator.NOT_EQUAL,
+            "BETWEEN", ComparisonOperator.BETWEEN,
+            "NOT_BETWEEN", ComparisonOperator.NOT_BETWEEN);
+
+    /** Reverse map of {@link #CF_COMPARISON_OPERATORS} for reading rules back. */
+    private static final Map<Byte, String> CF_COMPARISON_OPERATOR_NAMES = buildComparisonOperatorNames();
+
+    /** LLM-friendly icon-set aliases -&gt; POI IconSet enum names. */
+    private static final Map<String, String> CF_ICON_SET_ALIASES = buildIconSetAliases();
+
+    /** Function-name pattern used for the "unknown function" warning. */
+    private static final Pattern CF_FUNCTION_PATTERN = Pattern.compile("([A-Za-z_][A-Za-z0-9_.]*)\\s*\\(");
+
+    private static Map<Byte, String> buildComparisonOperatorNames() {
+        Map<Byte, String> names = new HashMap<>();
+        CF_COMPARISON_OPERATORS.forEach((name, op) -> names.put(op, name));
+        return names;
+    }
+
+    private static Map<String, String> buildIconSetAliases() {
+        Map<String, String> aliases = new LinkedHashMap<>();
+        aliases.put("3_ARROWS", "GYR_3_ARROW");
+        aliases.put("3_ARROWS_GREY", "GREY_3_ARROWS");
+        aliases.put("3_FLAGS", "GYR_3_FLAGS");
+        aliases.put("3_TRAFFIC_LIGHTS", "GYR_3_TRAFFIC_LIGHTS");
+        aliases.put("3_TRAFFIC_LIGHTS_BOX", "GYR_3_TRAFFIC_LIGHTS_BOX");
+        aliases.put("3_SHAPES", "GYR_3_SHAPES");
+        aliases.put("3_SYMBOLS", "GYR_3_SYMBOLS");
+        aliases.put("3_SYMBOLS_CIRCLE", "GYR_3_SYMBOLS_CIRCLE");
+        aliases.put("4_ARROWS", "GYR_4_ARROWS");
+        aliases.put("4_ARROWS_GREY", "GREY_4_ARROWS");
+        aliases.put("4_TRAFFIC_LIGHTS", "RB_4_TRAFFIC_LIGHTS");
+        aliases.put("4_RATINGS", "RATINGS_4");
+        aliases.put("5_ARROWS", "GYYYR_5_ARROWS");
+        aliases.put("5_ARROWS_GREY", "GREY_5_ARROWS");
+        aliases.put("5_RATINGS", "RATINGS_5");
+        aliases.put("5_QUARTERS", "QUARTERS_5");
+        return aliases;
+    }
+
+    /**
+     * Adds a cellIs conditional formatting rule (comparison against a fixed value or formula).
+     * @param sheetHandle sheet handle
+     * @param range range string, e.g. "A1:A100" (multiple ranges comma-separated; a single cell
+     *        "B2" is allowed)
+     * @param operator comparison operator: GT, LT, GTE, LTE, EQ, NE, BETWEEN or NOT_BETWEEN
+     * @param f1 first operand as formula/value string, e.g. "50", "$A$1" or '"OK"' (string
+     *        literals need embedded quotes)
+     * @param f2 second operand (only for BETWEEN / NOT_BETWEEN, otherwise null)
+     * @param style style map with optional keys: fontColor, backgroundColor, bold, italic
+     * @return conditional-format handle (e.g. "cf-3") for {@link #removeConditionalFormat}
+     * @throws PoiUserRuntimeException if the sheet handle, operator, range or formula syntax is invalid
+     */
+    public String addConditionalFormatCellIs(String sheetHandle, String range, String operator,
+            String f1, String f2, Map<String, Object> style) {
+        Sheet sh = getSheetByHandle(sheetHandle);
+        XSSFWorkbook wb = (XSSFWorkbook) sh.getWorkbook();
+        byte op = mapComparisonOperator(operator);
+        boolean between = op == ComparisonOperator.BETWEEN || op == ComparisonOperator.NOT_BETWEEN;
+        if (between && (f2 == null || f2.isBlank())) {
+            throw new PoiUserRuntimeException("Operator " + operator + " requires a second operand (f2).");
+        }
+        if (!between && f2 != null && !f2.isBlank()) {
+            throw new PoiUserRuntimeException("Operator " + operator + " takes only one operand; f2 must be null.");
+        }
+        String formula1 = normalizeFormula(f1, "f1");
+        validateFormulaSyntax(wb, sh, formula1);
+        String formula2 = between ? normalizeFormula(f2, "f2") : null;
+        if (between) {
+            validateFormulaSyntax(wb, sh, formula2);
+        }
+        SheetConditionalFormatting scf = sh.getSheetConditionalFormatting();
+        ConditionalFormattingRule rule = scf.createConditionalFormattingRule(op, formula1,
+                formula2);
+        applyRuleStyle(rule, style);
+        return registerConditionalFormat(sheetHandle, scf, parseRanges(range), rule);
+    }
+
+    /**
+     * Adds a formula-based conditional formatting rule.
+     * <p>
+     * The formula is written relative to the top-left cell of the range, e.g. range "A2:F100"
+     * with formula {@code '=$D2="OK"'} highlights all rows whose column D contains "OK".
+     * The formula is validated for syntax only (never evaluated); it is evaluated by Excel
+     * when the file is opened.
+     * </p>
+     * @param sheetHandle sheet handle
+     * @param range range string, e.g. "A2:F100"
+     * @param formula the condition formula (a leading '=' is stripped)
+     * @param style style map with optional keys: fontColor, backgroundColor, bold, italic
+     * @return conditional-format handle (e.g. "cf-4")
+     * @throws PoiUserRuntimeException if the sheet handle, range or formula syntax is invalid
+     */
+    public String addConditionalFormatExpression(String sheetHandle, String range,
+            String formula, Map<String, Object> style) {
+        Sheet sh = getSheetByHandle(sheetHandle);
+        XSSFWorkbook wb = (XSSFWorkbook) sh.getWorkbook();
+        String normalized = normalizeFormula(formula, "formula");
+        validateFormulaSyntax(wb, sh, normalized);
+        warnUnknownFunctions(normalized);
+        SheetConditionalFormatting scf = sh.getSheetConditionalFormatting();
+        ConditionalFormattingRule rule = scf.createConditionalFormattingRule(normalized);
+        applyRuleStyle(rule, style);
+        return registerConditionalFormat(sheetHandle, scf, parseRanges(range), rule);
+    }
+
+    /**
+     * Adds a 2-color or 3-color scale conditional formatting rule.
+     * @param sheetHandle sheet handle
+     * @param range range string, e.g. "G2:G100"
+     * @param colors 2 or 3 colors (hex RGB like "F8696B" or color name like "RED")
+     * @return conditional-format handle (e.g. "cf-5")
+     * @throws PoiUserRuntimeException if the sheet handle, range or a color is invalid
+     */
+    public String addConditionalFormatColorScale(String sheetHandle, String range, String[] colors) {
+        Sheet sh = getSheetByHandle(sheetHandle);
+        if (colors == null || colors.length < 2 || colors.length > 3) {
+            throw new PoiUserRuntimeException("Color scale needs 2 or 3 colors, got: "
+                    + ((colors == null) ? 0 : colors.length));
+        }
+        byte[][] rgbs = new byte[colors.length][];
+        for (int i = 0; i < colors.length; i++) {
+            rgbs[i] = toRgbBytes(colors[i], "color scale color");
+        }
+        SheetConditionalFormatting scf = sh.getSheetConditionalFormatting();
+        ConditionalFormattingRule rule = scf.createConditionalFormattingColorScaleRule();
+        ColorScaleFormatting cs = rule.getColorScaleFormatting();
+        cs.setNumControlPoints(colors.length);
+        cs.setColors(toXssfColors(rgbs));
+        // Re-assert a valid MIN / (PERCENTILE 50) / MAX configuration after the resize.
+        ConditionalFormattingThreshold[] thresholds = cs.getThresholds();
+        thresholds[0].setRangeType(ConditionalFormattingThreshold.RangeType.MIN);
+        if (colors.length == 3) {
+            thresholds[1].setRangeType(ConditionalFormattingThreshold.RangeType.PERCENTILE);
+            thresholds[1].setValue(50.0);
+        }
+        thresholds[colors.length - 1].setRangeType(ConditionalFormattingThreshold.RangeType.MAX);
+        return registerConditionalFormat(sheetHandle, scf, parseRanges(range), rule);
+    }
+
+    /**
+     * Adds a data bar conditional formatting rule.
+     * @param sheetHandle sheet handle
+     * @param range range string, e.g. "H2:H100"
+     * @param color bar color (hex RGB like "638EC6" or color name like "BLUE")
+     * @return conditional-format handle (e.g. "cf-6")
+     * @throws PoiUserRuntimeException if the sheet handle, range or color is invalid
+     */
+    public String addConditionalFormatDataBar(String sheetHandle, String range, String color) {
+        Sheet sh = getSheetByHandle(sheetHandle);
+        byte[] rgb = toRgbBytes(color, "data bar color");
+        SheetConditionalFormatting scf = sh.getSheetConditionalFormatting();
+        ConditionalFormattingRule rule = scf.createConditionalFormattingRule(new XSSFColor(rgb, null));
+        DataBarFormatting dataBar = rule.getDataBarFormatting();
+        if (dataBar != null) {
+            dataBar.getMinThreshold().setRangeType(ConditionalFormattingThreshold.RangeType.MIN);
+            dataBar.getMaxThreshold().setRangeType(ConditionalFormattingThreshold.RangeType.MAX);
+        }
+        return registerConditionalFormat(sheetHandle, scf, parseRanges(range), rule);
+    }
+
+    /**
+     * Adds an icon set conditional formatting rule (percent-based default thresholds).
+     * @param sheetHandle sheet handle
+     * @param range range string, e.g. "I2:I100"
+     * @param iconSet icon set name, e.g. "3_TRAFFIC_LIGHTS", "3_ARROWS", "4_RATINGS",
+     *        "5_RATINGS", "5_QUARTERS" (or a raw POI name like "GYR_3_TRAFFIC_LIGHTS")
+     * @return conditional-format handle (e.g. "cf-7")
+     * @throws PoiUserRuntimeException if the sheet handle, range or icon set name is invalid
+     */
+    public String addConditionalFormatIconSet(String sheetHandle, String range, String iconSet) {
+        Sheet sh = getSheetByHandle(sheetHandle);
+        IconMultiStateFormatting.IconSet set = mapIconSet(iconSet);
+        SheetConditionalFormatting scf = sh.getSheetConditionalFormatting();
+        ConditionalFormattingRule rule = scf.createConditionalFormattingRule(set);
+        return registerConditionalFormat(sheetHandle, scf, parseRanges(range), rule);
+    }
+
+    /**
+     * Returns all conditional format rules of a sheet.
+     * @param sheetHandle sheet handle
+     * @return array of rule maps with: handle (or null for rules not added via this API),
+     *         ranges, ruleType (CELL_VALUE_IS, FORMULA, COLOR_SCALE, DATA_BAR, ICON_SET, ...),
+     *         operator, formula1, formula2, style (best effort), colorScaleColors, dataBarColor,
+     *         iconSet, priority, stopIfTrue
+     * @throws PoiUserRuntimeException if the sheet handle is invalid
+     */
+    public Map<String, Object>[] getConditionalFormattings(String sheetHandle) {
+        Sheet sh = getSheetByHandle(sheetHandle);
+        SheetConditionalFormatting scf = sh.getSheetConditionalFormatting();
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (int cfIndex = 0; cfIndex < scf.getNumConditionalFormattings(); cfIndex++) {
+            ConditionalFormatting cf = scf.getConditionalFormattingAt(cfIndex);
+            String handle = findCfHandle(sheetHandle, cfIndex);
+            CellRangeAddress[] ranges = cf.getFormattingRanges();
+            StringBuilder rangeStr = new StringBuilder();
+            for (CellRangeAddress range : ranges) {
+                if (rangeStr.length() > 0) {
+                    rangeStr.append(',');
+                }
+                rangeStr.append(range.formatAsString());
+            }
+            for (int ruleIdx = 0; ruleIdx < cf.getNumberOfRules(); ruleIdx++) {
+                ConditionalFormattingRule rule = cf.getRule(ruleIdx);
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("handle", handle);
+                entry.put("ranges", rangeStr.toString());
+                entry.put("ruleType", String.valueOf(rule.getConditionType()));
+                entry.put("priority", rule.getPriority());
+                entry.put("stopIfTrue", rule.getStopIfTrue());
+                ConditionType conditionType = rule.getConditionType();
+                if (conditionType == ConditionType.CELL_VALUE_IS) {
+                    Byte opKey = rule.getComparisonOperation();
+                    entry.put("operator", CF_COMPARISON_OPERATOR_NAMES.get(opKey));
+                    entry.put("formula1", rule.getFormula1());
+                    entry.put("formula2", rule.getFormula2());
+                } else if (conditionType == ConditionType.FORMULA) {
+                    entry.put("formula", rule.getFormula1());
+                } else if (conditionType == ConditionType.COLOR_SCALE) {
+                    ColorScaleFormatting cs = rule.getColorScaleFormatting();
+                    if (cs != null) {
+                        List<String> colorHexes = new ArrayList<>();
+                        for (Color c : cs.getColors()) {
+                            colorHexes.add(colorToHex(c));
+                        }
+                        entry.put("colorScaleColors", colorHexes);
+                    }
+                } else if (conditionType == ConditionType.DATA_BAR) {
+                    DataBarFormatting dataBar = rule.getDataBarFormatting();
+                    if (dataBar != null) {
+                        entry.put("dataBarColor", colorToHex(dataBar.getColor()));
+                    }
+                } else if (conditionType == ConditionType.ICON_SET) {
+                    IconMultiStateFormatting icons = rule.getMultiStateFormatting();
+                    if (icons != null && icons.getIconSet() != null) {
+                        entry.put("iconSet", icons.getIconSet().name());
+                    }
+                }
+                Map<String, Object> style = readRuleStyle(rule);
+                if (!style.isEmpty()) {
+                    entry.put("style", style);
+                }
+                result.add(entry);
+            }
+        }
+        @SuppressWarnings("unchecked")
+        Map<String, Object>[] rules = result.toArray(new Map[0]);
+        return rules;
+    }
+
+    /**
+     * Removes one conditional format rule.
+     * @param sheetHandle sheet handle the rule was added to
+     * @param cfHandle conditional-format handle returned by an addConditionalFormat* method
+     * @throws PoiUserRuntimeException if the cf-handle is invalid or belongs to another sheet
+     */
+    public void removeConditionalFormat(String sheetHandle, String cfHandle) {
+        CfRegistration registration = conditionalFormats.get(cfHandle);
+        if (registration == null) {
+            throw new PoiUserRuntimeException("Conditional format not found (invalid handle): " + cfHandle);
+        }
+        if (!registration.sheetHandle().equals(sheetHandle)) {
+            throw new PoiUserRuntimeException("Conditional format " + cfHandle
+                    + " does not belong to sheet handle " + sheetHandle);
+        }
+        Sheet sh = getSheetByHandle(sheetHandle);
+        sh.getSheetConditionalFormatting().removeConditionalFormatting(registration.cfIndex());
+        conditionalFormats.remove(cfHandle);
+        // POI indexes conditional formattings as a list: shift the registrations above.
+        conditionalFormats.replaceAll((handle, reg) ->
+                reg.sheetHandle().equals(sheetHandle) && reg.cfIndex() > registration.cfIndex()
+                        ? new CfRegistration(reg.sheetHandle(), reg.cfIndex() - 1)
+                        : reg);
+        LOG.info("Removed conditional format {} from sheet {}", cfHandle, sheetHandle);
+    }
+
+    /**
+     * Removes all conditional format rules of a sheet.
+     * @param sheetHandle sheet handle
+     * @return number of removed conditional formatting blocks
+     * @throws PoiUserRuntimeException if the sheet handle is invalid
+     */
+    public int removeAllConditionalFormats(String sheetHandle) {
+        Sheet sh = getSheetByHandle(sheetHandle);
+        SheetConditionalFormatting scf = sh.getSheetConditionalFormatting();
+        int count = scf.getNumConditionalFormattings();
+        for (int i = count - 1; i >= 0; i--) {
+            scf.removeConditionalFormatting(i);
+        }
+        conditionalFormats.entrySet().removeIf(entry ->
+                entry.getValue().sheetHandle().equals(sheetHandle));
+        LOG.info("Removed {} conditional formatting block(s) from sheet {}", count, sheetHandle);
+        return count;
+    }
+
+    /**
+     * Registers a rule with POI and this instance's handle map.
+     */
+    private String registerConditionalFormat(String sheetHandle, SheetConditionalFormatting scf,
+            CellRangeAddress[] ranges, ConditionalFormattingRule rule) {
+        int cfIndex = scf.addConditionalFormatting(ranges, rule);
+        String handle = "cf-" + handleCounter.incrementAndGet();
+        conditionalFormats.put(handle, new CfRegistration(sheetHandle, cfIndex));
+        LOG.info("Added conditional format {} to sheet {}", handle, sheetHandle);
+        return handle;
+    }
+
+    /**
+     * Finds the cf-handle registered for a (sheet, CF index) pair, or null.
+     */
+    private String findCfHandle(String sheetHandle, int cfIndex) {
+        return conditionalFormats.entrySet().stream()
+                .filter(entry -> entry.getValue().sheetHandle().equals(sheetHandle)
+                        && entry.getValue().cfIndex() == cfIndex)
+                .map(Map.Entry::getKey)
+                .findFirst()
+                .orElse(null);
+    }
+
+    /**
+     * Maps an operator string to the POI comparison operator constant.
+     */
+    private static byte mapComparisonOperator(String operator) {
+        if (operator == null || operator.isBlank()) {
+            throw new PoiUserRuntimeException("Comparison operator must not be empty (allowed: "
+                    + "GT, LT, GTE, LTE, EQ, NE, BETWEEN, NOT_BETWEEN).");
+        }
+        Byte op = CF_COMPARISON_OPERATORS.get(operator.trim().toUpperCase(Locale.ROOT));
+        if (op == null) {
+            throw new PoiUserRuntimeException("Unknown comparison operator '" + operator
+                    + "' (allowed: GT, LT, GTE, LTE, EQ, NE, BETWEEN, NOT_BETWEEN).");
+        }
+        return op;
+    }
+
+    /**
+     * Maps an icon-set name (alias or POI enum name) to the POI IconSet.
+     */
+    private static IconMultiStateFormatting.IconSet mapIconSet(String iconSet) {
+        if (iconSet == null || iconSet.isBlank()) {
+            throw new PoiUserRuntimeException("Icon set must not be empty (e.g. 3_TRAFFIC_LIGHTS, "
+                    + "5_RATINGS, 5_QUARTERS).");
+        }
+        String normalized = iconSet.trim().toUpperCase(Locale.ROOT).replace('-', '_');
+        String enumName = CF_ICON_SET_ALIASES.getOrDefault(normalized, normalized);
+        try {
+            return IconMultiStateFormatting.IconSet.valueOf(enumName);
+        } catch (IllegalArgumentException e) {
+            throw new PoiUserRuntimeException("Unknown icon set '" + iconSet + "' (e.g. use: "
+                    + String.join(", ", CF_ICON_SET_ALIASES.keySet()) + ").");
+        }
+    }
+
+    /**
+     * Validates a formula for syntax (never evaluates it). The formula is stored unmodified
+     * and evaluated by Excel when the file is opened; failing fast here avoids Excel's
+     * "unreadable content" repair dialog.
+     */
+    private static void validateFormulaSyntax(XSSFWorkbook wb, Sheet sh, String formula) {
+        try {
+            FormulaParser.parse(formula, XSSFEvaluationWorkbook.create(wb), FormulaType.CELL,
+                    wb.getSheetIndex(sh));
+        } catch (FormulaParseException e) {
+            throw new PoiUserRuntimeException("Invalid conditional-format formula '" + formula
+                    + "': " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Logs a warning for function names unknown to POI's function registry. This is a soft
+     * check only: POI stores conditional-format formulas unmodified, so Excel may still
+     * support functions POI does not know (e.g. newer functions like XLOOKUP).
+     */
+    private static void warnUnknownFunctions(String formula) {
+        Matcher matcher = CF_FUNCTION_PATTERN.matcher(formula);
+        while (matcher.find()) {
+            String name = matcher.group(1).toUpperCase(Locale.ROOT);
+            if (FunctionMetadataRegistry.getFunctionByName(name) == null) {
+                LOG.warn("Conditional-format formula uses function '{}' which is unknown to POI's "
+                        + "function registry; Excel may still support it (the formula is stored "
+                        + "unmodified).", name);
+            }
+        }
+    }
+
+    /**
+     * Strips a leading '=' and rejects empty formulas.
+     */
+    private static String normalizeFormula(String formula, String what) {
+        if (formula == null || formula.isBlank()) {
+            throw new PoiUserRuntimeException("Conditional format " + what + " must not be empty.");
+        }
+        String normalized = formula.trim();
+        if (normalized.startsWith("=")) {
+            normalized = normalized.substring(1);
+        }
+        if (normalized.isBlank()) {
+            throw new PoiUserRuntimeException("Conditional format " + what + " must not be empty.");
+        }
+        return normalized;
+    }
+
+    /**
+     * Parses a range string ("A1:A100", "B2", or several comma-separated ranges) into
+     * POI range addresses.
+     */
+    private static CellRangeAddress[] parseRanges(String range) {
+        if (range == null || range.isBlank()) {
+            throw new PoiUserRuntimeException("Conditional format range must not be empty.");
+        }
+        List<CellRangeAddress> ranges = new ArrayList<>();
+        for (String part : range.split("[,;]")) {
+            String single = part.trim();
+            if (single.isEmpty()) {
+                continue;
+            }
+            if (!single.contains(":")) {
+                single = single + ":" + single;
+            }
+            try {
+                ranges.add(CellRangeAddress.valueOf(single));
+            } catch (IllegalArgumentException e) {
+                throw new PoiUserRuntimeException("Invalid conditional format range '"
+                        + part.trim() + "' in '" + range + "': " + e.getMessage(), e);
+            }
+        }
+        if (ranges.isEmpty()) {
+            throw new PoiUserRuntimeException("Conditional format range must not be empty.");
+        }
+        return ranges.toArray(new CellRangeAddress[0]);
+    }
+
+    /**
+     * Applies the style map (fontColor, backgroundColor, bold, italic) to a rule's
+     * differential style. Unknown keys are rejected to fail fast for the LLM.
+     */
+    private static void applyRuleStyle(ConditionalFormattingRule rule, Map<String, Object> style) {
+        if (style == null || style.isEmpty()) {
+            return;
+        }
+        for (String key : style.keySet()) {
+            if (!"fontColor".equals(key) && !"backgroundColor".equals(key)
+                    && !"bold".equals(key) && !"italic".equals(key)) {
+                throw new PoiUserRuntimeException("Unknown conditional format style key '" + key
+                        + "' (allowed: fontColor, backgroundColor, bold, italic).");
+            }
+        }
+        if (style.containsKey("bold") || style.containsKey("italic")
+                || style.containsKey("fontColor")) {
+            FontFormatting font = rule.createFontFormatting();
+            if (style.containsKey("bold") || style.containsKey("italic")) {
+                // Note: FontFormatting.setFontStyle has the (confusing)
+                // parameter order (italic, bold) - see its Javadoc:
+                // "setFontStyle(boolean italic, boolean bold)"
+                font.setFontStyle(Boolean.TRUE.equals(style.get("italic")),
+                        Boolean.TRUE.equals(style.get("bold")));
+            }
+            Object fontColor = style.get("fontColor");
+            if (fontColor != null) {
+                applyRuleFontColor(font, fontColor.toString());
+            }
+        }
+        Object backgroundColor = style.get("backgroundColor");
+        if (backgroundColor != null) {
+            byte[] rgb = toRgbBytes(backgroundColor.toString(), "backgroundColor");
+            PatternFormatting fill = rule.createPatternFormatting();
+            fill.setFillForegroundColor(new XSSFColor(rgb, null));
+            fill.setFillPattern(PatternFormatting.SOLID_FOREGROUND);
+        }
+    }
+
+    /**
+     * Applies a font color to a rule: color names use the (exact) indexed color, hex colors
+     * are applied as true RGB (conditional formatting styles support arbitrary RGB).
+     */
+    private static void applyRuleFontColor(FontFormatting font, String color) {
+        IndexedColors named = COLOR_NAME_MAP.get(colorNameKey(color));
+        if (named != null) {
+            font.setFontColorIndex(named.getIndex());
+            return;
+        }
+        byte[] rgb = toRgbBytes(color, "fontColor");
+        font.setFontColor(new XSSFColor(rgb, null));
+    }
+
+    /**
+     * Normalizes a color string for the color-name map lookup (no '#', uppercase).
+     */
+    private static String colorNameKey(String color) {
+        String key = color.startsWith("#") ? color.substring(1) : color;
+        return key.toUpperCase(Locale.ROOT);
+    }
+
+    /**
+     * Resolves a color (hex RGB like "FFC7CE" or color name like "RED") to an RGB byte triple.
+     */
+    private static byte[] toRgbBytes(String color, String what) {
+        if (color == null || color.isBlank()) {
+            throw new PoiUserRuntimeException(what + " must not be empty.");
+        }
+        IndexedColors named = COLOR_NAME_MAP.get(colorNameKey(color));
+        if (named != null) {
+            int[] rgb = INDEXED_COLOR_RGB.get(named);
+            if (rgb != null) {
+                return new byte[]{(byte) rgb[0], (byte) rgb[1], (byte) rgb[2]};
+            }
+        }
+        String hex = colorNameKey(color);
+        byte[] rgb;
+        try {
+            rgb = HexFormat.of().parseHex(hex);
+        } catch (IllegalArgumentException e) {
+            throw new PoiUserRuntimeException("Invalid " + what + " '" + color
+                    + "': use a color name (e.g. RED) or hex RGB (e.g. FFC7CE).", e);
+        }
+        if (rgb.length != 3) {
+            throw new PoiUserRuntimeException("Invalid " + what + " '" + color
+                    + "': hex RGB needs exactly 6 hex digits (e.g. FFC7CE).");
+        }
+        return rgb;
+    }
+
+    /**
+     * Converts RGB byte triples to XSSFColor array (for color scales).
+     */
+    private static XSSFColor[] toXssfColors(byte[][] rgbs) {
+        XSSFColor[] colors = new XSSFColor[rgbs.length];
+        for (int i = 0; i < rgbs.length; i++) {
+            colors[i] = new XSSFColor(rgbs[i], null);
+        }
+        return colors;
+    }
+
+    /**
+     * Reads the differential style of a rule back (best effort): bold, italic, fontColor,
+     * backgroundColor.
+     */
+    private static Map<String, Object> readRuleStyle(ConditionalFormattingRule rule) {
+        Map<String, Object> style = new LinkedHashMap<>();
+        FontFormatting font = rule.getFontFormatting();
+        if (font != null) {
+            style.put("bold", font.isBold());
+            style.put("italic", font.isItalic());
+            Color fontColor = font.getFontColor();
+            if (fontColor != null) {
+                style.put("fontColor", colorToHex(fontColor));
+            }
+        }
+        PatternFormatting fill = rule.getPatternFormatting();
+        if (fill != null && fill.getFillPattern() != PatternFormatting.NO_FILL) {
+            Color fillColor = fill.getFillForegroundColorColor();
+            if (fillColor != null) {
+                style.put("backgroundColor", colorToHex(fillColor));
+            }
+        }
+        return style;
+    }
+
+    // ========================================================================
     // Help / Documentation
     // ========================================================================
 
@@ -1160,6 +1777,28 @@ public class PoiToolBox {
                 poi.setCellFontColor(sh,r,c,hex)  - Set font color (hex e.g. "FF0000" or name "RED")
                 poi.setCellBackgroundColor(...)   - Set background color
                 poi.setCellDataFormat(sh,r,c,fmt) - Set data format (e.g. "0.00", "dd.MM.yyyy", "@" for text)
+                
+                --- Conditional Formatting ---
+                poi.addConditionalFormatCellIs(sh, range, op, f1, f2, style)
+                                                  - Add cellIs rule; op: GT, LT, GTE, LTE, EQ,
+                                                    NE, BETWEEN, NOT_BETWEEN; f2 only for
+                                                    BETWEEN/NOT_BETWEEN. Returns cf-handle.
+                poi.addConditionalFormatExpression(sh, range, formula, style)
+                                                  - Add formula rule; formula relative to the
+                                                    top-left cell of range, e.g. '=$D2="OK"'
+                poi.addConditionalFormatColorScale(sh, range, colors)
+                                                  - 2 or 3 color gradient, e.g. ["F8696B","63BE7B"]
+                poi.addConditionalFormatDataBar(sh, range, color)  - Add data bar
+                poi.addConditionalFormatIconSet(sh, range, iconSet)
+                                                  - Icon set, e.g. "3_TRAFFIC_LIGHTS", "4_RATINGS",
+                                                    "5_RATINGS", "5_QUARTERS"
+                poi.getConditionalFormattings(sh) - List all conditional format rules
+                poi.removeConditionalFormat(sh, cfHandle)   - Remove one rule
+                poi.removeAllConditionalFormats(sh)         - Remove all rules of a sheet
+                style is an object with optional keys: fontColor, backgroundColor, bold, italic
+                (colors as hex RGB "FFC7CE" or name "RED"). Formulas are syntax-validated and
+                stored unmodified (English function names, A1 references); Excel evaluates them
+                when the file is opened.
                 
                 --- Advanced ---
                 poi.getMergedRegions(sh)          - Get merged regions

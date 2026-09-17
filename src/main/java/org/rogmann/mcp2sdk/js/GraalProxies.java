@@ -62,6 +62,40 @@ public class GraalProxies {
     }
 
     /**
+     * Converts a Java array (possibly nested) into a {@link ProxyArray} that is
+     * fully traversable from JavaScript.
+     * <p>
+     * A plain Java array returned to JavaScript is seen as an opaque host object:
+     * a sandbox whose HostAccess denies array access rejects element access, and
+     * {@code JSON.stringify} renders it as an empty object {@code {}} - which is
+     * the common way an LLM inspects structured results. Wrapping the array in a
+     * {@link ProxyArray} gives it native JavaScript array semantics
+     * ({@code Array.isArray(...) === true}, {@code .length}, {@code .join()},
+     * {@code JSON.stringify}).
+     * </p>
+     * <p>
+     * Elements are converted recursively on access: nested arrays, {@link List}s
+     * and {@link Map}s become {@link NestedProxyArray}s / {@link NestedProxyObject}s.
+     * </p>
+     * @param array the Java array (e.g. {@code Object[]} or nested {@code Object[][]})
+     * @return a ProxyArray with recursive element conversion
+     */
+    public static ProxyArray toProxyArray(Object[] array) {
+        return new NestedProxyArray(Arrays.asList(array));
+    }
+
+    /**
+     * Converts a Java list (possibly with nested structures) into a {@link ProxyArray}
+     * that is fully traversable from JavaScript.
+     * @see #toProxyArray(Object[]) for the rationale
+     * @param list the Java list
+     * @return a ProxyArray with recursive element conversion
+     */
+    public static ProxyArray toProxyArray(List<?> list) {
+        return new NestedProxyArray(list);
+    }
+
+    /**
      * Creates a JavaScript {@code Uint8Array} (ArrayBuffer-backed, unsigned 0-255)
      * from a Java byte array.
      * <p>

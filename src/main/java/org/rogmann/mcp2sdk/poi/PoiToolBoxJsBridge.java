@@ -7,10 +7,8 @@ import org.graalvm.polyglot.proxy.ProxyObject;
 import org.rogmann.mcp2sdk.js.GraalProxies;
 import org.rogmann.mcp2sdk.js.JsModuleInterface;
 
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 
 /**
@@ -168,7 +166,7 @@ public class PoiToolBoxJsBridge implements JsModuleInterface {
                 poi.getRowCount(args[0].asString()));
 
         methods.put("getAllData", (ProxyExecutable) args ->
-                poi.getAllData(args[0].asString()));
+                GraalProxies.toProxyArray(poi.getAllData(args[0].asString())));
 
         methods.put("setAllData", (ProxyExecutable) args -> {
             String sheetHandle = args[0].asString();
@@ -236,25 +234,11 @@ public class PoiToolBoxJsBridge implements JsModuleInterface {
         });
 
         // ---- Advanced ----
-        methods.put("getMergedRegions", (ProxyExecutable) args -> {
-            Map<String, Object>[] regions = poi.getMergedRegions(args[0].asString());
-            if (regions == null) return null;
-            List<ProxyObject> result = new ArrayList<>();
-            for (Map<String, Object> region : regions) {
-                result.add(ProxyObject.fromMap(region));
-            }
-            return result.toArray();
-        });
+        methods.put("getMergedRegions", (ProxyExecutable) args ->
+                GraalProxies.toProxyArray(poi.getMergedRegions(args[0].asString())));
 
-        methods.put("getFormulas", (ProxyExecutable) args -> {
-            Map<String, String>[] formulas = poi.getFormulas(args[0].asString());
-            if (formulas == null) return null;
-            List<ProxyObject> result = new ArrayList<>();
-            for (Map<String, String> formula : formulas) {
-                result.add(ProxyObject.fromMap(new LinkedHashMap<>(formula)));
-            }
-            return result.toArray();
-        });
+        methods.put("getFormulas", (ProxyExecutable) args ->
+                GraalProxies.toProxyArray(poi.getFormulas(args[0].asString())));
 
         methods.put("setColumnWidth", (ProxyExecutable) args -> {
             poi.setColumnWidth(args[0].asString(), args[1].asInt(), args[2].asInt());
@@ -266,9 +250,107 @@ public class PoiToolBoxJsBridge implements JsModuleInterface {
             return null;
         });
 
+        // ---- Conditional Formatting ----
+        methods.put("addConditionalFormatCellIs", (ProxyExecutable) args -> {
+            String f2 = (args.length > 4 && !args[4].isNull()) ? args[4].asString() : null;
+            Map<String, Object> style = (args.length > 5 && !args[5].isNull())
+                    ? toStyleMap(args[5]) : null;
+            return poi.addConditionalFormatCellIs(args[0].asString(), args[1].asString(),
+                    args[2].asString(), args[3].asString(), f2, style);
+        });
+
+        methods.put("addConditionalFormatExpression", (ProxyExecutable) args -> {
+            Map<String, Object> style = (args.length > 3 && !args[3].isNull())
+                    ? toStyleMap(args[3]) : null;
+            return poi.addConditionalFormatExpression(args[0].asString(), args[1].asString(),
+                    args[2].asString(), style);
+        });
+
+        methods.put("addConditionalFormatColorScale", (ProxyExecutable) args -> {
+            String[] colors = toStringArray(args[2]);
+            return poi.addConditionalFormatColorScale(args[0].asString(), args[1].asString(), colors);
+        });
+
+        methods.put("addConditionalFormatDataBar", (ProxyExecutable) args -> {
+            return poi.addConditionalFormatDataBar(args[0].asString(), args[1].asString(),
+                    args[2].asString());
+        });
+
+        methods.put("addConditionalFormatIconSet", (ProxyExecutable) args -> {
+            return poi.addConditionalFormatIconSet(args[0].asString(), args[1].asString(),
+                    args[2].asString());
+        });
+
+        methods.put("getConditionalFormattings", (ProxyExecutable) args ->
+                GraalProxies.toProxyArray(poi.getConditionalFormattings(args[0].asString())));
+
+        methods.put("removeConditionalFormat", (ProxyExecutable) args -> {
+            poi.removeConditionalFormat(args[0].asString(), args[1].asString());
+            return null;
+        });
+
+        methods.put("removeAllConditionalFormats", (ProxyExecutable) args ->
+                poi.removeAllConditionalFormats(args[0].asString()));
+
         // ---- Help ----
         methods.put("help", (ProxyExecutable) args -> poi.help());
 
         return ProxyObject.fromMap(methods);
+    }
+
+    /**
+     * Converts a JavaScript style object (e.g. {@code {backgroundColor: "FFC7CE", bold: true}})
+     * into a Java map. Unlike {@link GraalProxies#fromValue}, which only converts scalars,
+     * this reads the object members explicitly.
+     * @param value the JS style object
+     * @return the style map, or {@code null} for a null/undefined value
+     */
+    private static Map<String, Object> toStyleMap(Value value) {
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        if (!value.hasMembers()) {
+            throw new IllegalArgumentException("style must be an object with keys like "
+                    + "fontColor, backgroundColor, bold, italic, got a non-object value.");
+        }
+        Map<String, Object> style = new LinkedHashMap<>();
+        for (String key : value.getMemberKeys()) {
+            Value member = value.getMember(key);
+            if (member == null || member.isNull()) {
+                continue;
+            }
+            if (member.isString()) {
+                style.put(key, member.asString());
+            } else if (member.isBoolean()) {
+                style.put(key, member.asBoolean());
+            } else if (member.isNumber()) {
+                style.put(key, member.as(Number.class));
+            } else {
+                throw new IllegalArgumentException("style." + key + " must be a string, "
+                        + "boolean or number.");
+            }
+        }
+        return style;
+    }
+
+    /**
+     * Converts a JavaScript array of strings (e.g. color scale colors) into a Java array.
+     * @param value the JS array
+     * @return the string array
+     */
+    private static String[] toStringArray(Value value) {
+        if (value == null || value.isNull() || !value.hasArrayElements()) {
+            throw new IllegalArgumentException("Expected an array of strings, got: " + value);
+        }
+        int size = (int) value.getArraySize();
+        String[] result = new String[size];
+        for (int i = 0; i < size; i++) {
+            Value element = value.getArrayElement(i);
+            if (element == null || !element.isString()) {
+                throw new IllegalArgumentException("Element " + i + " of the array must be a string.");
+            }
+            result[i] = element.asString();
+        }
+        return result;
     }
 }
