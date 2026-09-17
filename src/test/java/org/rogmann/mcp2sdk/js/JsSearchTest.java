@@ -180,8 +180,48 @@ class JsSearchTest {
         return ((Number) counts(result).get(name)).longValue();
     }
 
+    @SuppressWarnings("unchecked")
+    private static List<String> warnings(Map<String, Object> result) {
+        return (List<String>) result.get("warnings");
+    }
+
     private static void write(String path, String content) {
         JsFileSystem.writeFile(path, content);
+    }
+
+    /** Writes raw bytes below the temporary project base, creating parent directories. */
+    private void writeRaw(String path, byte[] data) throws IOException {
+        Path target = tempDir.resolve(path);
+        Path parent = target.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        Files.write(target, data);
+    }
+
+    /** Concatenation of byte arrays, used by the binary-detection fixtures. */
+    private static byte[] concat(byte[]... parts) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        for (byte[] part : parts) {
+            out.writeBytes(part);
+        }
+        return out.toByteArray();
+    }
+
+    /** Filler of {@code size} ASCII bytes (a fixture that must not look like a pattern). */
+    private static byte[] dots(int size) {
+        byte[] data = new byte[size];
+        Arrays.fill(data, (byte) '.');
+        return data;
+    }
+
+    /**
+     * Fixture for the binary sniff window: exactly {@code cutAt} ASCII bytes, then one
+     * multi-byte character - so the window boundary falls into that character - then a tail
+     * line carrying the searched word.
+     */
+    private static byte[] cutAtSniffWindow(int cutAt, String multiByteCharacter) {
+        return concat(dots(cutAt), text(multiByteCharacter), text("\nstatus: TODO offen\n"));
     }
 
     private static Map<String, byte[]> bytes(Object... namesAndContents) {
@@ -460,6 +500,65 @@ class JsSearchTest {
         assertEquals("m.txt", JsSearch.grep(matcher("TODO"), "m.txt", opts("mode", "filesWithMatches")));
         assertEquals(List.of("m.txt"), JsSearch.files(matcher("TODO"), "m.txt",
                 opts("mode", "filesWithMatches")));
+    }
+
+    /**
+     * Finding G-042: every rejected {@code mode} of {@code search.find()} used to answer with the
+     * same remark about {@code counts}, so a caller who never wrote {@code counts} was sent after
+     * it. The message must quote the value that was given, name the modes of <em>this</em> entry
+     * point, and only explain {@code counts} when the value really is {@code counts}.
+     */
+    @Test
+    void modeErrorDescribesTheValueItWasGiven() {
+        write("m.txt", "TODO");
+
+        String counts = assertThrows(IllegalArgumentException.class,
+                () -> JsSearch.find(matcher("TODO"), "m.txt", opts("mode", "counts"))).getMessage();
+        assertTrue(counts.contains("got 'counts'"), counts);
+        assertTrue(counts.contains("search.grep()"), "counts belongs to grep: " + counts);
+        assertTrue(counts.contains("'structured'") && counts.contains("'offsets'"), counts);
+
+        String content = assertThrows(IllegalArgumentException.class,
+                () -> JsSearch.find(matcher("TODO"), "m.txt", opts("mode", "content"))).getMessage();
+        assertFalse(content.contains("counts"),
+                "an unrelated value must not be explained with counts: " + content);
+        assertTrue(content.contains("got 'content'"), content);
+        assertTrue(content.contains("search.grep()"), content);
+
+        String blurb = assertThrows(IllegalArgumentException.class,
+                () -> JsSearch.find(matcher("TODO"), "m.txt", opts("mode", "blurb"))).getMessage();
+        assertFalse(blurb.contains("counts"), blurb);
+        assertTrue(blurb.contains("got 'blurb'"), blurb);
+
+        // near misses are named as what they are
+        assertTrue(assertThrows(IllegalArgumentException.class,
+                        () -> JsSearch.find(matcher("TODO"), "m.txt", opts("mode", "strucured")))
+                        .getMessage().contains("did you mean 'structured'"), "typo hint missing");
+        assertTrue(assertThrows(IllegalArgumentException.class,
+                        () -> JsSearch.find(matcher("TODO"), "m.txt", opts("mode", "Structured")))
+                        .getMessage().contains("case-sensitive"), "case hint missing");
+        assertTrue(assertThrows(IllegalArgumentException.class,
+                        () -> JsSearch.find(matcher("TODO"), "m.txt", opts("mode", "")))
+                        .getMessage().contains("must not be empty"), "empty mode hint missing");
+
+        // the other entry points follow the same rule and name their own modes
+        String grep = assertThrows(IllegalArgumentException.class,
+                () -> JsSearch.grep(matcher("TODO"), "m.txt", opts("mode", "structured"))).getMessage();
+        assertTrue(grep.startsWith("search.grep()"), grep);
+        assertTrue(grep.contains("got 'structured'"), grep);
+        assertTrue(grep.contains("search.find()"), "structured belongs to find: " + grep);
+        assertTrue(grep.contains("'counts'"), "grep lists its own modes: " + grep);
+
+        String files = assertThrows(IllegalArgumentException.class,
+                () -> JsSearch.files(matcher("TODO"), "m.txt", opts("mode", "content"))).getMessage();
+        assertTrue(files.startsWith("search.files()"), files);
+        assertTrue(files.contains("got 'content'"), files);
+        assertFalse(files.contains("offsets"), "offsets is not a mode of files(): " + files);
+
+        // a value that is not a string at all is shown, so the caller sees what arrived
+        assertTrue(assertThrows(IllegalArgumentException.class,
+                        () -> JsSearch.find(matcher("TODO"), "m.txt", opts("mode", 42)))
+                        .getMessage().contains("42"), "must show the value that was passed");
     }
 
     @Test
@@ -874,7 +973,10 @@ class JsSearchTest {
         assertEquals(1, count(result, "archiveEntriesScanned"));
         assertEquals(1, count(result, "skipped"));
         assertEquals(0, count(result, "errors"));
-        assertEquals(0, ((List<?>) result.get("warnings")).size());
+        // ...but it does not stay invisible: the skip is summarized and names the entry (spec 18)
+        assertEquals(1, warnings(result).size(), warnings(result).toString());
+        assertTrue(warnings(result).get(0).contains("JsUserRuntimeException.class"),
+                warnings(result).toString());
 
         String out = JsSearch.grep(matcher("class JsUserRuntimeException"), "sample.tar.gz",
                 opts("archives", true));
@@ -1170,6 +1272,149 @@ class JsSearchTest {
 
         Files.write(tempDir.resolve("explicit.bin"), new byte[]{'a', 'b', 0, 'T', 'O', 'D', 'O'});
         assertThrows(JsUserRuntimeException.class, () -> JsSearch.find(matcher("TODO"), "explicit.bin"));
+    }
+
+    /**
+     * Regression (reported by an LLM using "grep before the run"): a valid UTF-8, NUL-free
+     * {@code knowledge/gaps.yaml} was skipped as binary because the 8192-byte detection window
+     * ended inside a {@code …} (e2 80 | a6) and the strict decode of that slice therefore looked
+     * like malformed input. The character continues with the next byte, so the file is text.
+     */
+    @Test
+    void threeByteCharacterCutByTheSniffWindowIsNotBinary() throws IOException {
+        writeRaw("knowledge/gaps.yaml", cutAtSniffWindow(8190, "…"));   // window keeps e2 80
+
+        Map<String, Object> result = JsSearch.find(matcher("TODO"), ".", opts("recursive", true));
+        assertEquals(List.of("knowledge/gaps.yaml"), filesOf(result));
+        assertEquals(0, count(result, "skipped"), "a sequence cut by the window is not binary (18)");
+        assertTrue(warnings(result).isEmpty(), warnings(result).toString());
+        // the match sits behind the boundary: the rest of the file really was read and decoded
+        assertEquals(1, matches(result).size());
+        assertEquals("status: TODO offen", matches(result).get(0).get("text"));
+        assertEquals(2, ((Number) matches(result).get(0).get("line")).intValue());
+        assertTrue(JsSearch.grep(matcher("TODO"), "knowledge/gaps.yaml", null).contains("TODO"));
+    }
+
+    /** Same boundary case with a 4-byte character: only the lead byte is left in the window. */
+    @Test
+    void fourByteCharacterCutByTheSniffWindowIsNotBinary() throws IOException {
+        writeRaw("emoji.txt", cutAtSniffWindow(8191, "\uD83D\uDE00"));  // window keeps f0 only
+
+        Map<String, Object> result = JsSearch.find(matcher("TODO"), "emoji.txt", null);
+        assertEquals(List.of("emoji.txt"), filesOf(result));
+        assertEquals(0, count(result, "skipped"));
+        assertEquals("status: TODO offen", matches(result).get(0).get("text"));
+        // the character itself crosses the boundary: line 1 is the filler plus the whole emoji
+        Map<String, Object> emojiHit = JsSearch.find(matcher("\uD83D\uDE00"), "emoji.txt", null);
+        assertEquals(1, matches(emojiHit).size(), "the emoji must survive the window boundary");
+        String firstLine = String.valueOf(matches(emojiHit).get(0).get("text"));
+        assertTrue(firstLine.endsWith("\uD83D\uDE00"), "unexpected line content: " + firstLine);
+    }
+
+    /**
+     * The other side of the boundary rule: a sequence that is cut and then followed by a byte
+     * that cannot continue it really is malformed, and a file shorter than the window that ends
+     * mid-character really is truncated data. Both stay binary.
+     */
+    @Test
+    void malformedUtf8IsStillBinary() throws IOException {
+        writeRaw("mid.txt", concat(dots(4000), new byte[]{(byte) 0xE2, (byte) 0x80, 'A'}, dots(5000),
+                text("TODO\n")));
+        writeRaw("latin1.txt", concat(dots(10), new byte[]{(byte) 0xE9}, dots(9000)));
+        writeRaw("overlong.txt", concat(dots(10), new byte[]{(byte) 0xC0, (byte) 0x80}, dots(50),
+                text("TODO\n")));
+        Map<String, Object> result = JsSearch.find(matcher("TODO"), ".", opts("recursive", true));
+        assertTrue(filesOf(result).isEmpty(), "none of them is text: " + filesOf(result));
+        assertEquals(3, count(result, "skipped"));
+    }
+
+    /** A file smaller than the sniff window is decoded as complete input, boundary included. */
+    @Test
+    void fileTruncatedAtItsOwnEndIsBinary() throws IOException {
+        writeRaw("broken.txt", concat(text("TODO"), new byte[]{(byte) 0xE2, (byte) 0x80}));
+        write("fine.txt", "TODO\n");
+        Map<String, Object> result = JsSearch.find(matcher("TODO"), ".", opts("recursive", true));
+        assertEquals(List.of("fine.txt"), filesOf(result), "the truncated file must not match");
+        assertEquals(1, count(result, "skipped"));
+        assertTrue(warnings(result).toString().contains("broken.txt"), warnings(result).toString());
+        assertThrows(JsUserRuntimeException.class, () -> JsSearch.find(matcher("TODO"), "broken.txt"),
+                "an explicit binary target is a hard error (30.1)");
+    }
+
+    /**
+     * The window decides, the rest of the file is not inspected - that was true before this fix
+     * and stays true: a stray byte directly behind byte 8192 is decoded leniently (U+FFFD) by the
+     * line reader instead of turning the file into a "binary" that is skipped. Fixing the
+     * detection must not mean skipping more than before.
+     */
+    @Test
+    void invalidByteBehindTheWindowDoesNotMakeAFileBinary() throws IOException {
+        writeRaw("late.txt", concat(dots(8192), new byte[]{(byte) 0xE9}, text("TODO\n")));
+        Map<String, Object> result = JsSearch.find(matcher("TODO"), "late.txt", null);
+        assertEquals(List.of("late.txt"), filesOf(result));
+        assertEquals(0, count(result, "skipped"));
+        assertTrue(warnings(result).isEmpty(), warnings(result).toString());
+    }
+
+    /**
+     * A skipped file used to leave no trace at all: {@code skipped: 1} with an empty
+     * {@code warnings} list, which reads like "searched, nothing there". Every binary skip is
+     * now summarized in one warning naming the paths (spec 18).
+     */
+    @Test
+    void binarySkipsAreSummarizedInOneWarning() throws IOException {
+        write("notes.txt", "nothing to find here");
+        writeRaw("a.bin", new byte[]{'T', 0, 'x'});
+        writeRaw("b.bin", new byte[]{'U', 0, 'x'});
+        writeRaw("sub/c.bin", new byte[]{'V', 0, 'x'});
+
+        Map<String, Object> result = JsSearch.find(matcher("TODO"), ".", opts("recursive", true));
+        assertEquals(3, count(result, "skipped"));
+        List<String> warnings = warnings(result);
+        assertEquals(1, warnings.size(), "one summary instead of one message per file: " + warnings);
+        String warning = warnings.get(0);
+        assertTrue(warning.contains("a.bin") && warning.contains("b.bin")
+                && warning.contains("sub/c.bin"), warning);
+        assertTrue(warning.contains("binary"), warning);
+        assertTrue(warning.contains("bytes"), "the hint must name the workaround: " + warning);
+    }
+
+    /** The summary stays short: five named paths, the rest as a count. */
+    @Test
+    void binarySkipWarningCountsWhatItDoesNotName() throws IOException {
+        for (int i = 0; i < 7; i++) {
+            writeRaw("img/icon" + i + ".png", new byte[]{0, 1, 2, 3});
+        }
+        Map<String, Object> result = JsSearch.find(matcher("TODO"), ".", opts("recursive", true));
+        List<String> warnings = warnings(result);
+        assertEquals(1, warnings.size(), warnings.toString());
+        assertTrue(warnings.get(0).contains("7 binary files"), warnings.get(0));
+        assertTrue(warnings.get(0).contains("2 more"), warnings.get(0));
+    }
+
+    /** Text-only scans are unaffected: no binary files, no binary warning. */
+    @Test
+    void textOnlyScanStaysWarningFree() {
+        write("a.txt", "TODO a");
+        write("sub/b.txt", "b\n");
+        Map<String, Object> result = JsSearch.find(matcher("TODO"), ".", opts("recursive", true));
+        assertEquals(List.of("a.txt"), filesOf(result));
+        assertTrue(warnings(result).isEmpty(), warnings(result).toString());
+    }
+
+    /**
+     * The workaround named in the bug report: {@code binary: "bytes"} never consults the
+     * detection, so a file the text scan refuses is still searchable.
+     */
+    @Test
+    void byteSearchIgnoresTheDetection() throws IOException {
+        writeRaw("knowledge/gaps.bin", concat(text("TODO"), new byte[]{0}, text("\n"), dots(8190)));
+        Map<String, Object> textScan = JsSearch.find(matcher("TODO"), ".", opts("recursive", true));
+        assertTrue(filesOf(textScan).isEmpty(), "the NUL byte makes it binary");
+        assertEquals(1, count(textScan, "skipped"));
+        assertEquals(List.of("knowledge/gaps.bin"),
+                JsSearch.files(JsSearch.SearchPattern.byteLiteral(text("TODO")), ".",
+                        opts("recursive", true, "binary", "bytes")));
     }
 
     @Test

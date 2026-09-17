@@ -10,8 +10,9 @@ import java.io.InputStreamReader;
 import java.io.PushbackInputStream;
 import java.io.Reader;
 import java.nio.ByteBuffer;
-import java.nio.charset.CharacterCodingException;
+import java.nio.CharBuffer;
 import java.nio.charset.CharsetDecoder;
+import java.nio.charset.CoderResult;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryIteratorException;
@@ -32,6 +33,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
@@ -593,6 +595,12 @@ public final class JsSearch {
     /** Maximum number of warnings collected in {@code find().warnings}. */
     private static final int MAX_WARNINGS = 20;
 
+    /**
+     * Number of paths the binary-skip warning names (spec 18); the remainder is summarized as a
+     * count, so a directory full of icons still produces one short message.
+     */
+    private static final int BINARY_SKIP_WARNING_PATHS = 5;
+
     /** Mode of {@code search.grep()} (default): grep-like line output. */
     public static final String MODE_CONTENT = "content";
     /** Mode returning one matching path per line. */
@@ -603,6 +611,21 @@ public final class JsSearch {
     public static final String MODE_OFFSETS = "offsets";
     /** Mode of the byte search: one {@code path:count} line per file (spec 19.5). */
     public static final String MODE_COUNTS = "counts";
+
+    /** Every mode of the module, in message order (used by the "did you mean" search). */
+    private static final List<String> ALL_MODES = List.of(MODE_CONTENT, MODE_FILES_WITH_MATCHES,
+            MODE_STRUCTURED, MODE_OFFSETS, MODE_COUNTS);
+
+    /**
+     * Where each mode is served. A rejected mode is explained by naming its real home, so the
+     * hint stays true for modes that have nothing to do with each other (finding G-042).
+     */
+    private static final Map<String, String> MODE_OWNER = Map.of(
+            MODE_CONTENT, "the default mode of search.grep()",
+            MODE_FILES_WITH_MATCHES, "a mode of search.grep() and search.files()",
+            MODE_STRUCTURED, "the default mode of search.find()",
+            MODE_OFFSETS, "a mode of search.grep() and search.find()",
+            MODE_COUNTS, "a string mode of search.grep()");
 
     /** Value of the {@code binary} option: skip binary files (default, unchanged behaviour). */
     public static final String BINARY_SKIP = "skip";
@@ -659,8 +682,8 @@ public final class JsSearch {
     private static final String OPTION_LIST = String.join(", ", OPTION_NAMES);
 
     /** ZIP-like archive extensions. */
-    private static final Set<String> ZIP_EXTENSIONS = Set.of("zip", "jar", "war", "ear", "rar", "apk",
-            "xlsx", "docx", "pptx", "vsix", "epub");
+    private static final Set<String> ZIP_EXTENSIONS = Set.of("zip", "jar", "war", "ear", "rar", "aar", "apk",
+            "xlsx", "docx", "pptx", "vsix", "epub", "odt", "ods");
 
     /** Plain tar extension. */
     private static final String TAR_EXTENSION = "tar";
@@ -884,6 +907,17 @@ public final class JsSearch {
             throw new IllegalArgumentException("recursiveArchives requires archives: true");
         }
         parseMode(raw.get("mode"), modeContext, o);
+        if (!o.binaryBytes() && (MODE_OFFSETS.equals(o.mode) || MODE_COUNTS.equals(o.mode))) {
+            // Spec 19.4/19.5: both modes are byte search only. Accepting them for a text search
+            // would silently answer with content lines instead - the same kind of untruthful
+            // answer that finding G-042 complains about, only quieter.
+            throw new IllegalArgumentException("mode '" + o.mode + "' is a byte-search mode and needs"
+                    + " binary: \"" + BINARY_BYTES + "\" ("
+                    + (MODE_COUNTS.equals(o.mode)
+                        ? "a text search counts per file in the structured result of search.find()"
+                        : "a text search reports line numbers, not byte offsets")
+                    + ", see search.help())");
+        }
         if (MODE_COUNTS.equals(o.mode) && !o.filename) {
             throw new IllegalArgumentException("Option 'filename' cannot be false with mode '"
                     + MODE_COUNTS + "': a line of bare numbers could not be traced back to a file");
@@ -898,34 +932,160 @@ public final class JsSearch {
      *   <li>{@code search.find}: structured, offsets (counts is string-only)</li>
      *   <li>{@code search.files}: filesWithMatches (that is all it returns)</li>
      * </ul>
+     * A value that is not accepted is described by {@link #unsupportedMode(String, String, List)}:
+     * the message depends on the value, not only on the entry point.
      */
     private static void parseMode(Object v, String context, Options o) {
         if (v == null) {
-            o.mode = MODE_STRUCTURED.equals(context) ? MODE_STRUCTURED
-                    : "search.files".equals(context) ? MODE_FILES_WITH_MATCHES : MODE_CONTENT;
+            o.mode = defaultMode(context);
             return;
         }
         if (!(v instanceof String s)) {
-            throw new IllegalArgumentException("Option 'mode' must be a string");
+            throw new IllegalArgumentException("Option 'mode' must be a string (got "
+                    + abbreviate(String.valueOf(v)) + "; the value is a mode name such as \"offsets\")");
         }
-        if ("search.grep".equals(context)) {
-            if (!MODE_CONTENT.equals(s) && !MODE_FILES_WITH_MATCHES.equals(s)
-                    && !MODE_OFFSETS.equals(s) && !MODE_COUNTS.equals(s)) {
-                throw new IllegalArgumentException("search.grep() supports mode '" + MODE_CONTENT
-                        + "', '" + MODE_FILES_WITH_MATCHES + "', '" + MODE_OFFSETS + "' or '"
-                        + MODE_COUNTS + "'");
-            }
-        } else if ("search.find".equals(context)) {
-            if (!MODE_STRUCTURED.equals(s) && !MODE_OFFSETS.equals(s)) {
-                throw new IllegalArgumentException("search.find() supports mode '" + MODE_STRUCTURED
-                        + "' or '" + MODE_OFFSETS + "' only ('" + MODE_COUNTS + "' is a string mode"
-                        + " of search.grep())");
-            }
-        } else if (!MODE_FILES_WITH_MATCHES.equals(s)) {
-            throw new IllegalArgumentException("search.files() supports mode '" + MODE_FILES_WITH_MATCHES
-                    + "' only (or omit mode)");
+        List<String> allowed = allowedModes(context);
+        if (allowed.contains(s)) {
+            o.mode = s;
+            return;
         }
-        o.mode = s;
+        throw new IllegalArgumentException(unsupportedMode(context, s, allowed));
+    }
+
+    /** Mode used when {@code mode} is absent: the natural result of the entry point. */
+    private static String defaultMode(String context) {
+        if (isFindContext(context)) {
+            return MODE_STRUCTURED;
+        }
+        return "search.files".equals(context) ? MODE_FILES_WITH_MATCHES : MODE_CONTENT;
+    }
+
+    /** {@code search.find} accepts {@code structured} and {@code offsets}, nothing else. */
+    private static boolean isFindContext(String context) {
+        return "search.find".equals(context) || MODE_STRUCTURED.equals(context);
+    }
+
+    /** The modes of one entry point, in the order they are listed in messages. */
+    private static List<String> allowedModes(String context) {
+        if (isFindContext(context)) {
+            return List.of(MODE_STRUCTURED, MODE_OFFSETS);
+        }
+        if ("search.files".equals(context)) {
+            return List.of(MODE_FILES_WITH_MATCHES);
+        }
+        return List.of(MODE_CONTENT, MODE_FILES_WITH_MATCHES, MODE_OFFSETS, MODE_COUNTS);
+    }
+
+    /** Entry point as it is written in messages; an unknown context is reported as grep. */
+    private static String entryPointName(String context) {
+        if (isFindContext(context)) {
+            return "search.find()";
+        }
+        return "search.files".equals(context) ? "search.files()" : "search.grep()";
+    }
+
+    /**
+     * Message for a mode the entry point does not offer. It names the value that was given and the
+     * modes that are allowed <em>here</em>, and the closing remark is chosen for that value:
+     * pointing every wrong value at {@code counts} - however unrelated it is - sends the reader
+     * after an option they never mentioned (finding G-042).
+     */
+    private static String unsupportedMode(String context, String given, List<String> allowed) {
+        StringBuilder sb = new StringBuilder(entryPointName(context))
+                .append(" only supports mode ").append(quotedList(allowed))
+                .append(" (got '").append(given).append('\'');
+        String note = given.isEmpty()
+                ? "the mode must not be empty - omit the option for '" + defaultMode(context) + "'"
+                : modeHint(given, allowed);
+        if (note != null) {
+            sb.append(" - ").append(note);
+        }
+        // One mode only: saying what an omitted option would do is worth the extra clause, unless
+        // the note above already said it.
+        if (allowed.size() == 1 && (note == null || !note.contains("omit"))) {
+            sb.append(note != null && note.endsWith("?") ? ". Omitting" : "; omitting")
+                    .append(" 'mode' gives the same result");
+        }
+        return sb.append(')').toString();
+    }
+
+    /**
+     * Remark for one rejected mode value: a mode that exists but belongs to another entry point is
+     * named there, a wrong spelling of an existing name is reported as such, a near miss suggests
+     * the closest allowed mode, and anything else gets no remark at all.
+     * @return the remark (without the leading dash), or {@code null} if the value needs none
+     */
+    private static String modeHint(String given, List<String> allowed) {
+        String owner = MODE_OWNER.get(given);
+        if (owner != null) {
+            return "that is " + owner;
+        }
+        for (String mode : ALL_MODES) {
+            if (mode.equalsIgnoreCase(given)) {
+                return allowed.contains(mode)
+                        ? "mode names are case-sensitive, use '" + mode + "'"
+                        : "mode names are case-sensitive, and '" + mode + "' is " + MODE_OWNER.get(mode);
+            }
+        }
+        String near = nearestMode(given, allowed);
+        return near == null ? null : "did you mean '" + near + "'?";
+    }
+
+    /** Closest allowed mode within two edits (case-insensitive), or {@code null}. */
+    private static String nearestMode(String given, List<String> allowed) {
+        if (given.length() < 3) {
+            return null; // too short to say anything sensible
+        }
+        String lower = given.toLowerCase(Locale.ROOT);
+        String best = null;
+        int bestDistance = Integer.MAX_VALUE;
+        for (String mode : allowed) {
+            int distance = editDistance(lower, mode.toLowerCase(Locale.ROOT));
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = mode;
+            }
+        }
+        return bestDistance <= 2 ? best : null;
+    }
+
+    /** Levenshtein distance of two strings (two rows, no matrix). */
+    private static int editDistance(String a, String b) {
+        int[] previous = new int[b.length() + 1];
+        int[] current = new int[b.length() + 1];
+        for (int j = 0; j <= b.length(); j++) {
+            previous[j] = j;
+        }
+        for (int i = 1; i <= a.length(); i++) {
+            current[0] = i;
+            for (int j = 1; j <= b.length(); j++) {
+                int cost = a.charAt(i - 1) == b.charAt(j - 1) ? 0 : 1;
+                current[j] = Math.min(Math.min(current[j - 1] + 1, previous[j] + 1),
+                        previous[j - 1] + cost);
+            }
+            int[] swap = previous;
+            previous = current;
+            current = swap;
+        }
+        return previous[b.length()];
+    }
+
+    /** {@code 'a'}, {@code 'a' or 'b'}, {@code 'a', 'b' or 'c'}. */
+    private static String quotedList(List<String> values) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < values.size(); i++) {
+            if (i > 0) {
+                sb.append(i == values.size() - 1 ? " or " : ", ");
+            }
+            sb.append('\'').append(values.get(i)).append('\'');
+        }
+        return sb.toString();
+    }
+
+    /** A foreign value in a message, on one line and short enough not to flood it. */
+    private static String abbreviate(String value) {
+        String oneLine = value.replace('\n', ' ').replace('\r', ' ');
+        return oneLine.length() <= 40 ? oneLine : oneLine.substring(0, 37) + "...";
     }
 
     /**
@@ -1631,6 +1791,8 @@ public final class JsSearch {
                 break;
             }
         }
+        // A file that was not searched at all is information, not noise (spec 18).
+        engine.summarizeBinarySkips();
         return engine;
     }
 
@@ -1660,6 +1822,13 @@ public final class JsSearch {
         private final Map<String, List<MatchRecord>> byPath = new TreeMap<>(DISPLAY_PATH_ORDER);
         private final Counts counts = new Counts();
         private final List<String> warnings = new ArrayList<>();
+        /**
+         * Paths the text scan skipped as binary (spec 18), sorted like the result paths. They are
+         * summarized in a single warning by {@link #summarizeBinarySkips()}: a file that is not
+         * searched at all must not leave a clean "no matches" result behind without a trace,
+         * otherwise "grep found nothing" silently turns into "the code has no such thing".
+         */
+        private final Set<String> binarySkipped = new TreeSet<>(DISPLAY_PATH_ORDER);
 
         private boolean truncated;
         private String truncatedReason;
@@ -2065,6 +2234,7 @@ public final class JsSearch {
                         throw new JsUserRuntimeException(
                                 "Cannot search binary file as text: " + src.displayPath);
                     }
+                    binarySkipped.add(src.displayPath);
                     return;
                 }
                 FileScan scan = scanContent(src, in, maxBytes);
@@ -2316,7 +2486,20 @@ public final class JsSearch {
             boolean perFileLimitCut;
         }
 
-        /** Binary detection heuristic: NUL byte or invalid UTF-8 in the first bytes. */
+        /**
+         * Binary detection heuristic: NUL byte or invalid UTF-8 in the first bytes (spec 18).
+         * <p>
+         * The sniff window is a fixed-size slice of a longer stream, so it can end in the middle
+         * of a multi-byte sequence (a {@code …} cut to {@code e2 80} is the classic case). That
+         * is no evidence of binary content - the sequence simply continues beyond the window, and
+         * the reader that decodes the rest of the stream sees the whole character. The strict
+         * decode therefore runs with {@code endOfInput = false} while more data may follow: it
+         * still reports malformed input at every inner position of the window but tolerates a
+         * partial sequence at its very end. A source shorter than the window ended before the
+         * window was full, so it is decoded with {@code endOfInput = true} and a file that really
+         * is cut off mid-character stays binary.
+         * </p>
+         */
         private static boolean isBinary(SniffedInputStream in) throws IOException {
             byte[] prefix = in.prefix();
             if (prefix.length == 0) {
@@ -2327,15 +2510,27 @@ public final class JsSearch {
                     return true;
                 }
             }
+            return hasMalformedUtf8(prefix, prefix.length < BINARY_SNIFF_BYTES);
+        }
+
+        /**
+         * Strict UTF-8 check of the binary sniff window.
+         * @param prefix bytes of the window, NUL-free
+         * @param endOfInput true if {@code prefix} is the complete source, so that a partial
+         *                   trailing sequence really is truncated data and counts as malformed
+         * @return true if the bytes are not valid UTF-8, ignoring only a partial sequence that
+         *         continues beyond the window
+         */
+        private static boolean hasMalformedUtf8(byte[] prefix, boolean endOfInput) {
             CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
                     .onMalformedInput(CodingErrorAction.REPORT)
                     .onUnmappableCharacter(CodingErrorAction.REPORT);
-            try {
-                decoder.decode(ByteBuffer.wrap(prefix));
-                return false;
-            } catch (CharacterCodingException e) {
-                return true;
-            }
+            // UTF-8 never yields more characters than it consumes bytes (a 4-byte sequence is a
+            // surrogate pair, everything else is one character), so this cannot overflow;
+            // REPORT means no replacement characters are emitted either.
+            CharBuffer out = CharBuffer.allocate(prefix.length + 1);
+            CoderResult result = decoder.decode(ByteBuffer.wrap(prefix), out, endOfInput);
+            return result.isMalformed() || result.isUnmappable();
         }
 
         /** Reads the lines of one source and collects matching lines with their context. */
@@ -2429,6 +2624,33 @@ public final class JsSearch {
             if (warnings.size() < MAX_WARNINGS) {
                 warnings.add(message);
             }
+        }
+
+        /**
+         * Turns the files skipped as binary into one warning line (spec 18). One message for the
+         * whole scan, so a repository full of icons costs one line and not one per file, but a
+         * single overlooked {@code .yaml} is named at its path. The byte-search hint is part of
+         * the message because that is the workaround a caller can act on.
+         */
+        private void summarizeBinarySkips() {
+            if (binarySkipped.isEmpty()) {
+                return;
+            }
+            int total = binarySkipped.size();
+            StringBuilder sb = new StringBuilder("Skipped ").append(total)
+                    .append(total == 1 ? " binary file" : " binary files").append(" in text mode:");
+            int shown = 0;
+            for (String path : binarySkipped) {
+                if (shown >= BINARY_SKIP_WARNING_PATHS) {
+                    sb.append(", ... (").append(total - shown).append(" more)");
+                    break;
+                }
+                sb.append(' ').append(path).append(',');
+                shown++;
+            }
+            sb.setLength(sb.length() - 1); // drop the trailing comma
+            sb.append("; they are not searched as text - use binary: \"bytes\" to search them");
+            addWarning(sb.toString());
         }
 
         // ----------------------------------------------------------------
@@ -3417,6 +3639,7 @@ public final class JsSearch {
             "Scope:      recursive=false",
             "Output:     mode=\"content\"|\"filesWithMatches\"|\"offsets\"|\"counts\" (grep);",
             "            \"structured\"|\"offsets\" (find); \"filesWithMatches\" (files);",
+            "            offsets/counts are byte-search modes and need binary=\"bytes\";",
             "            filename=true, lineNumbers=true",
             "Context:    before=0, after=0, context=0 (aliases B, A, C; conflicts are errors)",
             "Pattern:    flags=\"\" (any of " + VALID_REGEX_FLAGS + "), caseInsensitive=false",
@@ -3488,8 +3711,11 @@ public final class JsSearch {
             "",
             "--- Limitations ---",
             "- text mode decodes UTF-8 only; a file is binary when the first " + BINARY_SNIFF_BYTES + " bytes",
-            "  contain NUL or invalid UTF-8. binary:\"skip\" (default) skips it - an explicit",
-            "  binary or oversized target throws - and binary:\"bytes\" searches it exactly,",
+            "  contain NUL or invalid UTF-8. A multi-byte character cut by the end of that window",
+            "  is not invalid - it continues in the next byte - so long UTF-8 files stay text.",
+            "  binary:\"skip\" (default) skips a binary file - an explicit binary or oversized target",
+            "  throws - and binary:\"bytes\" searches it exactly. Skipped files are summarized in",
+            "  one warning naming their paths,",
             "- byte search: regex source must be ASCII, characters above 0xFF never match, a regex",
             "  match longer than " + BINARY_REGEX_OVERLAP_BYTES / 1024 + " KiB over a window boundary may be missed,",
             "- UTF-16 text is bytes, not characters: search \"h\\x00a\\x00l\\x00l\\x00o\\x00\", the",
