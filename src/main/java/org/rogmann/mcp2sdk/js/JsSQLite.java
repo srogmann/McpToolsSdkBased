@@ -20,7 +20,7 @@ import java.util.Set;
  * Controlled read-only access to SQLite database files for JavaScript.
  * <p>
  * A small self-contained parser for the SQLite database file format (as documented in
- * <em>https://sqlite.org/fileformat.html</em>) - deliberately without any external
+ * <em>https://www.sqlite.org/fileformat2.html</em>) - deliberately without any external
  * dependency such as xerial/sqlite-jdbc. The supported scope is intentionally simple:
  * </p>
  * <ul>
