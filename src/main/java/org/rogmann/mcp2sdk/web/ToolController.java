@@ -2,7 +2,6 @@ package org.rogmann.mcp2sdk.web;
 
 import org.rogmann.mcp2sdk.ToolRegistry;
 import org.rogmann.mcp2sdk.ToolSpecWithState;
-import org.rogmann.mcp2sdk.ToolState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Controller;
@@ -18,7 +17,7 @@ import java.util.Map;
 @RequestMapping("/tools")
 public class ToolController {
 
-    private static final Logger LOG = LoggerFactory.getLogger(ToolController.class);
+     private static final Logger LOG = LoggerFactory.getLogger(ToolController.class);
 
     private final ToolRegistry toolRegistry;
 
