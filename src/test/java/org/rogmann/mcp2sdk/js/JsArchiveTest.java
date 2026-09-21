@@ -5,29 +5,39 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import org.apache.poi.ss.usermodel.Cell;
+import org.apache.poi.ss.usermodel.Sheet;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.zip.CRC32;
 import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 import java.util.zip.ZipOutputStream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Tests for {@link JsArchive} (ZIP and tar listing/extraction and security).
+ * Tests for {@link JsArchive} (ZIP and tar listing/extraction, ZIP writing and security).
  */
 class JsArchiveTest {
 
@@ -37,20 +47,34 @@ class JsArchiveTest {
     Path tempDir;
 
     private String oldProjectDir;
+    private String oldReadonly;
 
     @BeforeEach
     void setUp() {
         oldProjectDir = System.getProperty("IDE_PROJECT_DIR");
         System.setProperty("IDE_PROJECT_DIR", tempDir.toString());
+        // ZIP writing is off by default; tests that need it call enableZipWrite().
+        oldReadonly = System.getProperty(JsArchive.PROP_READONLY);
+        System.clearProperty(JsArchive.PROP_READONLY);
     }
 
     @AfterEach
     void tearDown() {
-        if (oldProjectDir != null) {
-            System.setProperty("IDE_PROJECT_DIR", oldProjectDir);
+        restoreProperty("IDE_PROJECT_DIR", oldProjectDir);
+        restoreProperty(JsArchive.PROP_READONLY, oldReadonly);
+    }
+
+    private static void restoreProperty(String key, String value) {
+        if (value != null) {
+            System.setProperty(key, value);
         } else {
-            System.clearProperty("IDE_PROJECT_DIR");
+            System.clearProperty(key);
         }
+    }
+
+    /** Enables the gated ZIP write operations for the current test. */
+    private void enableZipWrite() {
+        System.setProperty(JsArchive.PROP_READONLY, "false");
     }
 
     // ========================================================================
@@ -306,6 +330,153 @@ class JsArchiveTest {
         assertArrayEquals(tarBytes, JsArchive.gunzip(JsArchive.gzip(tarBytes)));
     }
 
+    /** Entry name inside src/test/resources/test.tar.gz. */
+    private static final String TGZ_ENTRY = "org/rogmann/mcp2sdk/js/JsUserRuntimeException.java";
+
+    /**
+     * The one-shot case: a {@code .tar.gz} (or {@code .tgz}) is read with a single call,
+     * without gunzip and without an option &ndash; gzip is recognized from the magic bytes
+     * {@code 1F 8B 08}, not from the name.
+     */
+    @Test
+    void tgzOneShotRead() throws IOException {
+        Files.write(tempDir.resolve("test.tar.gz"), readResource("/test.tar.gz"));
+
+        List<Map<String, Object>> entries = JsArchive.tarEntries("test.tar.gz");
+        assertEquals(List.of(TGZ_ENTRY), names(entries));
+        Map<String, Object> entry = entries.get(0);
+        assertEquals("file", entry.get("type"));
+        assertEquals(Boolean.TRUE, entry.get("isFile"));
+        assertEquals(Boolean.FALSE, entry.get("isDirectory"));
+        assertEquals(961L, entry.get("size"));
+        assertEquals("0664", entry.get("mode"));
+
+        byte[] content = JsArchive.tarEntry("test.tar.gz", TGZ_ENTRY);
+        assertNotNull(content);
+        assertEquals(961, content.length);
+        assertEquals(REAL_FILE_SHA256, JsCrypto.sha256(content));
+        assertTrue(new String(content, StandardCharsets.UTF_8)
+                .startsWith("package org.rogmann.mcp2sdk.js;"));
+        assertNull(JsArchive.tarEntry("test.tar.gz", "not/there.txt"));
+
+        // Same result as the explicit two-step route (decompress first, then read bytes).
+        byte[] tarBytes = JsArchive.gunzipFile("test.tar.gz");
+        assertEquals(names(entries), names(JsArchive.tarEntries(tarBytes)));
+        assertArrayEquals(content, JsArchive.tarEntry(tarBytes, TGZ_ENTRY));
+    }
+
+    /** The byte-array variant must decide from the same magic bytes as the file variant. */
+    @Test
+    void tgzFromBytesAndPathAgree() throws IOException {
+        byte[] gz = readResource("/test.tar.gz");
+        Files.write(tempDir.resolve("test.tar.gz"), gz);
+
+        assertEquals(names(JsArchive.tarEntries("test.tar.gz")), names(JsArchive.tarEntries(gz)));
+        assertArrayEquals(JsArchive.tarEntry("test.tar.gz", TGZ_ENTRY),
+                JsArchive.tarEntry(gz, TGZ_ENTRY));
+        assertNull(JsArchive.tarEntry(gz, "not/there.txt"));
+    }
+
+    /**
+     * Detection is content-based: the name is never trusted, in neither direction.
+     */
+    @Test
+    void gzipIsDetectedByMagicNotByName() throws IOException {
+        byte[] gz = readResource("/test.tar.gz");
+        byte[] plainTar = JsArchive.gunzip(gz);
+
+        // (a) A tarball that hides behind a neutral name is still read.
+        Files.write(tempDir.resolve("payload.bin"), gz);
+        assertEquals(List.of(TGZ_ENTRY), names(JsArchive.tarEntries("payload.bin")));
+        assertEquals(REAL_FILE_SHA256, JsCrypto.sha256(JsArchive.tarEntry("payload.bin", TGZ_ENTRY)));
+
+        // (b) The opposite lie: name says .tar.gz, content is an uncompressed tar. Reading it
+        //     must not be attempted as gzip (that would fail with a confusing gzip error).
+        Files.write(tempDir.resolve("misleading.tar.gz"), plainTar);
+        assertEquals(List.of(TGZ_ENTRY), names(JsArchive.tarEntries("misleading.tar.gz")));
+        assertEquals(REAL_FILE_SHA256,
+                JsCrypto.sha256(JsArchive.tarEntry("misleading.tar.gz", TGZ_ENTRY)));
+
+        // (c) .tgz as such, both compressed and uncompressed.
+        Files.write(tempDir.resolve("pack.tgz"), gz);
+        assertEquals(List.of(TGZ_ENTRY), names(JsArchive.tarEntries("pack.tgz")));
+        Files.write(tempDir.resolve("plain.tgz"), plainTar);
+        assertEquals(List.of(TGZ_ENTRY), names(JsArchive.tarEntries("plain.tgz")));
+    }
+
+    /**
+     * A second gzip-compressed tar from the resources, read in one call: more than one entry,
+     * so the listing and the extraction of a middle entry are covered for a gzipped source.
+     */
+    @Test
+    void tgzWithSeveralEntries() throws IOException {
+        Files.write(tempDir.resolve("sample.tar.gz"), readResource("/js/sample.tar.gz"));
+
+        List<Map<String, Object>> entries = JsArchive.tarEntries("sample.tar.gz");
+        assertEquals(List.of("src/main/java/org/rogmann/mcp2sdk/js/JsUserRuntimeException.java",
+                "target/classes/org/rogmann/mcp2sdk/js/JsUserRuntimeException.class"), names(entries));
+        assertEquals(List.of(961L, 630L), entries.stream().map(e -> e.get("size")).toList());
+
+        // Extracting the first entry stops the scan early, before the gzip trailer.
+        byte[] first = JsArchive.tarEntry("sample.tar.gz",
+                "src/main/java/org/rogmann/mcp2sdk/js/JsUserRuntimeException.java");
+        assertEquals(REAL_FILE_SHA256, JsCrypto.sha256(first));
+        // ... and the entry behind it is still found.
+        assertEquals(630, JsArchive.tarEntry("sample.tar.gz",
+                "target/classes/org/rogmann/mcp2sdk/js/JsUserRuntimeException.class").length);
+    }
+
+    /**
+     * A broken gzip source fails with a clear error instead of quietly returning a partial
+     * archive. Both break points are covered: a gzip stream that ends too early and a tar
+     * stream that is cut inside an entry while the gzip layer is intact.
+     */
+    @Test
+    void truncatedGzTarFailsCleanly() throws IOException {
+        byte[] gz = readResource("/test.tar.gz");
+
+        // (a) gzip header cut after a few bytes
+        Files.write(tempDir.resolve("stub.tar.gz"), Arrays.copyOf(gz, 6));
+        JsUserRuntimeException stub = assertThrows(JsUserRuntimeException.class,
+                () -> JsArchive.tarEntries("stub.tar.gz"));
+        assertTrue(stub.getMessage().contains("stub.tar.gz"), stub.getMessage());
+
+        // (b) valid gzip around a tar that stops inside the data of the first entry
+        byte[] cutTar = Arrays.copyOf(JsArchive.gunzip(gz), 1024); // header + half of the data
+        Files.write(tempDir.resolve("half.tar.gz"), JsArchive.gzip(cutTar));
+        assertThrows(JsUserRuntimeException.class, () -> JsArchive.tarEntries("half.tar.gz"));
+        assertThrows(JsUserRuntimeException.class, () -> JsArchive.tarEntry("half.tar.gz", TGZ_ENTRY));
+        assertThrows(JsUserRuntimeException.class, () -> JsArchive.tarEntries(JsArchive.gzip(cutTar)));
+    }
+
+    /**
+     * Concatenated gzip members are decompressed (the JDK reader resets the inflater for each
+     * member), while the tar scan stops at the first end-of-archive marker - the same verdict
+     * GNU tar gives for {@code cat one.tar.gz one.tar.gz}.
+     */
+    @Test
+    void concatenatedGzipMembersReadAsFirstTar() throws IOException {
+        byte[] gz = readResource("/test.tar.gz");
+        byte[] twice = new byte[gz.length * 2];
+        System.arraycopy(gz, 0, twice, 0, gz.length);
+        System.arraycopy(gz, 0, twice, gz.length, gz.length);
+        Files.write(tempDir.resolve("twice.tar.gz"), twice);
+
+        assertEquals(List.of(TGZ_ENTRY), names(JsArchive.tarEntries("twice.tar.gz")));
+        assertEquals(REAL_FILE_SHA256,
+                JsCrypto.sha256(JsArchive.tarEntry("twice.tar.gz", TGZ_ENTRY)));
+    }
+
+    /** The help text has to mention the one-shot usage (it is the case callers look for). */
+    @Test
+    void helpMentionsGzippedTarballs() {
+        String help = JsArchive.help();
+        assertTrue(help.contains(".tgz"), "help must name .tgz");
+        assertTrue(help.contains("1F 8B 08"), "help must state how gzip is detected: " + help);
+        assertTrue(help.contains("tarEntries(\"sources.tar.gz\")"),
+                "help must show the one-shot call: " + help);
+    }
+
     // ========================================================================
     // Security
     // ========================================================================
@@ -347,6 +518,326 @@ class JsArchiveTest {
     }
 
     // ========================================================================
+    // ZIP write access (gated by the mcp.js.archive.readonly system property)
+    // ========================================================================
+
+    @Test
+    void writeOperationsAreDisabledByDefault() throws IOException {
+        writeZip("ro.zip", List.<Object[]>of(new Object[]{"a.txt", bytes("A")}));
+        assertTrue(JsArchive.isReadOnly());
+        assertEquals(Boolean.TRUE, JsArchive.status().get("readonly"));
+
+        JsUserRuntimeException refused = assertThrows(JsUserRuntimeException.class,
+                () -> JsArchive.zipCreate("new.zip", List.of(), false, null, null));
+        assertTrue(refused.getMessage().contains("read-only"), refused.getMessage());
+        assertTrue(refused.getMessage().contains(JsArchive.PROP_READONLY), refused.getMessage());
+        assertThrows(JsUserRuntimeException.class,
+                () -> JsArchive.zipEntryWrite("ro.zip", "a.txt", bytes("B"), null, null));
+        assertThrows(JsUserRuntimeException.class, () -> JsArchive.zipEntryDelete("ro.zip", "a.txt"));
+
+        // Nothing was written, and reading is unaffected.
+        assertFalse(Files.exists(tempDir.resolve("new.zip"), LinkOption.NOFOLLOW_LINKS));
+        assertEquals(1, JsArchive.zipEntries("ro.zip").size());
+        assertArrayEquals(bytes("A"), JsArchive.zipEntry("ro.zip", "a.txt"));
+        assertTrue(JsArchive.help().contains("DISABLED"));
+    }
+
+    @Test
+    void statusReportsWriteStateAndLimits() {
+        Map<String, Object> closed = JsArchive.status();
+        assertEquals(Boolean.FALSE, closed.get("writeEnabled"));
+        assertEquals(JsArchive.PROP_READONLY, closed.get("property"));
+        assertNull(closed.get("propertyValue"));
+        assertEquals(Boolean.FALSE, closed.get("tarWriteSupported"));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> limits = (Map<String, Object>) closed.get("limits");
+        assertEquals(JsArchive.MAX_ENTRY_BYTES, limits.get("maxEntryBytes"));
+        assertEquals(JsArchive.MAX_ZIP_ENTRIES, limits.get("maxZipEntries"));
+        assertEquals(JsArchive.MAX_ARCHIVE_BYTES, limits.get("maxArchiveBytes"));
+
+        enableZipWrite();
+        Map<String, Object> open = JsArchive.status();
+        assertEquals(Boolean.TRUE, open.get("writeEnabled"));
+        assertEquals(Boolean.FALSE, open.get("readonly"));
+        assertEquals("false", open.get("propertyValue"));
+        assertFalse(JsArchive.isReadOnly());
+        assertTrue(JsArchive.help().contains("ENABLED"));
+    }
+
+    @Test
+    void zipCreateWritesReadableArchive() {
+        enableZipWrite();
+        Map<String, Object> result = JsArchive.zipCreate("out.zip", List.of(
+                JsArchive.ZipEntrySpec.of("dir/", new byte[0]),
+                JsArchive.ZipEntrySpec.ofText("dir/a.txt", "AA"),
+                JsArchive.ZipEntrySpec.of("b.txt", bytes("BBB"))), false, "made by test", null);
+
+        assertEquals("out.zip", result.get("path"));
+        assertEquals(Boolean.TRUE, result.get("created"));
+        assertEquals(Boolean.FALSE, result.get("replaced"));
+        assertEquals(3, result.get("entries"));
+        assertEquals(5L, result.get("uncompressedBytes"));
+        assertNotNull(result.get("archiveBytes"));
+        assertTrue(((List<?>) result.get("warnings")).isEmpty(), String.valueOf(result.get("warnings")));
+
+        List<Map<String, Object>> entries = JsArchive.zipEntries("out.zip");
+        assertEquals(List.of("b.txt", "dir/", "dir/a.txt"), names(entries));
+        assertEquals("DEFLATED", entries.get(0).get("method"));
+        assertEquals(3L, entries.get(0).get("size"));
+        assertEquals(Boolean.TRUE, entries.get(1).get("isDirectory"));
+        assertArrayEquals(bytes("AA"), JsArchive.zipEntry("out.zip", "dir/a.txt"));
+    }
+
+    @Test
+    void zipCreateWritesEmptyArchiveAndHonoursStoreMethodMtimeAndComments() throws IOException {
+        enableZipWrite();
+        Map<String, Object> empty = JsArchive.zipCreate("empty.zip", List.of(), false, null, null);
+        assertEquals(0, empty.get("entries"));
+        assertEquals(List.of(), JsArchive.zipEntries("empty.zip"));
+
+        JsArchive.zipCreate("stored.zip", List.of(new JsArchive.ZipEntrySpec("raw.bin", bytes("rawdata"),
+                "store", 1_600_000_000_000L, "entry comment")), false, "archive comment", 9);
+        try (ZipFile zf = new ZipFile(tempDir.resolve("stored.zip").toFile(), StandardCharsets.UTF_8)) {
+            ZipEntry entry = zf.getEntry("raw.bin");
+            assertNotNull(entry);
+            assertEquals(ZipEntry.STORED, entry.getMethod());
+            assertEquals(7L, entry.getSize());
+            assertEquals("entry comment", entry.getComment());
+            assertEquals(1_600_000_000L, entry.getLastModifiedTime().toMillis() / 1000);
+            assertEquals("archive comment", zf.getComment());
+        }
+        assertArrayEquals(bytes("rawdata"), JsArchive.zipEntry("stored.zip", "raw.bin"));
+    }
+
+    @Test
+    void zipCreateRefusesExistingFileWithoutOverwrite() {
+        enableZipWrite();
+        JsArchive.zipCreate("twice.zip", List.of(JsArchive.ZipEntrySpec.ofText("a.txt", "1")), false, null, null);
+        JsUserRuntimeException refused = assertThrows(JsUserRuntimeException.class,
+                () -> JsArchive.zipCreate("twice.zip", List.of(JsArchive.ZipEntrySpec.ofText("a.txt", "2")),
+                        false, null, null));
+        assertTrue(refused.getMessage().contains("File exists"), refused.getMessage());
+        assertArrayEquals(bytes("1"), JsArchive.zipEntry("twice.zip", "a.txt"));
+
+        Map<String, Object> replaced = JsArchive.zipCreate("twice.zip",
+                List.of(JsArchive.ZipEntrySpec.ofText("a.txt", "2")), true, null, null);
+        assertEquals(Boolean.TRUE, replaced.get("replaced"));
+        assertArrayEquals(bytes("2"), JsArchive.zipEntry("twice.zip", "a.txt"));
+    }
+
+    @Test
+    void zipCreateRejectsUnsafeNamesAndBadOptions() {
+        enableZipWrite();
+        assertThrows(IllegalArgumentException.class, () -> JsArchive.zipCreate("bad.zip",
+                List.of(JsArchive.ZipEntrySpec.ofText("../escape.txt", "x")), false, null, null));
+        assertThrows(IllegalArgumentException.class, () -> JsArchive.zipCreate("bad.zip",
+                List.of(JsArchive.ZipEntrySpec.ofText("/abs.txt", "x")), false, null, null));
+        assertThrows(IllegalArgumentException.class, () -> JsArchive.zipCreate("bad.zip",
+                List.of(JsArchive.ZipEntrySpec.ofText("back\\slash.txt", "x")), false, null, null));
+        assertThrows(IllegalArgumentException.class, () -> JsArchive.zipCreate("bad.zip",
+                List.of(JsArchive.ZipEntrySpec.ofText("C:/drive.txt", "x")), false, null, null));
+        assertThrows(IllegalArgumentException.class, () -> JsArchive.zipCreate("bad.zip",
+                List.of(JsArchive.ZipEntrySpec.ofText("a/../b.txt", "x")), false, null, null));
+        assertThrows(IllegalArgumentException.class, () -> JsArchive.zipCreate("bad.zip",
+                List.of(JsArchive.ZipEntrySpec.ofText("   ", "x")), false, null, null));
+        assertThrows(IllegalArgumentException.class, () -> JsArchive.zipCreate("bad.zip",
+                List.of(JsArchive.ZipEntrySpec.ofText("same.txt", "1"),
+                        JsArchive.ZipEntrySpec.ofText("same.txt", "2")), false, null, null));
+        assertThrows(IllegalArgumentException.class, () -> JsArchive.zipCreate("bad.zip",
+                List.of(new JsArchive.ZipEntrySpec("dir/", bytes("not empty"), null, null, null)),
+                false, null, null));
+        assertThrows(IllegalArgumentException.class, () -> JsArchive.zipCreate("bad.zip",
+                List.of(JsArchive.ZipEntrySpec.ofText("a.txt", "x")), false, null, 42));
+        assertFalse(Files.exists(tempDir.resolve("bad.zip"), LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
+    void writtenEntryNamesAlwaysCarryTheUtf8Flag() throws IOException {
+        enableZipWrite();
+        JsArchive.zipCreate("utf.zip", List.of(
+                JsArchive.ZipEntrySpec.ofText("plain.txt", "a"),
+                JsArchive.ZipEntrySpec.ofText("gr\u00fc\u00dfe/\u00e4.txt", "b")), false, null, null);
+        List<Integer> flags = localHeaderFlags(Files.readAllBytes(tempDir.resolve("utf.zip")));
+        assertEquals(2, flags.size());
+        for (int flag : flags) {
+            // JDK ZipCoder sets the EFS flag for every UTF-8 name, ASCII ones included.
+            assertEquals(0x800, flag & 0x800, "EFS flag missing: 0x" + Integer.toHexString(flag));
+        }
+        assertEquals(List.of("gr\u00fc\u00dfe/\u00e4.txt", "plain.txt"), names(JsArchive.zipEntries("utf.zip")));
+    }
+
+    @Test
+    void zipEntryWriteReplacesEntryAndKeepsEverythingElse() throws IOException {
+        enableZipWrite();
+        writeStructuredZip(tempDir.resolve("keep.zip"));
+
+        Map<String, Object> result = JsArchive.zipEntryWrite("keep.zip", "media/blob.bin",
+                bytes("new content"), null, null);
+        assertEquals("replaced", result.get("action"));
+        assertEquals("media/blob.bin", result.get("name"));
+        assertEquals(4, result.get("entriesBefore"));
+        assertEquals(4, result.get("entriesAfter"));
+        assertEquals(11, result.get("entryBytes"));
+        assertEquals("STORED", result.get("method")); // the replaced entry was STORED and stays STORED
+        assertEquals(crcHex("new content"), result.get("crc32"));
+
+        try (ZipFile zf = new ZipFile(tempDir.resolve("keep.zip").toFile(), StandardCharsets.UTF_8)) {
+            assertEquals(List.of("one.txt", "media/blob.bin", "dir/", "two.txt"), physicalNames(zf));
+            assertArrayEquals(bytes("one"), readEntry(zf, "one.txt"));
+            assertArrayEquals(bytes("two"), readEntry(zf, "two.txt"));
+            assertArrayEquals(bytes("new content"), readEntry(zf, "media/blob.bin"));
+            assertEquals(ZipEntry.STORED, zf.getEntry("media/blob.bin").getMethod());
+            assertEquals(ZipEntry.DEFLATED, zf.getEntry("one.txt").getMethod());
+            assertEquals(Instant.parse("2020-01-01T10:00:00Z").getEpochSecond(),
+                    zf.getEntry("one.txt").getLastModifiedTime().toMillis() / 1000);
+            assertTrue(zf.getEntry("dir/").isDirectory());
+            assertEquals("keep me", zf.getComment());
+        }
+    }
+
+    @Test
+    void zipEntryWriteAppendsNewEntries() throws IOException {
+        enableZipWrite();
+        writeZip("grow.zip", List.<Object[]>of(new Object[]{"a.txt", bytes("A")}));
+
+        Map<String, Object> added = JsArchive.zipEntryWrite("grow.zip", "new.txt", bytes("N"), null, null);
+        assertEquals("added", added.get("action"));
+        assertEquals(1, added.get("entriesBefore"));
+        assertEquals(2, added.get("entriesAfter"));
+        assertEquals("DEFLATED", added.get("method"));
+
+        JsArchive.zipEntryWrite("grow.zip", "raw/new.bin", bytes("R"), "store", 1_600_000_000_000L);
+        try (ZipFile zf = new ZipFile(tempDir.resolve("grow.zip").toFile(), StandardCharsets.UTF_8)) {
+            assertEquals(3, physicalNames(zf).size());
+            assertEquals(ZipEntry.STORED, zf.getEntry("raw/new.bin").getMethod());
+            assertEquals(1_600_000_000L, zf.getEntry("raw/new.bin").getLastModifiedTime().toMillis() / 1000);
+            assertArrayEquals(bytes("A"), readEntry(zf, "a.txt"));
+        }
+    }
+
+    @Test
+    void zipEntryWriteRefusesContentInDirectoryEntryAndMissingFile() throws IOException {
+        enableZipWrite();
+        writeZip("dirmix.zip", List.<Object[]>of(new Object[]{"dir/", new byte[0]}));
+        assertThrows(IllegalArgumentException.class,
+                () -> JsArchive.zipEntryWrite("dirmix.zip", "dir/", bytes("x"), null, null));
+        assertThrows(JsUserRuntimeException.class,
+                () -> JsArchive.zipEntryWrite("missing.zip", "a.txt", bytes("x"), null, null));
+        assertThrows(IllegalArgumentException.class,
+                () -> JsArchive.zipEntryWrite("dirmix.zip", "../out.txt", bytes("x"), null, null));
+    }
+
+    @Test
+    void zipEntryDeleteRemovesOneEntry() throws IOException {
+        enableZipWrite();
+        writeStructuredZip(tempDir.resolve("del.zip"));
+
+        Map<String, Object> result = JsArchive.zipEntryDelete("del.zip", "media/blob.bin");
+        assertEquals("deleted", result.get("action"));
+        assertEquals(1, result.get("deleted"));
+        assertEquals(4, result.get("entriesBefore"));
+        assertEquals(3, result.get("entriesAfter"));
+        try (ZipFile zf = new ZipFile(tempDir.resolve("del.zip").toFile(), StandardCharsets.UTF_8)) {
+            assertEquals(List.of("one.txt", "dir/", "two.txt"), physicalNames(zf));
+            assertNull(zf.getEntry("media/blob.bin"));
+            assertArrayEquals(bytes("two"), readEntry(zf, "two.txt"));
+        }
+    }
+
+    @Test
+    void zipEntryDeleteOfUnknownNameFailsWithSuggestionsAndKeepsArchive() throws IOException {
+        enableZipWrite();
+        writeZip("keepme.zip", List.<Object[]>of(new Object[]{"dir/a.txt", bytes("A")}));
+        byte[] before = Files.readAllBytes(tempDir.resolve("keepme.zip"));
+
+        JsUserRuntimeException e = assertThrows(JsUserRuntimeException.class,
+                () -> JsArchive.zipEntryDelete("keepme.zip", "dir/a.tx"));
+        assertTrue(e.getMessage().contains("not found"), e.getMessage());
+        assertTrue(e.getMessage().contains("dir/a.txt"), e.getMessage());
+        assertTrue(e.getMessage().contains("zipEntries"), e.getMessage());
+        assertArrayEquals(before, Files.readAllBytes(tempDir.resolve("keepme.zip")));
+        assertNoTempArchiveFiles();
+    }
+
+    @Test
+    void rewriteOfArchiveWithDuplicateNamesIsRefused() throws IOException {
+        enableZipWrite();
+        writeZip("dup.zip", List.<Object[]>of(
+                new Object[]{"a.txt", bytes("first")},
+                new Object[]{"b.txt", bytes("second")},
+                new Object[]{"c.txt", bytes("third")}));
+        duplicateEntryName(tempDir.resolve("dup.zip"), "b.txt", "a.txt");
+        byte[] before = Files.readAllBytes(tempDir.resolve("dup.zip"));
+
+        // The JDK resolves entry data by name, so two records named 'a.txt' cannot be told
+        // apart: copying them could silently write the wrong content.
+        JsUserRuntimeException e = assertThrows(JsUserRuntimeException.class,
+                () -> JsArchive.zipEntryWrite("dup.zip", "c.txt", bytes("x"), null, null));
+        assertTrue(e.getMessage().contains("duplicate entry names"), e.getMessage());
+        assertTrue(e.getMessage().contains("a.txt"), e.getMessage());
+        assertArrayEquals(before, Files.readAllBytes(tempDir.resolve("dup.zip")));
+        assertNoTempArchiveFiles();
+    }
+
+    @Test
+    void rewriteOfSignedArchiveWarnsAboutTheSignature() throws IOException {
+        enableZipWrite();
+        writeZip("signed.zip", List.<Object[]>of(
+                new Object[]{"META-INF/MANIFEST.MF", bytes("Manifest-Version: 1.0\n")},
+                new Object[]{"META-INF/TEST.SF", bytes("Name: a.txt\n")},
+                new Object[]{"META-INF/TEST.RSA", bytes("not-a-real-signature")},
+                new Object[]{"a.txt", bytes("A")}));
+
+        Map<String, Object> result = JsArchive.zipEntryWrite("signed.zip", "a.txt", bytes("B"), null, null);
+        String warnings = String.valueOf(result.get("warnings"));
+        assertTrue(warnings.contains("signed"), warnings);
+        assertTrue(warnings.contains("META-INF/TEST.SF"), warnings);
+        assertArrayEquals(bytes("B"), JsArchive.zipEntry("signed.zip", "a.txt"));
+    }
+
+    @Test
+    void failedRewriteLeavesOriginalUntouchedAndNoTempFile() throws IOException {
+        enableZipWrite();
+        byte[] broken = writeArchiveWithBrokenStoredSize();
+        Path zip = tempDir.resolve("corrupt.zip");
+
+        JsUserRuntimeException e = assertThrows(JsUserRuntimeException.class,
+                () -> JsArchive.zipEntryWrite("corrupt.zip", "other.txt", bytes("new"), null, null));
+        List<String> leftover = tempArchiveFiles();
+        assertTrue(e.getMessage().contains("corrupt archive"), e.getMessage());
+        assertEquals(List.of(), leftover, "temporary archive files left behind");
+        assertArrayEquals(broken, Files.readAllBytes(zip));
+    }
+
+    @Test
+    void rewrittenWorkbookStaysReadableByPoi() throws IOException {
+        enableZipWrite();
+        Path xlsx = tempDir.resolve("book.xlsx");
+        try (XSSFWorkbook workbook = new XSSFWorkbook(); OutputStream out = Files.newOutputStream(xlsx)) {
+            Sheet sheet = workbook.createSheet("Sheet1");
+            sheet.createRow(0).createCell(0).setCellValue("Sales");
+            sheet.createRow(1).createCell(0).setCellValue("Region");
+            workbook.write(out);
+        }
+        String part = "xl/sharedStrings.xml";
+        byte[] shared = JsArchive.zipEntry("book.xlsx", part);
+        assertNotNull(shared, "POI is expected to use a shared string table");
+
+        String xml = new String(shared, StandardCharsets.UTF_8);
+        assertTrue(xml.contains(">Sales<"), xml);
+        Map<String, Object> result = JsArchive.zipEntryWrite("book.xlsx", part,
+                xml.replace(">Sales<", ">Revenue<").getBytes(StandardCharsets.UTF_8), null, null);
+        assertEquals("replaced", result.get("action"));
+
+        try (XSSFWorkbook reopened = new XSSFWorkbook(Files.newInputStream(xlsx))) {
+            Cell first = reopened.getSheetAt(0).getRow(0).getCell(0);
+            Cell second = reopened.getSheetAt(0).getRow(1).getCell(0);
+            assertEquals("Revenue", first.getStringCellValue());
+            assertEquals("Region", second.getStringCellValue());
+        }
+    }
+
+    // ========================================================================
     // Test helpers
     // ========================================================================
 
@@ -371,6 +862,206 @@ class JsArchiveTest {
                 zos.closeEntry();
             }
         }
+    }
+
+    // ---- helpers for the ZIP write tests -----------------------------------
+
+    private static byte[] bytes(String text) {
+        return text.getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static List<String> names(List<Map<String, Object>> entries) {
+        return entries.stream().map(e -> (String) e.get("name")).toList();
+    }
+
+    /** Entry names in the order they appear in the central directory. */
+    private static List<String> physicalNames(ZipFile zf) {
+        return zf.stream().map(ZipEntry::getName).toList();
+    }
+
+    private static byte[] readEntry(ZipFile zf, String name) throws IOException {
+        ZipEntry entry = zf.getEntry(name);
+        assertNotNull(entry, "entry not found: " + name);
+        try (InputStream in = zf.getInputStream(entry)) {
+            return in.readAllBytes();
+        }
+    }
+
+    private static String crcHex(String text) {
+        CRC32 crc = new CRC32();
+        crc.update(text.getBytes(StandardCharsets.UTF_8));
+        return String.format("%08x", crc.getValue());
+    }
+
+    /**
+     * Writes an archive holding everything a rewrite has to preserve: entry order, mixed
+     * compression methods, a directory entry, an explicit modification time and a comment
+     * on the archive itself.
+     */
+    private static void writeStructuredZip(Path zip) throws IOException {
+        try (ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(zip), StandardCharsets.UTF_8)) {
+            ZipEntry one = new ZipEntry("one.txt");
+            one.setLastModifiedTime(FileTime.from(Instant.parse("2020-01-01T10:00:00Z")));
+            zos.putNextEntry(one);
+            zos.write(bytes("one"));
+            zos.closeEntry();
+
+            byte[] blob = bytes("binary-blob-content");
+            CRC32 crc = new CRC32();
+            crc.update(blob);
+            ZipEntry stored = new ZipEntry("media/blob.bin");
+            stored.setMethod(ZipEntry.STORED);
+            stored.setSize(blob.length);
+            stored.setCrc(crc.getValue());
+            zos.putNextEntry(stored);
+            zos.write(blob);
+            zos.closeEntry();
+
+            ZipEntry dir = new ZipEntry("dir/");
+            dir.setMethod(ZipEntry.STORED);
+            dir.setSize(0);
+            dir.setCrc(0);
+            zos.putNextEntry(dir);
+            zos.closeEntry();
+
+            zos.putNextEntry(new ZipEntry("two.txt"));
+            zos.write(bytes("two"));
+            zos.closeEntry();
+
+            zos.setComment("keep me");
+        }
+    }
+
+    /**
+     * Writes an archive whose central directory declares 5000 bytes for a 5 byte STORED
+     * entry, so copying that entry must fail. Returns the (broken but valid ZIP structure)
+     * file content for the "original unchanged" comparison.
+     */
+    private byte[] writeArchiveWithBrokenStoredSize() throws IOException {
+        Path zip = tempDir.resolve("corrupt.zip");
+        try (ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(zip), StandardCharsets.UTF_8)) {
+            byte[] raw = bytes("12345");
+            CRC32 crc = new CRC32();
+            crc.update(raw);
+            ZipEntry stored = new ZipEntry("blob.bin");
+            stored.setMethod(ZipEntry.STORED);
+            stored.setSize(raw.length);
+            stored.setCrc(crc.getValue());
+            zos.putNextEntry(stored);
+            zos.write(raw);
+            zos.closeEntry();
+
+            zos.putNextEntry(new ZipEntry("other.txt"));
+            zos.write(bytes("O"));
+            zos.closeEntry();
+        }
+        patchCentralDirectorySizes(zip, "blob.bin", 5000);
+        return Files.readAllBytes(zip);
+    }
+
+    /** Overwrites compressed and uncompressed size of a central directory entry. */
+    private static void patchCentralDirectorySizes(Path zip, String name, long size) throws IOException {
+        byte[] data = Files.readAllBytes(zip);
+        byte[] nameBytes = name.getBytes(StandardCharsets.UTF_8);
+        boolean patched = false;
+        for (int i = 0; i + 46 <= data.length; i++) {
+            if (isCentralHeader(data, i)) {
+                int nameLength = littleEndian16(data, i + 28);
+                if (nameLength == nameBytes.length && matches(data, i + 46, nameBytes)) {
+                    writeLittleEndian32(data, i + 20, size); // compressed size
+                    writeLittleEndian32(data, i + 24, size); // uncompressed size
+                    patched = true;
+                }
+            }
+        }
+        assertTrue(patched, "central directory entry not found: " + name);
+        Files.write(zip, data);
+    }
+
+    /**
+     * Renames an entry in both its local and its central header, producing an archive that
+     * holds the same name twice (something {@code ZipOutputStream} itself refuses to write).
+     */
+    private static void duplicateEntryName(Path zip, String from, String to) throws IOException {
+        byte[] data = Files.readAllBytes(zip);
+        byte[] fromBytes = from.getBytes(StandardCharsets.UTF_8);
+        byte[] toBytes = to.getBytes(StandardCharsets.UTF_8);
+        assertEquals(fromBytes.length, toBytes.length, "renaming requires equal name length");
+        int changed = 0;
+        for (int i = 0; i + 30 <= data.length; i++) {
+            int nameOffset;
+            int nameLength;
+            if (isLocalHeader(data, i)) {
+                nameOffset = i + 30;
+                nameLength = littleEndian16(data, i + 26);
+            } else if (isCentralHeader(data, i)) {
+                nameOffset = i + 46;
+                nameLength = littleEndian16(data, i + 28);
+            } else {
+                continue;
+            }
+            if (nameLength == fromBytes.length && matches(data, nameOffset, fromBytes)) {
+                System.arraycopy(toBytes, 0, data, nameOffset, toBytes.length);
+                changed++;
+            }
+        }
+        assertEquals(2, changed, "expected one local and one central header to be renamed");
+        Files.write(zip, data);
+    }
+
+    /** General purpose flags of all local file headers. */
+    private static List<Integer> localHeaderFlags(byte[] data) {
+        List<Integer> flags = new ArrayList<>();
+        for (int i = 0; i + 30 <= data.length; i++) {
+            if (isLocalHeader(data, i)) {
+                flags.add(littleEndian16(data, i + 6));
+            }
+        }
+        return flags;
+    }
+
+    private static boolean isLocalHeader(byte[] data, int i) {
+        return data[i] == 0x50 && data[i + 1] == 0x4b && data[i + 2] == 0x03 && data[i + 3] == 0x04;
+    }
+
+    private static boolean isCentralHeader(byte[] data, int i) {
+        return data[i] == 0x50 && data[i + 1] == 0x4b && data[i + 2] == 0x01 && data[i + 3] == 0x02;
+    }
+
+    private static boolean matches(byte[] data, int offset, byte[] expected) {
+        if (offset + expected.length > data.length) {
+            return false;
+        }
+        for (int i = 0; i < expected.length; i++) {
+            if (data[offset + i] != expected[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static int littleEndian16(byte[] data, int offset) {
+        return (data[offset] & 0xFF) | ((data[offset + 1] & 0xFF) << 8);
+    }
+
+    private static void writeLittleEndian32(byte[] data, int offset, long value) {
+        data[offset] = (byte) (value & 0xFF);
+        data[offset + 1] = (byte) ((value >> 8) & 0xFF);
+        data[offset + 2] = (byte) ((value >> 16) & 0xFF);
+        data[offset + 3] = (byte) ((value >> 24) & 0xFF);
+    }
+
+    private List<String> tempArchiveFiles() throws IOException {
+        try (var stream = Files.list(tempDir)) {
+            return stream.map(p -> p.getFileName().toString())
+                    .filter(n -> n.endsWith(".ziptmp"))
+                    .sorted()
+                    .toList();
+        }
+    }
+
+    private void assertNoTempArchiveFiles() throws IOException {
+        assertEquals(List.of(), tempArchiveFiles(), "temporary archive files left behind");
     }
 
     private void writeTar(String name, TarWriter writer) throws IOException {
