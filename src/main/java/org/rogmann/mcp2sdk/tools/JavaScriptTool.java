@@ -25,6 +25,7 @@ import org.rogmann.mcp2sdk.js.JsMcpProxyBridge;
 import org.rogmann.mcp2sdk.js.JsModuleInterface;
 import org.rogmann.mcp2sdk.js.JsSearchBridge;
 import org.rogmann.mcp2sdk.js.JsSQLiteBridge;
+import org.rogmann.mcp2sdk.xml.JsXmlBridge;
 import org.rogmann.mcp2sdk.poi.DocxToolBoxJsBridge;
 import org.rogmann.mcp2sdk.poi.PoiToolBoxJsBridge;
 import org.rogmann.mcp2sdk.poi.PptxToolBoxJsBridge;
@@ -163,6 +164,7 @@ public class JavaScriptTool {
         // Uses the same path rules as `fs` and the same archive formats as `archive`.
         modules.put("search", new JsSearchBridge());
         modules.put("javap", new JsJavapBridge());
+        modules.put("xml", new JsXmlBridge());
         modules.put("poi", new PoiToolBoxJsBridge());
         modules.put("docx", new DocxToolBoxJsBridge());
         modules.put("pptx", new PptxToolBoxJsBridge());
