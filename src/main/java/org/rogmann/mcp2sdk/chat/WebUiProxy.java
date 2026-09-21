@@ -89,16 +89,21 @@ public class WebUiProxy {
      * @param promptTokens    number of prompt tokens sent
      * @param completionTokens number of completion tokens generated
      * @param totalTokens     total tokens (prompt + completion)
-     * @param cachedTokens    number of cached/prompt tokens reused (0 if not reported)
+     * @param cachedTokens    number of cached/prompt tokens reused. The value is only meaningful
+     *                        when {@code cachedTokensKnown} is {@code true}; otherwise it is
+     *                        reported as {@code 0} for compatibility but does not prove that no
+     *                        tokens were cached
+     * @param cachedTokensKnown {@code true} if cached-token usage was explicitly reported by the
+     *                        server or sampled by the proxy; {@code false} if it is unknown
      * @param ppUncachedTPS   prompt processing tokens per second for the tokens NOT served from
-     *                        the KV cache (0 if no uncached tokens or no timing data). Only adds
-     *                        information beyond {@code ppTPS} in the llama.cpp path, where
-     *                        {@code ppTPS} is the server-reported rate for all prompt tokens; in
-     *                        the vLLM-metrics and streaming paths it equals {@code ppTPS}
-     * @param ppTPS           prompt processing tokens per second. In the vLLM-metrics and streaming
-     *                        paths this is cache-corrected (based on the tokens that actually had
-     *                        to be computed); in the llama.cpp path it is the server-reported
-     *                        {@code prompt_per_second} (all prompt tokens)
+     *                        the KV cache. This is only computed when {@code cachedTokensKnown}
+     *                        is {@code true}; otherwise it is {@code 0} to avoid presenting a raw
+     *                        prompt rate as an uncached rate
+     * @param ppTPS           prompt processing tokens per second. In the llama.cpp path this is
+     *                        the server-reported {@code prompt_per_second}; in the vLLM-metrics
+     *                        and wall-clock paths it is cache-corrected only if
+     *                        {@code cachedTokensKnown} is {@code true}, otherwise it is a raw
+     *                        total-prompt-token estimate
      * @param tgTPS           token generation tokens per second
      * @param estimated       {@code true} if any of the rates/timings had to be estimated
      *                        (wall-clock, heuristics or synthesized fallbacks) instead of being
@@ -107,11 +112,16 @@ public class WebUiProxy {
      *                        answer content), from request send to first SSE delta. Wall-clock
      *                        and therefore an upper bound of the server TTFT; {@code 0} when not
      *                        measurable (e.g. non-streaming)
+     * @param usageWarnings   machine-readable warnings about the server-reported usage object.
+     *                        The raw usage object is written unchanged; warnings only mark
+     *                        inconsistencies or unsupported/ambiguous details
      */
     public record LlmUsage(LocalDateTime tsStart, long millisPP, long millisTG, String model,
                            long promptTokens, long completionTokens, long totalTokens,
-                           long cachedTokens, float ppUncachedTPS, float ppTPS, float tgTPS,
-                           boolean estimated, long ttftClientMs) {}
+                           long cachedTokens, boolean cachedTokensKnown,
+                           float ppUncachedTPS, float ppTPS, float tgTPS,
+                           boolean estimated, long ttftClientMs,
+                           List<String> usageWarnings) {}
 
     /** Collected usage statistics for all LLM requests */
     private final List<LlmUsage> usages = Collections.synchronizedList(new ArrayList<>());
@@ -1371,8 +1381,11 @@ public class WebUiProxy {
             }
 
             // --- USAGE STATISTICS ---
-            recordUsageStatistics(tsStart, firstContentTime.get(), sseDataLines, sampleMetrics,
-                    metricsBefore, firstOutputNano, tsStartNano);
+            // Capture the monotonic stream end before any post-processing/metrics sampling, so
+            // the generated-token span (TG) is not inflated by cache-metric polling or JSONL work.
+            final long tsEndNano = System.nanoTime();
+            recordUsageStatistics(tsStart, sseDataLines, sampleMetrics,
+                    metricsBefore, firstOutputNano, tsStartNano, tsEndNano);
 
             // Diagnostic: report how much of the streamed output was reasoning vs answer.
             // Confirms whether the backend actually engaged thinking mode.
@@ -1482,19 +1495,28 @@ public class WebUiProxy {
      * Parses the collected SSE data lines for usage/timing information,
      * computes statistics, logs them, and optionally writes to a JSONL file.
      *
+     * <p>The fallback PP/TG split uses the first <em>output</em> token (reasoning or answer),
+     * not the first visible answer-content token. For reasoning models the first answer content
+     * can arrive only after a long chain-of-thought, which would otherwise be counted as prompt
+     * processing and removed from token generation.</p>
+     *
+     * <p>The raw server {@code usage} node is preserved unchanged. Cache availability is exposed
+     * via {@code cachedTokensKnown}, and server-side usage inconsistencies are emitted as
+     * {@code usageWarnings} outside that raw node.</p>
+     *
      * @param tsStart         timestamp when the request started
-     * @param firstContentTime timestamp of the first content token (streaming), or null if not available
      * @param sseDataLines    collected SSE data line JSON strings
      * @param sampleMetrics   whether the upstream vLLM cache metrics were sampled
      * @param metricsBefore   cached-token counter before the request (or -1)
      * @param firstOutputNano {@link System#nanoTime()} of the first output token (reasoning/answer),
      *                        or null/0 if not measurable
      * @param tsStartNano     {@link System#nanoTime()} of the request start
+     * @param tsEndNano       {@link System#nanoTime()} of the stream end, or 0 if unknown
      */
-    private void recordUsageStatistics(LocalDateTime tsStart, LocalDateTime firstContentTime,
+    private void recordUsageStatistics(LocalDateTime tsStart,
                                        List<String> sseDataLines, boolean sampleMetrics,
                                        long metricsBefore, AtomicLong firstOutputNano,
-                                       long tsStartNano) {
+                                       long tsStartNano, long tsEndNano) {
         if (sseDataLines.isEmpty()) {
             LOG.info("No SSE data lines collected for usage statistics.");
             return;
@@ -1525,29 +1547,112 @@ public class WebUiProxy {
             // precedence over the wall-clock/rate heuristics used for other backends.
             JsonNode metricsNode = dataNode.get("metrics");
 
+            if (usageNode == null || !usageNode.isObject()) {
+                LOG.warn("Skipping usage statistics: final usage field is missing or not an object. tsStart={}", tsStart);
+                return;
+            }
+
             String model = dataNode.has("model") ? dataNode.get("model").asString() : getModelName();
 
             long promptTokens = usageNode.has("prompt_tokens") ? usageNode.get("prompt_tokens").asLong() : 0;
             long completionTokens = usageNode.has("completion_tokens") ? usageNode.get("completion_tokens").asLong() : 0;
             long totalTokens = usageNode.has("total_tokens") ? usageNode.get("total_tokens").asLong() : 0;
-            long cachedTokens = 0;
-            if (usageNode.has("prompt_tokens_details") && usageNode.get("prompt_tokens_details").has("cached_tokens")) {
-                cachedTokens = usageNode.get("prompt_tokens_details").get("cached_tokens").asLong();
-            }
 
-            // If metric sampling is enabled, the upstream vLLM /metrics counter delta is a reliable
-            // per-request cache indicator and also covers backends/streams that do not (or not yet)
-            // report prompt_tokens_details in the usage object.
-            if (sampleMetrics && metricsBefore >= 0) {
-                long metricsAfter = readVllmCachedTokensMetric();
-                if (metricsAfter >= 0) {
-                    cachedTokens = metricsAfter - metricsBefore;
+            // Warnings are written outside the raw server "usage" node. The raw usage block stays
+            // byte-for-byte semantically unchanged; these markers only flag upstream inconsistencies.
+            List<String> usageWarnings = new ArrayList<>();
+
+            long cachedTokens = 0;
+            boolean cachedTokensKnown = false;
+            if (usageNode.has("prompt_tokens_details") && usageNode.get("prompt_tokens_details").has("cached_tokens")) {
+                JsonNode cachedTokensNode = usageNode.get("prompt_tokens_details").get("cached_tokens");
+                if (cachedTokensNode.isNumber()) {
+                    long reportedCachedTokens = cachedTokensNode.asLong();
+                    if (reportedCachedTokens < 0) {
+                        usageWarnings.add("negative_cached_tokens");
+                    } else {
+                        cachedTokens = reportedCachedTokens;
+                        cachedTokensKnown = true;
+                    }
+                } else {
+                    usageWarnings.add("cached_tokens_not_numeric");
                 }
             }
 
+            // If metric sampling is enabled, the upstream vLLM /metrics counter delta is a fallback
+            // cache indicator for streams that do not (or not yet) report prompt_tokens_details.
+            // Explicit per-request usage details take precedence over the global /metrics counter.
+            if (!cachedTokensKnown && sampleMetrics && metricsBefore >= 0) {
+                long metricsAfter = readVllmCachedTokensMetric();
+                if (metricsAfter >= 0) {
+                    long sampledCachedTokens = metricsAfter - metricsBefore;
+                    if (sampledCachedTokens >= 0) {
+                        cachedTokens = sampledCachedTokens;
+                        cachedTokensKnown = true;
+                    } else {
+                        usageWarnings.add("negative_sampled_cached_token_delta");
+                    }
+                }
+            }
+
+            if (promptTokens < 0) {
+                usageWarnings.add("negative_prompt_tokens");
+            }
+            if (completionTokens < 0) {
+                usageWarnings.add("negative_completion_tokens");
+            }
+            if (totalTokens < 0) {
+                usageWarnings.add("negative_total_tokens");
+            }
+
+            if (!usageNode.has("prompt_tokens")) {
+                usageWarnings.add("missing_prompt_tokens");
+            }
+            if (!usageNode.has("completion_tokens")) {
+                usageWarnings.add("missing_completion_tokens");
+            }
+            if (!usageNode.has("total_tokens")) {
+                usageWarnings.add("missing_total_tokens");
+            } else if (promptTokens >= 0 && completionTokens >= 0 && totalTokens >= 0
+                    && totalTokens != promptTokens + completionTokens) {
+                usageWarnings.add("total_tokens_mismatch");
+            }
+
+            if (cachedTokensKnown && cachedTokens < 0) {
+                usageWarnings.add("negative_cached_tokens");
+            }
+            if (cachedTokensKnown && promptTokens >= 0 && cachedTokens > promptTokens) {
+                usageWarnings.add("cached_tokens_gt_prompt_tokens");
+            }
+
+            JsonNode completionDetails = usageNode.get("completion_tokens_details");
+            if (completionDetails != null && completionDetails.isObject()
+                    && completionDetails.has("reasoning_tokens")) {
+                JsonNode reasoningTokensNode = completionDetails.get("reasoning_tokens");
+                if (reasoningTokensNode.isNumber()) {
+                    long reasoningTokens = reasoningTokensNode.asLong();
+                    if (reasoningTokens < 0) {
+                        usageWarnings.add("negative_reasoning_tokens");
+                    }
+                    if (completionTokens >= 0 && reasoningTokens > completionTokens) {
+                        usageWarnings.add("reasoning_tokens_gt_completion_tokens");
+                    }
+                } else {
+                    usageWarnings.add("reasoning_tokens_not_numeric");
+                }
+            }
+
+            if (!usageWarnings.isEmpty()) {
+                LOG.warn("Server usage inconsistencies: warnings={}, promptTokens={}, completionTokens={}, "
+                                + "totalTokens={}, cachedTokens={}, cachedTokensKnown={}, tsStart={}",
+                        usageWarnings, promptTokens, completionTokens, totalTokens, cachedTokens,
+                        cachedTokensKnown, tsStart);
+            }
+
             // Client-side time-to-first-output-token (wall-clock, upper bound of the server
-            // TTFT). 0 when not measurable (e.g. non-streaming without a streamed SSE feed).
-            long ttftClientMs = (firstOutputNano != null && firstOutputNano.get() > 0L)
+            // TTFT). This includes reasoning output, not only visible answer content. 0 when not
+            // measurable (e.g. non-streaming without a streamed SSE feed).
+            long ttftClientMs = (firstOutputNano != null && firstOutputNano.get() > 0L && tsStartNano > 0L)
                     ? millisElapsed(tsStartNano, firstOutputNano.get()) : 0L;
 
             long millisPP;
@@ -1570,17 +1675,18 @@ public class WebUiProxy {
                 double serverTgTPS = timingsNode.has("predicted_per_second") ? timingsNode.get("predicted_per_second").asDouble() : 0;
 
                 // Server-reported rates: llama.cpp's prompt_per_second is based on ALL prompt
-                // tokens (uncached share). ppUncachedTPS below gives the cache-corrected counterpart.
+                // tokens (uncached share). ppUncachedTPS below is only meaningful if cached-token
+                // usage is actually known.
                 ppTPS = (float) serverPpTPS;
                 tgTPS = (float) serverTgTPS;
                 estimated = false;
 
                 LOG.info("Usage stats (llama.cpp): promptTokens={}, completionTokens={}, totalTokens={}, cachedTokens={}, "
-                                + "millisPP={}, millisTG={}, ppTPS={} (server), ppUncachedTPS={} (cache-corrected), "
-                                + "tgTPS={} (server), ttftClientMs={}, estimated={}",
-                        promptTokens, completionTokens, totalTokens, cachedTokens,
+                                + "cachedTokensKnown={}, millisPP={}, millisTG={}, ppTPS={} (server), "
+                                + "ppUncachedTPS={} (cache-corrected if known), tgTPS={} (server), ttftClientMs={}, estimated={}",
+                        promptTokens, completionTokens, totalTokens, cachedTokens, cachedTokensKnown,
                         millisPP, millisTG, ppTPS,
-                        computePpUncachedTPS(millisPP, promptTokens, cachedTokens),
+                        cachedTokensKnown ? computePpUncachedTPS(millisPP, promptTokens, cachedTokens) : 0f,
                         tgTPS, ttftClientMs, estimated);
 
             } else if (metricsNode != null && readMetricsTtftMs(metricsNode) > 0) {
@@ -1592,13 +1698,15 @@ public class WebUiProxy {
                 millisPP = Math.round(readMetricsTtftMs(metricsNode));
                 millisTG = Math.round(readMetricsGenMs(metricsNode, completionTokens));
 
-                // Prompt rate: only the tokens that actually had to be computed count. With a
-                // large cached share a naive promptTokens/time split is inflated by the "free"
-                // KV-cache hits, so correct for the cached tokens that
-                // --enable-prompt-tokens-details reports.
-                long uncachedTokens = Math.max(0, promptTokens - cachedTokens);
-                ppTPS = (millisPP > 0 && uncachedTokens > 0)
-                        ? (uncachedTokens * 1000f / millisPP) : 0;
+                // Prompt rate: if cached-token usage is known, only the tokens that actually had
+                // to be computed count. If it is unknown, do not present the raw prompt rate as a
+                // cache-corrected uncached rate; keep it as a total-prompt estimate and expose
+                // cachedTokensKnown=false to consumers.
+                long ppRateTokens = cachedTokensKnown
+                        ? Math.max(0, promptTokens - cachedTokens)
+                        : Math.max(0, promptTokens);
+                ppTPS = (millisPP > 0 && ppRateTokens > 0)
+                        ? (ppRateTokens * 1000f / millisPP) : 0;
 
                 double serverTgTPS = metricsNode.has("tokens_per_second")
                         ? metricsNode.get("tokens_per_second").asDouble() : 0;
@@ -1614,38 +1722,45 @@ public class WebUiProxy {
                 long ttftServerMs = millisPP;
                 long ttftDeltaMs = (ttftClientMs > 0) ? (ttftClientMs - ttftServerMs) : 0;
                 LOG.info("Usage stats (vLLM metrics): promptTokens={}, completionTokens={}, totalTokens={}, cachedTokens={}, "
-                                + "millisPP={}, millisTG={}, ppTPS={} (cache-corrected), tgTPS={}, "
-                                + "ttftServerMs={}, ttftClientMs={}, ttftDeltaMs={}, estimated={}",
-                        promptTokens, completionTokens, totalTokens, cachedTokens,
+                                + "cachedTokensKnown={}, millisPP={}, millisTG={}, ppTPS={} (cache-corrected if known), "
+                                + "tgTPS={}, ttftServerMs={}, ttftClientMs={}, ttftDeltaMs={}, estimated={}",
+                        promptTokens, completionTokens, totalTokens, cachedTokens, cachedTokensKnown,
                         millisPP, millisTG, ppTPS, tgTPS,
                         ttftServerMs, ttftClientMs, ttftDeltaMs, estimated);
 
-            } else if (firstContentTime != null) {
-                // Streaming with vLLM (no timings, but we have firstContentTime from the stream).
-                // This is a wall-clock estimate, not server-authoritative, therefore flagged.
-                LocalDateTime tsNow = LocalDateTime.now();
-                millisPP = Duration.between(tsStart, firstContentTime).toMillis();
-                millisTG = Duration.between(firstContentTime, tsNow).toMillis();
+            } else if (firstOutputNano != null && firstOutputNano.get() > 0L && tsStartNano > 0L) {
+                // No server-side timings/metrics, but the proxy saw the first output token.
+                // Use that first output token as the PP/TG boundary: for reasoning models it is
+                // the first reasoning delta, while the first visible answer content may arrive much
+                // later. Using firstContentTime here would count thinking time as prompt processing
+                // and leave almost no time in TG for the reasoning tokens.
+                // This is still only a client-side wall-clock estimate, therefore flagged.
+                long firstOutputTokenNano = firstOutputNano.get();
+                long streamEndNano = tsEndNano > 0L ? tsEndNano : System.nanoTime();
+                millisPP = millisElapsed(tsStartNano, firstOutputTokenNano);
+                millisTG = millisElapsed(firstOutputTokenNano, streamEndNano);
 
-                long uncachedTokens = Math.max(0, promptTokens - cachedTokens);
-                float computedPpTPS = (millisPP > 0 && uncachedTokens > 0) ? (uncachedTokens * 1000f / millisPP) : 0;
+                long ppRateTokens = cachedTokensKnown
+                        ? Math.max(0, promptTokens - cachedTokens)
+                        : Math.max(0, promptTokens);
+                float computedPpTPS = (millisPP > 0 && ppRateTokens > 0) ? (ppRateTokens * 1000f / millisPP) : 0;
                 float computedTgTPS = (millisTG > 0 && completionTokens > 0) ? (completionTokens * 1000f / millisTG) : 0;
                 ppTPS = computedPpTPS;
                 tgTPS = computedTgTPS;
                 estimated = true;
 
-                LOG.info("Usage stats (vLLM streaming): promptTokens={}, completionTokens={}, totalTokens={}, cachedTokens={}, "
-                                + "millisPP={}, millisTG={}, ppTPS={} (cache-corrected), tgTPS={}, "
-                                + "ttftClientMs={}, estimated={}",
-                        promptTokens, completionTokens, totalTokens, cachedTokens,
+                LOG.info("Usage stats (client wall-clock, first output token): promptTokens={}, completionTokens={}, "
+                                + "totalTokens={}, cachedTokens={}, cachedTokensKnown={}, millisPP={}, millisTG={}, "
+                                + "ppTPS={}, tgTPS={}, ttftClientMs={}, estimated={}",
+                        promptTokens, completionTokens, totalTokens, cachedTokens, cachedTokensKnown,
                         millisPP, millisTG, ppTPS, tgTPS, ttftClientMs, estimated);
 
             } else {
-                // Non-streaming (buffered) without server-side timing (no timings and no usable
-                // vLLM metrics): there is no reliable way to split the request into prompt- and
-                // generation-time. The former fixed ppTPS = 5 * tgTPS heuristic fabricated
-                // misleading values and has been removed; the pp/tg rates are reported as unknown
-                // (0) and the record is flagged as estimated.
+                // No server-side timing and no client-measured first output token (e.g. buffered
+                // non-streaming, or a stream that did not expose a recognizable output delta).
+                // There is no reliable way to split the request into prompt- and generation-time.
+                // The former fixed ppTPS = 5 * tgTPS heuristic fabricated misleading values and has
+                // been removed; the pp/tg rates are reported as unknown (0) and flagged estimated.
                 long totalMillis = Duration.between(tsStart, LocalDateTime.now()).toMillis();
                 millisPP = 0;
                 millisTG = 0;
@@ -1653,21 +1768,24 @@ public class WebUiProxy {
                 tgTPS = 0;
                 estimated = true;
 
-                LOG.info("Usage stats (non-streaming, no server metrics): promptTokens={}, completionTokens={}, totalTokens={}, "
-                                + "cachedTokens={}, totalMillis={}, millisPP={}, millisTG={}, ppTPS={}, tgTPS={}, estimated={}",
-                        promptTokens, completionTokens, totalTokens,
-                        cachedTokens, totalMillis, millisPP, millisTG,
-                        ppTPS, tgTPS, estimated);
+                LOG.info("Usage stats (no server metrics, no client output token): promptTokens={}, "
+                                + "completionTokens={}, totalTokens={}, cachedTokens={}, cachedTokensKnown={}, "
+                                + "totalMillis={}, millisPP={}, millisTG={}, ppTPS={}, tgTPS={}, "
+                                + "ttftClientMs={}, estimated={}",
+                        promptTokens, completionTokens, totalTokens, cachedTokens, cachedTokensKnown,
+                        totalMillis, millisPP, millisTG, ppTPS, tgTPS, ttftClientMs, estimated);
             }
 
-            // Effective prompt-processing rate for the tokens that actually had to be computed
-            // (i.e. not reused from the KV cache). With a large cached share the raw ppTPS is
-            // inflated by the "free" cache hits, so this is the meaningful throughput figure.
-            float ppUncachedTPS = computePpUncachedTPS(millisPP, promptTokens, cachedTokens);
+            // Effective prompt-processing rate for the tokens that actually had to be computed.
+            // This is only valid when cached-token usage is known; otherwise reporting a raw
+            // prompt rate as ppUncachedTPS would silently assume cachedTokens=0.
+            float ppUncachedTPS = cachedTokensKnown
+                    ? computePpUncachedTPS(millisPP, promptTokens, cachedTokens)
+                    : 0f;
 
             LlmUsage usage = new LlmUsage(tsStart, millisPP, millisTG, model,
-                    promptTokens, completionTokens, totalTokens, cachedTokens,
-                    ppUncachedTPS, ppTPS, tgTPS, estimated, ttftClientMs);
+                    promptTokens, completionTokens, totalTokens, cachedTokens, cachedTokensKnown,
+                    ppUncachedTPS, ppTPS, tgTPS, estimated, ttftClientMs, List.copyOf(usageWarnings));
             usages.add(usage);
 
             // Write to JSONL file if configured
@@ -1745,11 +1863,23 @@ public class WebUiProxy {
             record.put("completionTokens", usage.completionTokens());
             record.put("totalTokens", usage.totalTokens());
             record.put("cachedTokens", usage.cachedTokens());
+            record.put("cachedTokensKnown", usage.cachedTokensKnown());
             record.put("ppUncachedTPS", usage.ppUncachedTPS());
             record.put("ppTPS", usage.ppTPS());
             record.put("tgTPS", usage.tgTPS());
             record.put("estimated", usage.estimated());
             record.put("ttftClientMs", usage.ttftClientMs());
+
+            ArrayNode warningsNode = jsonMapper.createArrayNode();
+            if (usage.usageWarnings() != null) {
+                for (String warning : usage.usageWarnings()) {
+                    if (warning != null && !warning.isBlank()) {
+                        warningsNode.add(warning);
+                    }
+                }
+            }
+            record.set("usageWarnings", warningsNode);
+
             record.set("usage", usageNode);
 
             String jsonLine = jsonMapper.writeValueAsString(record) + "\n";
@@ -1783,13 +1913,25 @@ public class WebUiProxy {
         long totalPromptTokens = usages.stream().mapToLong(LlmUsage::promptTokens).sum();
         long totalCompletionTokens = usages.stream().mapToLong(LlmUsage::completionTokens).sum();
         long totalTokens = usages.stream().mapToLong(LlmUsage::totalTokens).sum();
-        long totalCachedTokens = usages.stream().mapToLong(LlmUsage::cachedTokens).sum();
-        // #TokenInUncached reflects the prompt tokens that actually had to be computed
-        // (i.e. not served from the KV/prefix cache).
-        long totalUncachedTokens = Math.max(0, totalPromptTokens - totalCachedTokens);
-        LOG.info("Shutdown: LLM usage statistics - #Requests={}, #TokenIn={}, #TokenInCached={}, #TokenInUncached={}, #TokenOut={}, #TotalTokens={}",
-                requestCount, totalPromptTokens, totalCachedTokens, totalUncachedTokens,
-                totalCompletionTokens, totalTokens);
+
+        // Cache-corrected prompt totals must only include requests where cached-token usage was
+        // actually reported/sampled. Requests with cachedTokensKnown=false are reported separately;
+        // otherwise unknown cached tokens would silently be treated as uncached tokens.
+        long totalPromptTokensWithCacheInfo = usages.stream()
+                .filter(LlmUsage::cachedTokensKnown)
+                .mapToLong(LlmUsage::promptTokens)
+                .sum();
+        long totalCachedTokensKnown = usages.stream()
+                .filter(LlmUsage::cachedTokensKnown)
+                .mapToLong(LlmUsage::cachedTokens)
+                .sum();
+        long totalUncachedTokensKnownCache = Math.max(0, totalPromptTokensWithCacheInfo - totalCachedTokensKnown);
+        long totalPromptTokensCacheUnknown = Math.max(0, totalPromptTokens - totalPromptTokensWithCacheInfo);
+
+        LOG.info("Shutdown: LLM usage statistics - #Requests={}, #TokenIn={}, #TokenInCachedKnown={}, "
+                        + "#TokenInUncachedKnownCache={}, #TokenInCacheUnknown={}, #TokenOut={}, #TotalTokens={}",
+                requestCount, totalPromptTokens, totalCachedTokensKnown, totalUncachedTokensKnownCache,
+                totalPromptTokensCacheUnknown, totalCompletionTokens, totalTokens);
     }
 
     /**
@@ -1878,8 +2020,8 @@ public class WebUiProxy {
                 dataLines.add(jsonMapper.writeValueAsString(responseNode));
                 // Non-streaming responses carry prompt_tokens_details.cached_tokens natively,
                 // so no extra /metrics sampling is needed here. No per-chunk timing is available,
-                // hence the firstOutputNano/tsStartNano are left null/0 (ttftClientMs = 0).
-                recordUsageStatistics(tsStart, null, dataLines, false, -1, null, 0L);
+                // hence the firstOutputNano/tsStartNano/tsEndNano are left null/0 (ttftClientMs=0).
+                recordUsageStatistics(tsStart, dataLines, false, -1, null, 0L, 0L);
             }
         } catch (RuntimeException e) {
             LOG.warn("Could not parse usage from non-streaming response: {}", e.getMessage());
@@ -1909,8 +2051,9 @@ public class WebUiProxy {
     /**
      * Helper to copy InputStream to OutputStream with buffering.
      * Ensures data is flushed periodically for streaming.
-     * Also collects SSE data lines for usage statistics extraction
-     * and records the timestamp of the first content token.
+     * Also collects SSE data lines for usage statistics extraction and records the timestamp of
+     * the first output token (reasoning or answer). The first visible answer-content token is
+     * recorded separately as a diagnostic; the fallback PP/TG split uses the first output token.
      *
      * <p>When {@code rewriteFlashReasoning} is {@code true} (vLLM/DeepSeek backend), each SSE
      * {@code data:} JSON is transformed on the fly: a vLLM {@code reasoning} field (in
@@ -1929,9 +2072,11 @@ public class WebUiProxy {
      * @param in               source input stream
      * @param out              target output stream
      * @param sseDataLines     collector for SSE data line JSON strings (may be null)
-     * @param firstContentTime atomic reference to store the timestamp of the first answer-content token (may be null)
+     * @param firstContentTime atomic reference to store the timestamp of the first answer-content token;
+     *                         kept for diagnostics and not used as the fallback PP/TG boundary (may be null)
      * @param firstOutputNano  atomic long to store the {@link System#nanoTime()} of the first output
-     *                         token (reasoning or answer content), used for the client TTFT (may be null)
+     *                         token (reasoning or answer content), used for the client TTFT and the
+     *                         fallback PP/TG split (may be null)
      * @param rewriteFlashReasoning whether to apply the vLLM-specific SSE enrichment (reasoning rewrite + live timings)
      * @param tsStartNano      {@link System#nanoTime()} of the request start, reference for the prompt rate
      * @throws IOException if an I/O error occurs
@@ -1952,8 +2097,9 @@ public class WebUiProxy {
         while ((bytesRead = in.read(buffer)) != -1) {
             String chunk = new String(buffer, 0, bytesRead, StandardCharsets.UTF_8);
 
-            // Collect SSE data lines for usage extraction
-            // and detect the first output/content token for the PP/TG split and client TTFT.
+            // Collect SSE data lines for usage extraction and detect the first output token
+            // (reasoning or answer) for the client TTFT / fallback PP/TG split. The answer-content
+            // token is also recorded for diagnostics only.
             if (sseDataLines != null || firstContentTime != null || firstOutputNano != null
                     || rewriteFlashReasoning) {
                 // Prepend any pending data from a previous partial line
@@ -2038,9 +2184,10 @@ public class WebUiProxy {
      *
      * <p>The first <em>output</em> token is the first delta that carries either reasoning
      * ({@code reasoning}/{@code reasoning_content}) or answer content — it is the client-side
-     * counterpart of the server {@code time_to_first_token}. The first <em>answer-content</em>
-     * token is the first delta carrying a non-null {@code content}, used for the PP/TG split.
-     * For a reasoning model the output token therefore arrives before the answer-content token.
+     * counterpart of the server {@code time_to_first_token} and the fallback PP/TG boundary.
+     * The first <em>answer-content</em> token is the first delta carrying a non-null {@code content};
+     * it is kept separately for diagnostics only. For a reasoning model the output token therefore
+     * arrives before the answer-content token.
      * Values that are present but {@code null} (OpenAI streams often carry {@code "content": null}
      * while thinking) do not count.</p>
      *
