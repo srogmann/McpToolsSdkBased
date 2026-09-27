@@ -8,6 +8,7 @@ import io.modelcontextprotocol.server.transport.HttpServletStreamableServerTrans
 import io.modelcontextprotocol.server.transport.HttpServletSseServerTransportProvider;
 import io.modelcontextprotocol.spec.McpSchema;
 
+import org.rogmann.mcp2sdk.review.ReviewStore;
 import org.rogmann.mcp2sdk.tools.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,6 +33,19 @@ public class McpConfig {
     @Bean
     public ToolRegistry toolRegistry() {
         return new ToolRegistry();
+    }
+
+    /**
+     * The shared review list behind {@code /review}, published as a bean so that the
+     * {@code ReviewController} receives it by injection. The store is a singleton because its
+     * writers - JS module bridges and tool services - are not Spring-managed; this bean is the
+     * read-side bridge into the web layer, nothing more.
+     *
+     * @return the shared review store
+     */
+    @Bean
+    public ReviewStore reviewStore() {
+        return ReviewStore.getInstance();
     }
 
     // JsonMapper Bean for serialization
