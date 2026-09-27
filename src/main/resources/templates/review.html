@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <title>Approval Review</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        table { border-collapse: collapse; width: 100%; max-width: 1100px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; vertical-align: top; }
+        th { background-color: #f2f2f2; }
+        .pending { color: #b8860b; font-weight: bold; }
+        .approved, .running { color: blue; font-weight: bold; }
+        .completed { color: green; font-weight: bold; }
+        .denied, .expired, .voided, .error { color: red; font-weight: bold; }
+        .ok { color: green; font-weight: bold; }
+        .failed { color: red; font-weight: bold; }
+        code { font-family: monospace; }
+        .note { color: #666; font-size: 0.9em; }
+        .statusline { display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+                      margin: 0 0 12px 0; padding: 6px 10px; background: #f2f6fa;
+                      border: 1px solid #d6e2ee; font-size: 0.9em; max-width: 1100px; }
+        #pollInfo { color: #555; }
+        .banner { margin: 0 0 12px 0; padding: 8px 12px; border: 1px solid #e0c000;
+                  background: #fff8d8; font-weight: bold; max-width: 1100px; }
+        .quick { display: inline; }
+        .quick button { padding: 3px 10px; cursor: pointer; margin-right: 4px; }
+        .quick .approve { background: #dfe; }
+        .quick .deny { background: #fed; }
+    </style>
+</head>
+<body>
+<h1>Approval review</h1>
+<p class="note">
+    Four-eyes approval for tool requests of every tool that asks for one. An approval covers
+    exactly the facts shown with the request; if the underlying content changes afterwards,
+    the approval is void.
+    <a th:href="@{/tools}">Tool management</a>
+</p>
+
+<div class="statusline">
+    <span id="pollInfo"></span>
+    <button type="button" id="reloadNow">Reload now</button>
+</div>
+<div class="banner" id="statusBanner" hidden></div>
+
+<h2>Pending / recent requests</h2>
+<table>
+    <thead>
+    <tr>
+        <th>Status</th>
+        <th>ID</th>
+        <th>Tool</th>
+        <th>Submitted</th>
+        <th>Subject</th>
+        <th>Details</th>
+        <th>Result</th>
+        <th>Comment</th>
+        <th>Decide</th>
+    </tr>
+    </thead>
+    <tbody>
+    <tr th:if="${#lists.isEmpty(entries)}">
+        <td colspan="9">No requests.</td>
+    </tr>
+    <tr th:each="entry : ${entries}" th:attr="data-id=${entry.id},data-status=${entry.status}">
+        <td><span th:class="${entry.status}" th:text="${entry.status}">pending</span>
+            <span th:if="${entry.renewCount > 0}" class="note"
+                  th:text="'(re-armed ' + ${entry.renewCount} + 'x)'">(re-armed 1x)</span></td>
+        <td><a th:href="@{'/review/' + ${entry.id}}" th:text="${entry.id}">id</a></td>
+        <td th:text="${entry.toolTitle}">Python execution</td>
+        <td th:text="${entry.submittedAt}">timestamp</td>
+        <td><strong th:text="${entry.title}">Run tools/check.py</strong><br/>
+            <span class="note" th:text="${entry.shortSummary}">one-line summary</span></td>
+        <td>
+            <div th:each="a : ${entry.attributes}">
+                <span th:text="${a.label}">Label</span>:
+                <code th:text="${a.value}">value</code>
+            </div>
+        </td>
+        <td><span th:if="${entry.ok != null}" th:class="${entry.ok} ? 'ok' : 'failed'"
+                  th:text="${entry.ok} ? 'OK' : 'FAILED'">OK</span>
+            <span class="note" th:text="${entry.resultSummary}">summary</span></td>
+        <td th:text="${entry.comment}">-</td>
+        <td>
+            <form th:if="${entry.quickDecision}" class="quick"
+                  th:action="@{'/review/' + ${entry.id} + '/decide'}" method="post">
+                <button type="submit" class="approve" name="action" value="approve">Approve</button>
+                <button type="submit" class="deny" name="action" value="deny">Deny</button>
+            </form>
+            <span th:unless="${entry.quickDecision}" class="note">
+                <a th:href="@{'/review/' + ${entry.id}}">open</a>
+            </span>
+        </td>
+    </tr>
+    </tbody>
+</table>
+
+<script>
+(function () {
+    'use strict';
+
+    /* No meta refresh: the page reloads only when the set of statuses really changed,
+       otherwise a reload would throw away the scroll position for no reason. */
+    var OPEN = ['pending', 'approved', 'running'];
+    var POLL_MS = 5000;
+
+    var pollInfo = document.getElementById('pollInfo');
+    var banner = document.getElementById('statusBanner');
+    var reloadBtn = document.getElementById('reloadNow');
+    var navigating = false;
+
+    function pad(n) { return (n < 10 ? '0' : '') + n; }
+    function clock() {
+        var d = new Date();
+        return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+    }
+    function setInfo(text) { if (pollInfo) { pollInfo.textContent = text; } }
+
+    function signature(doc) {
+        var rows = doc.querySelectorAll('tr[data-id]');
+        var parts = [];
+        Array.prototype.forEach.call(rows, function (r) {
+            parts.push(r.getAttribute('data-id') + '=' + r.getAttribute('data-status'));
+        });
+        return parts.join('|');
+    }
+
+    var current = signature(document);
+    var hasOpen = OPEN.some(function (s) { return current.indexOf('=' + s) >= 0; });
+
+    if (reloadBtn) {
+        reloadBtn.addEventListener('click', function () {
+            navigating = true;
+            window.location.reload();
+        });
+    }
+
+    function reloadNow() {
+        if (navigating) { return; }
+        navigating = true;
+        window.location.reload();
+    }
+
+    function showBanner(text) {
+        if (!banner) { return; }
+        banner.textContent = text;
+        banner.hidden = false;
+    }
+
+    if (!hasOpen) {
+        setInfo('No open request - no automatic updates.');
+        return;
+    }
+    setInfo('Open request present, checked ' + clock());
+
+    function poll() {
+        if (navigating || document.hidden || !window.fetch || !window.DOMParser) { return; }
+        window.fetch(window.location.href, {cache: 'no-store', headers: {'Accept': 'text/html'}})
+                .then(function (resp) { return resp.text(); })
+                .then(function (html) {
+                    var doc = new window.DOMParser().parseFromString(html, 'text/html');
+                    var fresh = signature(doc);
+                    if (!fresh && current) {
+                        setInfo('Status not readable (' + clock() + ')');
+                        return;
+                    }
+                    setInfo('Checked ' + clock());
+                    if (fresh === current) { return; }
+                    showBanner('The requests changed - reloading ...');
+                    window.setTimeout(reloadNow, 500);
+                })
+                .catch(function () {
+                    setInfo('Status check failed (' + clock()
+                            + ') - please use the "Reload now" button.');
+                });
+    }
+
+    window.setInterval(poll, POLL_MS);
+    document.addEventListener('visibilitychange', function () {
+        if (!document.hidden) { poll(); }
+    });
+    window.addEventListener('beforeunload', function () { navigating = true; });
+})();
+</script>
+</body>
+</html>

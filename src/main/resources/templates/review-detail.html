@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <title>Approval Review</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        h1, h2 { font-size: 1.2em; }
+        table { border-collapse: collapse; max-width: 1100px; }
+        th, td { border: 1px solid #ddd; padding: 6px 10px; text-align: left; vertical-align: top; }
+        th { background-color: #f2f2f2; white-space: nowrap; }
+        pre { background: #f7f7f7; border: 1px solid #ddd; padding: 10px; max-width: 1100px;
+              overflow-x: auto; font-size: 0.85em; }
+        .pending { color: #b8860b; font-weight: bold; }
+        .completed { color: green; font-weight: bold; }
+        .denied, .expired, .voided, .error { color: red; font-weight: bold; }
+        .approved, .running { color: blue; font-weight: bold; }
+        .ok { color: green; font-weight: bold; }
+        .failed { color: red; font-weight: bold; }
+        .met { color: green; }
+        .unmet { color: red; font-weight: bold; }
+        .error { color: red; font-weight: bold; }
+        code { font-family: monospace; }
+        .buttons { margin: 10px 0; }
+        .buttons button { padding: 6px 18px; margin-right: 8px; cursor: pointer; }
+        .approve { background: #dfe; }
+        .deny { background: #fed; }
+        textarea { max-width: 100%; }
+        .statusline { display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+                      margin: 0 0 12px 0; padding: 6px 10px; background: #f2f6fa;
+                      border: 1px solid #d6e2ee; font-size: 0.9em; }
+        #pollInfo { color: #555; }
+        .banner { margin: 0 0 12px 0; padding: 8px 12px; border: 1px solid #99c2ee;
+                  background: #eaf3fd; max-width: 1100px; }
+        .banner.warn { border-color: #e0c000; background: #fff8d8; font-weight: bold; }
+        .hint { color: #666; font-size: 0.85em; }
+        .submitting button { opacity: 0.55; pointer-events: none; }
+    </style>
+</head>
+<body th:attr="data-entry-id=${entry.id},data-status=${entry.status},data-terminal=${entry.terminal},data-expires-at=${entry.expiresAt}">
+<h1>Approval <span th:text="${entry.id}">id</span>
+    &mdash; <span id="statusNow" th:class="${entry.status}" th:text="${entry.status}">pending</span></h1>
+<p><a th:href="@{/review}">&larr; Back to the list</a></p>
+<p class="error" th:if="${error}" th:text="${error}"></p>
+
+<div class="statusline">
+    <span id="pollInfo">The status only changes through your decision.</span>
+    <span id="expiresInfo"></span>
+    <label><input type="checkbox" id="autoReloadOnChange" checked>
+        Reload automatically when the status changes</label>
+    <button type="button" id="reloadNow">Reload now</button>
+</div>
+<div class="banner" id="statusBanner" hidden></div>
+
+<h2>Request</h2>
+<table>
+    <tr><th>Tool</th><td th:text="${entry.toolTitle}">Python execution</td></tr>
+    <tr><th>Subject</th><td th:text="${entry.title}">Run tools/check.py</td></tr>
+    <tr><th>Reason</th><td th:text="${entry.reason}">reason</td></tr>
+    <tr><th>Submitted</th><td th:text="${entry.submittedAt}">timestamp</td></tr>
+    <tr><th>Artifacts</th>
+        <td><span th:if="${entry.artifactsOnDisk}"><code th:text="${entry.runDir}">runs/...</code></span>
+            <span th:if="${entry.memoryOnlyNote}" class="hint" th:text="${entry.memoryOnlyNote}"></span></td></tr>
+    <tr th:if="${entry.renewCount > 0}"><th>Re-armed</th>
+        <td><strong th:text="${entry.renewCount}">1</strong> &times; &mdash; last note:
+            <em th:text="${entry.renewNote}">note</em>
+            <div class="hint">This request expired without a decision and the model asked for it
+                again. Nothing changed: same id, same subject, same facts. Read the details below
+                again before you decide; you can still deny it.</div>
+        </td></tr>
+    <tr th:if="${entry.decidedAt}"><th>Decision</th>
+        <td><span th:text="${entry.status}">status</span> on
+            <span th:text="${entry.decidedAt}">ts</span>
+            &mdash; comment: <em th:text="${entry.comment}">-</em></td></tr>
+</table>
+
+<h2>Details</h2>
+<table>
+    <tr th:each="a : ${entry.attributes}">
+        <th th:text="${a.label}">Label</th>
+        <td>
+            <pre th:if="${a.code}" th:text="${a.value}">source</pre>
+            <code th:unless="${a.code}" th:text="${a.value}">value</code>
+            <div th:if="${a.truncated}" class="hint">excerpt &mdash; complete value:
+                <code th:text="${a.artifact}">artifact</code></div>
+            <div th:if="${a.note}" class="hint" th:text="${a.note}"></div>
+            <table th:if="${not #lists.isEmpty(a.checks)}">
+                <tr><th>Expectation</th><th>Outcome</th><th>Detail</th></tr>
+                <tr th:each="c : ${a.checks}">
+                    <td><code th:text="${c.expectation}">exit 0</code></td>
+                    <td th:class="${c.met} ? 'met' : 'unmet'" th:text="${c.met} ? 'met' : 'NOT met'">met</td>
+                    <td th:text="${c.detail}">detail</td>
+                </tr>
+            </table>
+        </td>
+    </tr>
+</table>
+
+<div th:if="${entry.pending}" class="buttons">
+    <h2>Decide</h2>
+    <form id="decideForm" th:action="@{'/review/' + ${entry.id} + '/decide'}" method="post">
+        <label for="comment">Comment (optional, reported back to the LLM when you deny):</label><br/>
+        <textarea id="comment" name="comment" rows="2" cols="80"></textarea><br/>
+        <span id="draftNote" class="hint" hidden>Draft restored from your previous visit. </span>
+        <span id="submitNote" class="hint" hidden></span><br/>
+        <button class="approve" id="approveBtn" type="submit" name="action" value="approve">Approve and Execute</button>
+        <button class="deny" id="denyBtn" type="submit" name="action" value="deny">Deny</button>
+    </form>
+    <p class="hint">
+        This page does <strong>not</strong> reload on a timer - your input is preserved.
+        The status is only polled in the background; a reload happens after a real status
+        change (and never while you are typing in the comment field) or when you press the
+        button. The comment is kept locally as a draft. Ctrl/Cmd+Enter = Approve and Execute.
+    </p>
+</div>
+
+<div th:if="${entry.response}">
+    <h2>Result</h2>
+    <table>
+        <tr><th>Status</th>
+            <td><span th:class="${entry.response.ok} ? 'ok' : 'failed'"
+                      th:text="${entry.response.status}">completed</span>
+                (<span th:text="${entry.response.ok} ? 'OK' : 'FAILED'">OK</span>)</td></tr>
+        <tr><th>Summary</th><td th:text="${entry.response.summary}">summary</td></tr>
+        <tr><th>Duration</th><td><span th:text="${entry.response.durationMs}">0</span> ms</td></tr>
+        <tr th:if="${entry.response.comment}"><th>Comment</th>
+            <td th:text="${entry.response.comment}">-</td></tr>
+    </table>
+
+    <h3>Result details</h3>
+    <table>
+        <tr th:each="a : ${entry.response.attributes}">
+            <th th:text="${a.label}">Label</th>
+            <td>
+                <pre th:if="${a.code}" th:text="${a.value}">output</pre>
+                <code th:unless="${a.code}" th:text="${a.value}">value</code>
+                <div th:if="${a.truncated}" class="hint">excerpt &mdash; complete value:
+                    <code th:text="${a.artifact}">artifact</code></div>
+                <div th:if="${a.note}" class="hint" th:text="${a.note}"></div>
+                <table th:if="${not #lists.isEmpty(a.checks)}">
+                    <tr><th>Expectation</th><th>Outcome</th><th>Detail</th></tr>
+                    <tr th:each="c : ${a.checks}">
+                        <td><code th:text="${c.expectation}">exit 0</code></td>
+                        <td th:class="${c.met} ? 'met' : 'unmet'" th:text="${c.met} ? 'met' : 'NOT met'">met</td>
+                        <td th:text="${c.detail}">detail</td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+</div>
+
+<script>
+(function () {
+    'use strict';
+
+    var body = document.body;
+    var entryId = body.getAttribute('data-entry-id') || 'unknown';
+    var status = body.getAttribute('data-status') || '';
+
+    /** Terminal is decided by the server (ReviewStatus.terminal) and travels as an attribute -
+        one vocabulary for every tool, no second status list to maintain in this page. */
+    var terminal = body.getAttribute('data-terminal') === 'true';
+    var POLL_MS = 3000;
+    var draftKey = 'python-review:comment:' + entryId;
+
+    var comment = document.getElementById('comment');
+    var form = document.getElementById('decideForm');
+    var banner = document.getElementById('statusBanner');
+    var pollInfo = document.getElementById('pollInfo');
+    var statusNow = document.getElementById('statusNow');
+    var autoReload = document.getElementById('autoReloadOnChange');
+    var reloadBtn = document.getElementById('reloadNow');
+    var draftNote = document.getElementById('draftNote');
+    var submitNote = document.getElementById('submitNote');
+    var expiresInfo = document.getElementById('expiresInfo');
+
+    /**
+     * Wall-clock end of the approval window (0 = none armed), epoch millis. The server
+     * reaps pending requests with an armed window, so this countdown is real - the
+     * model is told the same window.
+     */
+    var expiresAt = parseInt(body.getAttribute('data-expires-at') || '0', 10) || 0;
+
+    var navigating = false;
+    var submitting = false;
+    var pendingAction = null;
+
+    function pad(n) { return (n < 10 ? '0' : '') + n; }
+    function clock() {
+        var d = new Date();
+        return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+    }
+    function setInfo(text) { if (pollInfo) { pollInfo.textContent = text; } }
+
+    /** Shows how long the reviewer still has before the request expires again. */
+    function renderExpiry() {
+        if (!expiresInfo) { return; }
+        if (!expiresAt) {
+            expiresInfo.textContent = '';
+            return;
+        }
+        var left = Math.round((expiresAt - Date.now()) / 1000);
+        if (left <= 0) {
+            expiresInfo.textContent = 'Approval window over - the request expires any moment.';
+            return;
+        }
+        var mins = Math.floor(left / 60);
+        var secs = left % 60;
+        expiresInfo.textContent = 'Approval window: '
+                + (mins > 0 ? mins + ' min ' : '') + secs + ' s left.';
+    }
+
+    /* ---------- Keep the comment draft locally (no input is ever lost) ---------- */
+    function readDraft() {
+        try { return window.localStorage.getItem(draftKey) || ''; } catch (e) { return ''; }
+    }
+    function writeDraft(value) {
+        try { window.localStorage.setItem(draftKey, value); } catch (e) { /* private mode */ }
+    }
+    function dropDraft() {
+        try { window.localStorage.removeItem(draftKey); } catch (e) { /* ignore */ }
+    }
+
+    if (terminal || status === 'approved' || status === 'running') {
+        // The decision has been made - a local draft has no value anymore.
+        dropDraft();
+    } else if (comment && comment.value === '') {
+        var draft = readDraft();
+        if (draft !== '') {
+            comment.value = draft;
+            if (draftNote) { draftNote.hidden = false; }
+        }
+    }
+    if (comment) {
+        comment.addEventListener('input', function () { writeDraft(comment.value); });
+    }
+
+    /* ---------- Form: block double submits, keyboard shortcut ---------- */
+    if (form) {
+        var btns = form.querySelectorAll('button[type="submit"]');
+        Array.prototype.forEach.call(btns, function (b) {
+            b.addEventListener('click', function () { pendingAction = b.value; });
+        });
+        form.addEventListener('submit', function (ev) {
+            if (submitting) { ev.preventDefault(); return; }
+            submitting = true;
+            navigating = true;               // the decision is on its way: do not interfere
+            form.classList.add('submitting');
+            if (submitNote) {
+                submitNote.textContent = (pendingAction === 'deny')
+                        ? 'Sending the denial ...' : 'Sending the approval ...';
+                submitNote.hidden = false;
+            }
+        });
+        form.addEventListener('keydown', function (ev) {
+            if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') {
+                ev.preventDefault();
+                var approve = document.getElementById('approveBtn');
+                if (approve && !approve.disabled) {
+                    if (form.requestSubmit) { form.requestSubmit(approve); } else { approve.click(); }
+                }
+            }
+        });
+    }
+
+    /* ---------- Status banner ---------- */
+    function showBanner(text, warn, withButton) {
+        if (!banner) { return; }
+        banner.className = warn ? 'banner warn' : 'banner';
+        banner.textContent = text;
+        banner.hidden = false;
+        if (withButton) {
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.textContent = 'Reload now';
+            btn.addEventListener('click', function () {
+                navigating = true;
+                window.location.reload();
+            });
+            banner.appendChild(document.createTextNode(' '));
+            banner.appendChild(btn);
+        }
+    }
+
+    function lockForm(newStatus) {
+        if (!form) { return; }
+        var els = form.querySelectorAll('button, textarea');
+        Array.prototype.forEach.call(els, function (el) { el.disabled = true; });
+        if (submitNote) {
+            submitNote.textContent = 'The request is no longer open (status: ' + newStatus
+                    + ') - a decision is not possible anymore.';
+            submitNote.hidden = false;
+        }
+    }
+
+    /** True while the reviewer is working on the comment. */
+    function isEditing() {
+        if (!comment) { return false; }
+        if (document.activeElement === comment) { return true; }
+        return comment.value.trim() !== '';
+    }
+
+    function doReload() {
+        if (navigating) { return; }
+        navigating = true;
+        window.location.reload();
+    }
+
+    /* ---------- Background polling: reload ONLY on a real status change ---------- */
+    function poll() {
+        if (navigating || document.hidden || !window.fetch || !window.DOMParser) { return; }
+        window.fetch(window.location.href, {cache: 'no-store', headers: {'Accept': 'text/html'}})
+                .then(function (resp) { return resp.text(); })
+                .then(function (html) {
+                    var doc = new window.DOMParser().parseFromString(html, 'text/html');
+                    var fresh = (doc && doc.body) ? doc.body.getAttribute('data-status') : null;
+                    if (!fresh) {
+                        setInfo('Status not readable (' + clock() + ') - no auto reload.');
+                        return;
+                    }
+                    setInfo('Status ' + fresh + ', checked ' + clock());
+                    if (statusNow) {
+                        statusNow.textContent = fresh;
+                        statusNow.className = fresh;
+                    }
+                    terminal = (doc && doc.body)
+                            ? doc.body.getAttribute('data-terminal') === 'true' : terminal;
+                    // The window may have been re-armed or shortened elsewhere.
+                    expiresAt = (doc && doc.body)
+                            ? (parseInt(doc.body.getAttribute('data-expires-at') || '0', 10) || 0) : 0;
+                    renderExpiry();
+                    if (fresh === status) { return; }
+
+                    var old = status;
+                    status = fresh;
+                    body.setAttribute('data-status', fresh);
+                    if (fresh !== 'pending') { lockForm(fresh); }
+
+                    if (isEditing()) {
+                        // Top priority: never lose anything the reviewer has typed.
+                        showBanner('Status changed: ' + old + ' -> ' + fresh
+                                + '. Your comment is preserved - please reload the page manually.',
+                                true, true);
+                        return;
+                    }
+                    if (autoReload && autoReload.checked) {
+                        showBanner('Status changed: ' + old + ' -> ' + fresh + '. Reloading ...');
+                        window.setTimeout(doReload, 800);
+                    } else {
+                        showBanner('Status changed: ' + old + ' -> ' + fresh
+                                + '. Auto reload is switched off.', true, true);
+                    }
+                })
+                .catch(function () {
+                    setInfo('Status check failed (' + clock()
+                            + ') - please use the "Reload now" button.');
+                });
+    }
+
+    if (reloadBtn) {
+        reloadBtn.addEventListener('click', function () {
+            navigating = true;
+            window.location.reload();
+        });
+    }
+
+    if (terminal) {
+        setInfo('Final status ' + status + ' - no automatic updates.');
+    } else {
+        setInfo('Status ' + status + ', waiting for a decision or for it to expire.');
+        renderExpiry();
+        window.setInterval(poll, POLL_MS);
+        document.addEventListener('visibilitychange', function () {
+            if (!document.hidden) { poll(); }
+        });
+    }
+
+    window.addEventListener('beforeunload', function () { navigating = true; });
+})();
+</script>
+</body>
+</html>
