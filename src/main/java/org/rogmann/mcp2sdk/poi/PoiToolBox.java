@@ -1314,7 +1314,7 @@ public class PoiToolBox {
         Sheet sh = getSheetByHandle(sheetHandle);
         byte[] rgb = toRgbBytes(color, "data bar color");
         SheetConditionalFormatting scf = sh.getSheetConditionalFormatting();
-        ConditionalFormattingRule rule = scf.createConditionalFormattingRule(new XSSFColor(rgb, null));
+        ConditionalFormattingRule rule = scf.createConditionalFormattingRule(opaqueArgb(rgb));
         DataBarFormatting dataBar = rule.getDataBarFormatting();
         if (dataBar != null) {
             dataBar.getMinThreshold().setRangeType(ConditionalFormattingThreshold.RangeType.MIN);
@@ -1628,8 +1628,18 @@ public class PoiToolBox {
         if (backgroundColor != null) {
             byte[] rgb = toRgbBytes(backgroundColor.toString(), "backgroundColor");
             PatternFormatting fill = rule.createPatternFormatting();
-            fill.setFillForegroundColor(new XSSFColor(rgb, null));
-            fill.setFillPattern(PatternFormatting.SOLID_FOREGROUND);
+            // DXF specifics: the area of a rule fill is painted from the BACKGROUND
+            // colour (bgColor), not from fgColor. Excel therefore stores conditional
+            // format fills as <patternFill><bgColor rgb="FFxxxxxx"/></patternFill>
+            // without patternType, and so does LibreOffice when it writes a .xlsx.
+            // With fgColor + patternType="solid" the area stayed white in the viewer -
+            // only the font colour was applied (white-on-white effect).
+            // Note: setFillBackgroundColor(Color) takes the full CTColor (4-byte ARGB)
+            // via ptrn.setBgColor(...); unlike XSSFFontFormatting.setFontColor there is
+            // NO alpha trimming here, so no duplicate call is needed (see
+            // applyRuleFontColor).
+            // Cross-check: src/test/resources/js/cf_dxf_matrix.xlsx, sheet A vs. D.
+            fill.setFillBackgroundColor(opaqueArgb(rgb));
         }
     }
 
@@ -1644,7 +1654,18 @@ public class PoiToolBox {
             return;
         }
         byte[] rgb = toRgbBytes(color, "fontColor");
-        font.setFontColor(new XSSFColor(rgb, null));
+        XSSFColor xcolor = opaqueArgb(rgb);
+        // Workaround for POI 5.5.1 XSSFFontFormatting.setFontColor(Color):
+        //   if (_font.sizeOfColorArray() == 0) { _font.addNewColor().setRgb(xcolor.getRGB()); }
+        //   else                               { _font.setColorArray(0, xcolor.getCTColor()); }
+        // getRGB() strips the alpha byte, so the FIRST call on a fresh rule (no <color>
+        // element yet) always writes an invalid 6-digit value (rgb="FFFFFF" instead of
+        // "FFFFFFFF"). Viewers that read the attribute as 32-bit ARGB see alpha=00, i.e.
+        // invisible text. The SECOND call takes the else-branch and stores the full
+        // CTColor of xcolor (4-byte ARGB) - the value is then written correctly.
+        // Once POI keeps the ARGB length here, the duplicate call can be removed.
+        font.setFontColor(xcolor);
+        font.setFontColor(xcolor);
     }
 
     /**
@@ -1685,12 +1706,36 @@ public class PoiToolBox {
     }
 
     /**
+     * Wraps a 3-byte RGB triple into an opaque (alpha = FF) XSSFColor so that POI
+     * serializes a valid 8-digit ARGB value (e.g. rgb="FFFF0000").
+     * <p>
+     * Rationale: {@code new XSSFColor(byte[3], null)} only calls
+     * {@code ctColor.setRgb(rgb)}, i.e. the byte array is written unmodified into the
+     * rgb attribute and produces an INVALID 6-digit value (e.g. rgb="FF0000"). The
+     * OOXML schema types the attribute as ST_UnsignedIntHex (ECMA-376, hexBinary of
+     * exactly 4 bytes) and documents it as aRGB, so 8 hex digits are required.
+     * Viewers that parse the short form as a 32-bit ARGB value read alpha=00 (fully
+     * transparent), so conditional-format fills and font colors silently disappear
+     * (white cells / unreadable text) while a POI round-trip still looks correct.
+     * </p>
+     * @param rgb 3-byte RGB triple
+     * @return opaque XSSFColor carrying a 4-byte ARGB value
+     * @throws PoiUserRuntimeException if the value is not a 3-byte RGB triple
+     */
+    private static XSSFColor opaqueArgb(byte[] rgb) {
+        if (rgb == null || rgb.length != 3) {
+            throw new PoiUserRuntimeException("Expected a 3-byte RGB color value.");
+        }
+        return new XSSFColor(new byte[]{(byte) 0xFF, rgb[0], rgb[1], rgb[2]}, null);
+    }
+
+    /**
      * Converts RGB byte triples to XSSFColor array (for color scales).
      */
     private static XSSFColor[] toXssfColors(byte[][] rgbs) {
         XSSFColor[] colors = new XSSFColor[rgbs.length];
         for (int i = 0; i < rgbs.length; i++) {
-            colors[i] = new XSSFColor(rgbs[i], null);
+            colors[i] = opaqueArgb(rgbs[i]);
         }
         return colors;
     }
@@ -1711,10 +1756,18 @@ public class PoiToolBox {
             }
         }
         PatternFormatting fill = rule.getPatternFormatting();
-        if (fill != null && fill.getFillPattern() != PatternFormatting.NO_FILL) {
-            Color fillColor = fill.getFillForegroundColorColor();
-            if (fillColor != null) {
-                style.put("backgroundColor", colorToHex(fillColor));
+        if (fill != null) {
+            // bgColor first: the canonical DXF form
+            // (<patternFill><bgColor rgb="FFxxxxxx"/></patternFill>) has no patternType, so
+            // getFillPattern() reports NO_FILL for it - therefore no NO_FILL guard here.
+            // fgColor remains as a fallback for files written before this change.
+            Color fillColor = fill.getFillBackgroundColorColor();
+            if (fillColor == null) {
+                fillColor = fill.getFillForegroundColorColor();
+            }
+            String bgHex = colorToHex(fillColor);
+            if (bgHex != null) {
+                style.put("backgroundColor", bgHex);
             }
         }
         return style;
@@ -1799,6 +1852,11 @@ public class PoiToolBox {
                 (colors as hex RGB "FFC7CE" or name "RED"). Formulas are syntax-validated and
                 stored unmodified (English function names, A1 references); Excel evaluates them
                 when the file is opened.
+                Rule colors are written as 8-digit ARGB and a rule fill is stored in the
+                canonical DXF form <patternFill><bgColor rgb="FFxxxxxx"/></patternFill>
+                (no patternType) - that is what Excel writes and what LibreOffice renders.
+                Reading a rule back prefers bgColor and falls back to fgColor, so files
+                written by older versions of this toolbox keep their backgroundColor.
                 
                 --- Advanced ---
                 poi.getMergedRegions(sh)          - Get merged regions

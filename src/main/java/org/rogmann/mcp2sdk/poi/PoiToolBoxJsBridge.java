@@ -151,9 +151,13 @@ public class PoiToolBoxJsBridge implements JsModuleInterface {
                 poi.getCellFormula(args[0].asString(), args[1].asInt(), args[2].asInt()));
 
         // ---- Range / Data ----
+        // toProxyObject (not ProxyObject.fromMap) on all result maps: fromMap hands member
+        // values through unchanged, so a nested Map or List would arrive as a Java host object
+        // that the CONSTRAINED sandbox cannot read. Today these two maps are flat, but the
+        // wrapper must not decide that a future nested field silently becomes unreadable.
         methods.put("getUsedRange", (ProxyExecutable) args -> {
             Map<String, Object> range = poi.getUsedRange(args[0].asString());
-            return range != null ? ProxyObject.fromMap(range) : null;
+            return range != null ? GraalProxies.toProxyObject(range) : null;
         });
 
         methods.put("getRangeAsJson", (ProxyExecutable) args -> {
@@ -195,7 +199,7 @@ public class PoiToolBoxJsBridge implements JsModuleInterface {
         methods.put("getCellStyle", (ProxyExecutable) args -> {
             Map<String, Object> style = poi.getCellStyle(args[0].asString(),
                     args[1].asInt(), args[2].asInt());
-            return style != null ? ProxyObject.fromMap(style) : null;
+            return style != null ? GraalProxies.toProxyObject(style) : null;
         });
 
         methods.put("setCellBold", (ProxyExecutable) args -> {
