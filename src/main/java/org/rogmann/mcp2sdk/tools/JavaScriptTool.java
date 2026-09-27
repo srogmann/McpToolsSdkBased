@@ -21,6 +21,7 @@ import org.rogmann.mcp2sdk.js.JsCryptoBridge;
 import org.rogmann.mcp2sdk.js.JsFileSystem;
 import org.rogmann.mcp2sdk.js.JsFileSystemBridge;
 import org.rogmann.mcp2sdk.js.JsJavapBridge;
+import org.rogmann.mcp2sdk.js.JsM2Bridge;
 import org.rogmann.mcp2sdk.js.JsMcpProxyBridge;
 import org.rogmann.mcp2sdk.js.JsModuleInterface;
 import org.rogmann.mcp2sdk.js.JsSearchBridge;
@@ -119,6 +120,11 @@ public class JavaScriptTool {
     /** Maximum length of the source snippet shown for a JavaScript stack frame. */
     private static final int MAX_SNIPPET_CHARS = 160;
 
+    /** Maximum length of an exception message (prefix, longer messages can be clipped) */
+    private static final int MAX_EXCEPTION_MESSAGE_BEGIN = 8000;
+    /** Maximum length of an exception message (suffix, longer messages can be clipped) */
+    private static final int MAX_EXCEPTION_MESSAGE_TAIL = 400;
+
     /** Counter for readable worker thread names. */
     private static final AtomicInteger THREAD_COUNTER = new AtomicInteger();
 
@@ -164,6 +170,12 @@ public class JavaScriptTool {
         // Uses the same path rules as `fs` and the same archive formats as `archive`.
         modules.put("search", new JsSearchBridge());
         modules.put("javap", new JsJavapBridge());
+        // Read-only Maven repository (M2) access: classpath of a pom.xml, dependency tree,
+        // JAR entry reads (the core is org.rogmann.mcp2sdk.m2.M2Resolver). The entry bytes
+        // compose with javap/archive/search. Read-only by design (no write API; the sources
+        // download is the single, switchable exception). Disable with
+        // -Dmcp2sdk.module.m2.enabled=false.
+        modules.put("m2", new JsM2Bridge());
         modules.put("xml", new JsXmlBridge());
         modules.put("poi", new PoiToolBoxJsBridge());
         modules.put("docx", new DocxToolBoxJsBridge());
@@ -789,8 +801,14 @@ public class JavaScriptTool {
                 return buildTimeoutResult(e, sourceName, timeoutSeconds, baosOut);
             }
             StringBuilder sbMsg = new StringBuilder("Error during JavaScript execution: ");
+            String msgText = e.getMessage();
+            if (msgText != null && msgText.length() > MAX_EXCEPTION_MESSAGE_BEGIN + MAX_EXCEPTION_MESSAGE_TAIL + 1) {
+                msgText = msgText.substring(0, MAX_EXCEPTION_MESSAGE_BEGIN)
+                        + "[...removed %d chars...]".formatted(msgText.length() - MAX_EXCEPTION_MESSAGE_BEGIN - MAX_EXCEPTION_MESSAGE_TAIL)
+                        + msgText.substring(msgText.length() - MAX_EXCEPTION_MESSAGE_TAIL);
+            }
+            sbMsg.append(msgText);
             if (e instanceof PolyglotException pe) {
-                sbMsg.append(pe.getMessage());
                 if (pe.isSyntaxError()) {
                     sbMsg.append("\nThe script contains a JavaScript syntax error.");
                 }
@@ -804,8 +822,6 @@ public class JavaScriptTool {
                             loc.getStartLine(), loc.getStartColumn()));
                 }
                 sbMsg.append(buildHint());
-            } else {
-                sbMsg.append(e.getMessage());
             }
             String errorMessage = sbMsg.toString();
             // The exception (and with it the Java stack trace, GraalVM also prints the JavaScript
