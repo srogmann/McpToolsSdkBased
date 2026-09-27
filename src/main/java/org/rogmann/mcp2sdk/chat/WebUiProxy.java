@@ -1,5 +1,6 @@
 package org.rogmann.mcp2sdk.chat;
 
+import org.rogmann.mcp2sdk.utils.LlmUsage;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.node.ArrayNode;
 import tools.jackson.databind.node.ObjectNode;
@@ -68,60 +69,32 @@ public class WebUiProxy {
     private static final String PROP_REASONING = "webui.model.reasoning";
     private static final String PROP_BACKEND = "webui.model.backend";
     private static final String PROP_FETCH_METRICS = "webui.fetchMetrics";
+    /** Switches the DEBUG logging of LLM responses on (request logging is not affected). */
+    private static final String PROP_LOG_RESPONSES = "webui.logResponses";
+    /**
+     * Drops blank answer content that a model emits <em>between two tool calls</em> before the
+     * SSE line reaches the Web UI (see {@link #stripToolCallInterleaveContent}). Off by default;
+     * enable it only for the model/backend combination that shows the broken tool-call history.
+     */
+    private static final String PROP_SUPPRESS_TOOLCALL_INTERLEAVE = "webui.suppressToolCallInterleave";
 
     /** Backend vLLM */
     private static final String BACKEND_VLLM = "vllm";
 
     /**
      * Plausibility ceiling for the token rates synthesized on the vLLM path. Rates above this
-     * value (e.g. measured over a near-zero millisecond span) are treated as timing artifacts
-     * and the per-chunk timings enrichment is skipped for that chunk.
+     * value (e.g. measured over a near-zero millisecond span) are treated as timing artifacts.
+     *
+     * <p>The ceiling is applied <em>per rate</em>, not to the synthesized {@code timings} node as
+     * a whole: an implausible generation rate drops the node (the Web UI recomputes the rate from
+     * {@code predicted_n}/{@code predicted_ms}, so the counters alone would bring the artefact
+     * back), an implausible prompt rate drops only {@code prompt_per_second}. The prompt rate is
+     * judged on the tokens that the prefix cache did <em>not</em> serve, because a warm cache
+     * legitimately produces figures far above this ceiling (15k prompt tokens in 370 ms are
+     * 40k token/s) - screening it uncorrected would silence the live rate of the Web UI in
+     * exactly the requests that have plenty of them.</p>
      */
     private static final double MAX_PLAUSIBLE_TOKENS_PER_SECOND = 20_000.0;
-
-    /**
-     * Records usage statistics for a single LLM request/response cycle.
-     *
-     * @param tsStart         timestamp when the request started
-     * @param millisPP        milliseconds for prompt processing (time-to-first-token)
-     * @param millisTG        milliseconds for token generation (after first token until completion)
-     * @param model           model name as reported by the server
-     * @param promptTokens    number of prompt tokens sent
-     * @param completionTokens number of completion tokens generated
-     * @param totalTokens     total tokens (prompt + completion)
-     * @param cachedTokens    number of cached/prompt tokens reused. The value is only meaningful
-     *                        when {@code cachedTokensKnown} is {@code true}; otherwise it is
-     *                        reported as {@code 0} for compatibility but does not prove that no
-     *                        tokens were cached
-     * @param cachedTokensKnown {@code true} if cached-token usage was explicitly reported by the
-     *                        server or sampled by the proxy; {@code false} if it is unknown
-     * @param ppUncachedTPS   prompt processing tokens per second for the tokens NOT served from
-     *                        the KV cache. This is only computed when {@code cachedTokensKnown}
-     *                        is {@code true}; otherwise it is {@code 0} to avoid presenting a raw
-     *                        prompt rate as an uncached rate
-     * @param ppTPS           prompt processing tokens per second. In the llama.cpp path this is
-     *                        the server-reported {@code prompt_per_second}; in the vLLM-metrics
-     *                        and wall-clock paths it is cache-corrected only if
-     *                        {@code cachedTokensKnown} is {@code true}, otherwise it is a raw
-     *                        total-prompt-token estimate
-     * @param tgTPS           token generation tokens per second
-     * @param estimated       {@code true} if any of the rates/timings had to be estimated
-     *                        (wall-clock, heuristics or synthesized fallbacks) instead of being
-     *                        taken from authoritative server timings/metrics
-     * @param ttftClientMs    client-side measured time to the first output token (reasoning or
-     *                        answer content), from request send to first SSE delta. Wall-clock
-     *                        and therefore an upper bound of the server TTFT; {@code 0} when not
-     *                        measurable (e.g. non-streaming)
-     * @param usageWarnings   machine-readable warnings about the server-reported usage object.
-     *                        The raw usage object is written unchanged; warnings only mark
-     *                        inconsistencies or unsupported/ambiguous details
-     */
-    public record LlmUsage(LocalDateTime tsStart, long millisPP, long millisTG, String model,
-                           long promptTokens, long completionTokens, long totalTokens,
-                           long cachedTokens, boolean cachedTokensKnown,
-                           float ppUncachedTPS, float ppTPS, float tgTPS,
-                           boolean estimated, long ttftClientMs,
-                           List<String> usageWarnings) {}
 
     /** Collected usage statistics for all LLM requests */
     private final List<LlmUsage> usages = Collections.synchronizedList(new ArrayList<>());
@@ -157,6 +130,33 @@ public class WebUiProxy {
     @Value("${" + PROP_FETCH_METRICS + ":false}")
     private boolean fetchMetrics;
 
+    /**
+     * Whether the LLM <em>response</em> is logged on DEBUG in addition to the request body
+     * (property {@value #PROP_LOG_RESPONSES}, default false).
+     *
+     * <p>Unlike the request log line the response cannot be handed to the logger as-is: the
+     * streamed SSE chunks have to be accumulated (reasoning text, answer text, finish reason,
+     * usage) and re-serialized per request, i.e. StringBuilders and JSON work that are pure
+     * overhead in normal operation. That is why this is a separate switch instead of simply
+     * raising the log level; it only takes effect together with active DEBUG logging
+     * (see {@link #responseLogEnabled()}).</p>
+     */
+    @Value("${" + PROP_LOG_RESPONSES + ":false}")
+    private boolean logResponses;
+
+    /**
+     * Whether blank {@code delta.content} chunks between two tool calls are removed before
+     * forwarding to the Web UI (property {@value #PROP_SUPPRESS_TOOLCALL_INTERLEAVE}, default false).
+     *
+     * <p>Some model/backend combinations end every tool-call block with a newline token, so the
+     * stream carries a content delta between two {@code delta.tool_calls} blocks. The Web UI
+     * interprets any content delta as the end of a tool-call batch and shifts the next batch by
+     * the number of calls collected so far, which fabricates an empty tool call in the chat
+     * history. See {@link #stripToolCallInterleaveContent} for the workaround and its limits.</p>
+     */
+    @Value("${" + PROP_SUPPRESS_TOOLCALL_INTERLEAVE + ":false}")
+    private boolean suppressToolCallInterleave;
+
     /** Vision capabilities */
     @Value("${" + PROP_HAS_VISION + ":false}")
     private boolean hasVision;
@@ -188,6 +188,15 @@ public class WebUiProxy {
             " thinking", " response", "<|think|>"
     };
 
+    /**
+     * The reasoning-effort labels the chat template of the configured model accepts, as parsed by
+     * {@link ReasoningEfforts#parseTemplateEfforts(String)}; {@code null} until the first lookup. An
+     * empty list records "the template declares none", which is not the same as "not looked up yet" -
+     * it avoids re-parsing a template of several hundred kB on every request. Guarded by
+     * {@link #templateEfforts()}, mirroring {@link #chatTemplateCache}.
+     */
+    private List<String> templateEffortsCache = null;
+
     /** Counter of served static resources (first N logged on INFO, rest on DEBUG) */
     private final AtomicLong staticResourceCount = new AtomicLong();
 
@@ -203,11 +212,11 @@ public class WebUiProxy {
     private static final int LOG_STRING_PREFIX = 80;
     /** Number of trailing characters kept for a shortened string value. */
     private static final int LOG_STRING_SUFFIX = 20;
-    /** Max. length of the whole request body when it cannot be parsed as JSON. */
+    /** Max. length of the whole body when it cannot be parsed as JSON. */
     private static final int LOG_FALLBACK_MAX_LENGTH = 600;
-    /** Number of leading characters kept for a fallback-shortened request body. */
+    /** Number of leading characters kept for a fallback-shortened body. */
     private static final int LOG_FALLBACK_PREFIX = 500;
-    /** Number of trailing characters kept for a fallback-shortened request body. */
+    /** Number of trailing characters kept for a fallback-shortened body. */
     private static final int LOG_FALLBACK_SUFFIX = 100;
 
     /** Overall max. length of the logged request body, even if it contains many (individually
@@ -217,6 +226,25 @@ public class WebUiProxy {
     private static final int LOG_BODY_PREFIX = 1800;
     /** Number of trailing characters kept in the overall request-body log line. */
     private static final int LOG_BODY_SUFFIX = 200;
+
+    /** Max. length of a single string value of a logged response before shortening. Larger than
+     * the request limit on purpose: the answer/reasoning text is what the switch is enabled for. */
+    private static final int LOG_RESPONSE_MAX_STRING_LENGTH = 1200;
+    /** Number of leading characters kept for a shortened response string value. */
+    private static final int LOG_RESPONSE_STRING_PREFIX = 1000;
+    /** Number of trailing characters kept for a shortened response string value. */
+    private static final int LOG_RESPONSE_STRING_SUFFIX = 100;
+    /** Overall max. length of the logged response line, applied after per-value shortening. */
+    private static final int LOG_RESPONSE_BODY_MAX_LENGTH = 5000;
+    /** Number of leading characters kept in the overall response log line. */
+    private static final int LOG_RESPONSE_BODY_PREFIX = 4500;
+    /** Number of trailing characters kept in the overall response log line. */
+    private static final int LOG_RESPONSE_BODY_SUFFIX = 300;
+
+    /** Max. characters captured per response part (chain-of-thought / answer) for the response
+     * DEBUG log. Beyond that the remaining characters are only counted, so a long answer is not
+     * held in memory just for a debug line. */
+    private static final int RESPONSE_LOG_MAX_CHARS_PER_PART = 4000;
 
     /** Placeholder {@code arguments} used to replace an invalid assistant tool-call in the
      * forwarded request. The client-side history keeps its local copy; only the outgoing request
@@ -570,19 +598,66 @@ public class WebUiProxy {
      * @return shortened representation suitable for logging
      */
     private String shortenRequestBody(String requestBody) {
+        return shortenBody(requestBody, LOG_MAX_STRING_LENGTH, LOG_STRING_PREFIX, LOG_STRING_SUFFIX,
+                LOG_BODY_MAX_LENGTH, LOG_BODY_PREFIX, LOG_BODY_SUFFIX);
+    }
+
+    /**
+     * Prepares a response body for logging, mirroring {@link #shortenRequestBody} but with the
+     * larger limits of the {@code webui.logResponses} DEBUG log: the answer (and its chain of
+     * thought) is the reason the switch gets enabled, so single values are cut later than in the
+     * request log.
+     *
+     * @param responseBody raw response body or the response summary built from the SSE chunks
+     * @return shortened representation suitable for logging
+     */
+    private String shortenResponseBody(String responseBody) {
+        return shortenBody(responseBody, LOG_RESPONSE_MAX_STRING_LENGTH, LOG_RESPONSE_STRING_PREFIX,
+                LOG_RESPONSE_STRING_SUFFIX, LOG_RESPONSE_BODY_MAX_LENGTH,
+                LOG_RESPONSE_BODY_PREFIX, LOG_RESPONSE_BODY_SUFFIX);
+    }
+
+    /**
+     * Shortens a JSON body for logging with the given per-value and overall limits:
+     * long string values are trimmed first (keeping the JSON structure readable), then the whole
+     * line is capped. A body that cannot be parsed as JSON is truncated as plain text.
+     *
+     * @param body             raw body
+     * @param maxStringLength  length above which a single string value is shortened
+     * @param stringPrefix     leading characters kept for a shortened string value
+     * @param stringSuffix     trailing characters kept for a shortened string value
+     * @param bodyMaxLength    overall length above which the whole line is truncated
+     * @param bodyPrefix       leading characters kept for the overall line
+     * @param bodySuffix       trailing characters kept for the overall line
+     * @return shortened representation suitable for logging
+     */
+    private String shortenBody(String body, int maxStringLength, int stringPrefix, int stringSuffix,
+                               int bodyMaxLength, int bodyPrefix, int bodySuffix) {
         String shortened;
         try {
-            JsonNode node = jsonMapper.readTree(requestBody);
-            shortened = jsonMapper.writeValueAsString(shortenLongStrings(node));
+            JsonNode node = jsonMapper.readTree(body);
+            shortened = jsonMapper.writeValueAsString(
+                    shortenLongStrings(node, maxStringLength, stringPrefix, stringSuffix));
         } catch (RuntimeException e) {
-            LOG.debug("Cannot parse request body as JSON, fall back to plain truncation: {}",
-                    e.getMessage());
-            shortened = shortenText(requestBody, LOG_FALLBACK_MAX_LENGTH,
+            LOG.debug("Cannot parse body as JSON, fall back to plain truncation: {}", e.getMessage());
+            shortened = shortenText(body, LOG_FALLBACK_MAX_LENGTH,
                     LOG_FALLBACK_PREFIX, LOG_FALLBACK_SUFFIX);
         }
         // Per-value shortening keeps the JSON readable, but a body with many short values
         // (e.g. many tool calls) can still grow large - cap the overall log line.
-        return truncateLogText(shortened, LOG_BODY_MAX_LENGTH, LOG_BODY_PREFIX, LOG_BODY_SUFFIX);
+        return truncateLogText(shortened, bodyMaxLength, bodyPrefix, bodySuffix);
+    }
+
+    /**
+     * Whether the LLM response has to be collected for the DEBUG response log, i.e. the property
+     * {@value #PROP_LOG_RESPONSES} is set <em>and</em> DEBUG logging is really active. The second
+     * condition keeps the collection cost (StringBuilders, JSON re-serialization per chunk) off
+     * the stream when the logger would drop the line anyway.
+     *
+     * @return true if a response collector should be created for the current request
+     */
+    private boolean responseLogEnabled() {
+        return logResponses && LOG.isDebugEnabled();
     }
 
     /**
@@ -611,10 +686,13 @@ public class WebUiProxy {
     /**
      * Recursively shortens long string values in a JSON tree.
      *
-     * @param node node to process
+     * @param node            node to process
+     * @param maxStringLength length above which a string value is shortened
+     * @param prefix          number of leading characters kept for a shortened value
+     * @param suffix          number of trailing characters kept for a shortened value
      * @return a new node with the long string values shortened
      */
-    private JsonNode shortenLongStrings(JsonNode node) {
+    private JsonNode shortenLongStrings(JsonNode node, int maxStringLength, int prefix, int suffix) {
         if (node == null) {
             return null;
         }
@@ -622,21 +700,22 @@ public class WebUiProxy {
             ObjectNode src = (ObjectNode) node;
             ObjectNode dst = jsonMapper.createObjectNode();
             for (Map.Entry<String, JsonNode> entry : src.properties()) {
-                dst.set(entry.getKey(), shortenLongStrings(entry.getValue()));
+                dst.set(entry.getKey(), shortenLongStrings(entry.getValue(),
+                        maxStringLength, prefix, suffix));
             }
             return dst;
         } else if (node.isArray()) {
             ArrayNode dst = jsonMapper.createArrayNode();
             for (JsonNode child : node) {
-                dst.add(shortenLongStrings(child));
+                dst.add(shortenLongStrings(child, maxStringLength, prefix, suffix));
             }
             return dst;
         } else if (node.isString()) {
             String text = node.asString();
-            if (text.length() > LOG_MAX_STRING_LENGTH) {
-                String shortened = text.substring(0, LOG_STRING_PREFIX)
+            if (text.length() > maxStringLength) {
+                String shortened = text.substring(0, prefix)
                         + "[...]"
-                        + text.substring(text.length() - LOG_STRING_SUFFIX);
+                        + text.substring(text.length() - suffix);
                 return jsonMapper.stringNode(shortened);
             }
         }
@@ -1056,7 +1135,8 @@ public class WebUiProxy {
         }
 
         kwargsObj.put("reasoning_effort", effort);
-        LOG.debug("Injected reasoning_effort '{}' from budget {}", effort, budget);
+        LOG.debug("Injected reasoning_effort '{}' from budget {} (template labels {})",
+                effort, budget, templateEfforts());
     }
 
     /**
@@ -1099,12 +1179,14 @@ public class WebUiProxy {
             effort = enableThinking ? vllmEffortForBudget(reasoningBudget(llmRequest)) : null;
         }
 
+
         ObjectNode thinking = jsonMapper.createObjectNode();
         thinking.put("type", enableThinking ? "enabled" : "disabled");
         llmRequest.set("thinking", thinking);
 
         if (effort != null && !effort.isEmpty()) {
             llmRequest.put("reasoning_effort", effort);
+            LOG.debug("Set vLLM reasoning_effort '{}' (template labels {})", effort, templateEfforts());
         } else if (!hasExplicitEffort) {
             // No known level: still leave reasoning_effort absent so the backend default applies.
             llmRequest.remove("reasoning_effort");
@@ -1131,41 +1213,73 @@ public class WebUiProxy {
     }
 
     /**
-     * Maps a thinking/reasoning token budget to the corresponding effort label for llama.cpp.
-     * Matches {@code REASONING_EFFORT_TOKENS} in the Web UI (chat.service.ts):
-     * low=512, medium=2048, high=8192, max=-1 (unlimited; the UI omits the budget field
-     * for max, so the absent budget resolves to -1 here).
+     * Maps a thinking/reasoning token budget to the effort label accepted by the current model.
+     *
+     * <p>The label set is taken from the model's chat template whenever it declares one (see
+     * {@link #templateEfforts()}), so a template that uses a different vocabulary is served a label
+     * it actually accepts. DeepSeek-V4 for example branches on {@code high}/{@code max}, while
+     * Qwen3.8-Flash-Next only accepts {@code xhigh} (default), {@code medium} and {@code low} and
+     * rejects everything else with
+     * {@code Unexpected reasoning effort high. Supported types are xhigh (default), medium, and low.}</p>
+     *
+     * <p>Matches {@code REASONING_EFFORT_TOKENS} in the Web UI (chat.service.ts):
+     * low=512, medium=2048, high=8192, max=-1 (unlimited; the UI omits the budget field for max, so
+     * an absent budget resolves to -1 here). Without template information the llama.cpp label set
+     * {@code low/medium/high/max} is used.</p>
      *
      * @param budget the raw budget value (-1 when not present)
      * @return the effort label, or {@code null} if the budget is not a known level
      */
-    private static String reasoningEffortForBudget(int budget) {
-        return switch (budget) {
-            case 512 -> "low";
-            case 2048 -> "medium";
-            case 8192 -> "high";
-            case -1 -> "max";
-            default -> null;
-        };
+    private String reasoningEffortForBudget(int budget) {
+        return ReasoningEfforts.effortForBudget(budget, ReasoningEfforts.EFFORT_BY_BUDGET,
+                templateEfforts());
     }
 
     /**
-     * Maps a thinking/reasoning token budget to the DeepSeek OpenAI-format {@code reasoning_effort}
-     * label for a vLLM backend. DeepSeek only distinguishes {@code low}, {@code high} and
-     * {@code max}; there is no {@code medium}, so the UI's {@code medium} is raised to
-     * {@code high}. The UI's {@code high} maps to {@code high} (per convention, only {@code max}
-     * reaches {@code max}).
+     * Maps a thinking/reasoning token budget to the {@code reasoning_effort} label for a vLLM
+     * (DeepSeek OpenAI-format) backend. DeepSeek conventionally distinguishes {@code low},
+     * {@code high} and {@code max} and has no {@code medium}, so the UI's {@code medium} and
+     * {@code high} are both raised to {@code high} (per convention only {@code max} reaches
+     * {@code max}).
+     *
+     * <p>As in {@link #reasoningEffortForBudget(int)} the labels actually declared by the model's
+     * chat template take precedence over that convention: a template that accepts {@code medium}
+     * gets {@code medium}, and one that has no {@code max} (Qwen3.8-Flash-Next:
+     * {@code xhigh}/{@code medium}/{@code low}) receives its top level instead of a rejected
+     * {@code max}.</p>
      *
      * @param budget the raw budget value (-1 when not present)
      * @return the DeepSeek effort label, or {@code null} if the budget is not a known level
      */
-    private static String vllmEffortForBudget(int budget) {
-        return switch (budget) {
-            case 512 -> "low";
-            case 2048, 8192 -> "high";
-            case -1 -> "max";
-            default -> null;
-        };
+    private String vllmEffortForBudget(int budget) {
+        return ReasoningEfforts.effortForBudget(budget, ReasoningEfforts.VLLM_EFFORT_BY_BUDGET,
+                templateEfforts());
+    }
+
+    /**
+     * The reasoning-effort labels the chat template of the configured model accepts, e.g.
+     * {@code [high, max]} for DeepSeek-V4 or {@code [xhigh, medium, low]} for Qwen3.8-Flash-Next.
+     * The parsing itself lives in {@link ReasoningEfforts#parseTemplateEfforts(String)}; here the
+     * result is cached because a template can be several hundred kB and is read on every request.
+     *
+     * <p>An empty list means the template declares no effort vocabulary (or no template was found),
+     * in which case the backend default labels are used.</p>
+     *
+     * @return the declared labels in template order, empty if none are declared
+     */
+    private synchronized List<String> templateEfforts() {
+        if (templateEffortsCache == null) {
+            String template = loadChatTemplate();
+            templateEffortsCache = ReasoningEfforts.parseTemplateEfforts(template);
+            if (templateEffortsCache.isEmpty()) {
+                LOG.info("Model {}: chat template declares no reasoning_effort labels, keeping the "
+                        + "backend default labels", getModelName());
+            } else {
+                LOG.info("Model {}: chat template accepts reasoning effort labels {}",
+                        getModelName(), templateEffortsCache);
+            }
+        }
+        return templateEffortsCache;
     }
 
     /**
@@ -1267,6 +1381,11 @@ public class WebUiProxy {
 
         String requestOut = jsonMapper.writeValueAsString(llmRequest);
         LOG.debug("LLM Request: {}", shortenRequestBody(requestOut));
+
+        // Optional DEBUG dump of the answer (property webui.logResponses). The collector is only
+        // created when that switch is on - otherwise the streaming path neither buffers the chunks
+        // nor re-serializes a summary, which is the whole point of the extra property.
+        SseResponseLog responseLog = responseLogEnabled() ? new SseResponseLog(jsonMapper) : null;
 
         // Build target URL: modelUrl + requestPath
         String targetUrl = getModelUrl();
@@ -1375,9 +1494,14 @@ public class WebUiProxy {
             try (InputStream is = connection.getInputStream();
                  OutputStream os = clientResponse.getOutputStream()) {
                 copyStream(is, os, sseDataLines, firstContentTime, firstOutputNano,
-                        BACKEND_VLLM.equalsIgnoreCase(backend), tsStartNano);
+                        BACKEND_VLLM.equalsIgnoreCase(backend), tsStartNano, responseLog);
                 // Ensure flush happens at the end
                 os.flush();
+            }
+
+            // Response dump: one line per request, assembled from the chunks (see SseResponseLog).
+            if (responseLog != null) {
+                LOG.debug("LLM Response (streamed): {}", shortenResponseBody(responseLog.toLogString()));
             }
 
             // --- USAGE STATISTICS ---
@@ -1387,9 +1511,10 @@ public class WebUiProxy {
             recordUsageStatistics(tsStart, sseDataLines, sampleMetrics,
                     metricsBefore, firstOutputNano, tsStartNano, tsEndNano);
 
-            // Diagnostic: report how much of the streamed output was reasoning vs answer.
-            // Confirms whether the backend actually engaged thinking mode.
-            analyzeReasoningOutput(sseDataLines);
+            // Diagnostic: report how the output split over reasoning, answer and tool calls.
+            // Confirms whether the backend actually engaged thinking mode. The response-log
+            // collector (when active) supplies whole-stream counts, see the method javadoc.
+            analyzeReasoningOutput(sseDataLines, responseLog);
 
         } catch (IOException e) {
             LOG.error("IO-error while calling LLM ({}): {}", url, e.getMessage(), e);
@@ -1797,46 +1922,104 @@ public class WebUiProxy {
     }
 
     /**
-     * Diagnostic: counts how much of the streamed output was reasoning vs answer content.
+     * Diagnostic: reports how the generated output is distributed over chain-of-thought, answer
+     * content and tool-call arguments.
      *
-     * <p>The DeepSeek API returns the chain-of-thought in the {@code reasoning_content} field at
-     * the same level as {@code content}. This method inspects the collected SSE data lines and
-     * totals the lengths of {@code reasoning_content} and {@code content} deltas, so it is
-     * possible to confirm whether the backend actually engaged thinking mode instead of guessing
-     * from the token count alone.</p>
+     * <p>Reasoning arrives in the {@code reasoning_content} field at the same level as
+     * {@code content} (vLLM spells it {@code reasoning}); the counts make it possible to confirm
+     * whether the backend actually engaged thinking mode instead of guessing from the token count
+     * alone.</p>
      *
-     * @param sseDataLines the SSE data line JSON strings collected during the stream (may be empty)
+     * <p>The counts prefer {@link SseResponseLog}, which sees <em>every</em> chunk. That matters:
+     * {@code sseDataLines} is filled for usage extraction only and keeps just the last chunks
+     * before {@code [DONE]}, so scanning the tail alone would report {@code reasoningChars=0} for
+     * a long chain of thought that simply streamed earlier. Without the collector the tail scan
+     * remains as a fallback and the log line says so explicitly rather than implying a zero.</p>
+     *
+     * <p>Tool-call arguments are counted too, because a turn ending in
+     * {@code finish_reason=tool_calls} produces no answer content by design; without
+     * {@code toolCallChars} and {@code finishReason} such a turn is indistinguishable from an
+     * empty or failed answer.</p>
+     *
+     * @param sseDataLines the SSE data lines kept for usage extraction (tail of the stream)
+     * @param responseLog  whole-stream collector, or null when {@value #PROP_LOG_RESPONSES} is off
      */
-    private void analyzeReasoningOutput(List<String> sseDataLines) {
-        if (sseDataLines == null || sseDataLines.isEmpty()) {
+    private void analyzeReasoningOutput(List<String> sseDataLines, SseResponseLog responseLog) {
+        if (responseLog == null && (sseDataLines == null || sseDataLines.isEmpty())) {
             return;
         }
-        int reasoningChars = 0;
-        int contentChars = 0;
-        for (String line : sseDataLines) {
-            try {
-                JsonNode node = jsonMapper.readTree(line);
-                JsonNode choice = !node.path("choices").isEmpty() ? node.path("choices").get(0) : null;
-                if (choice == null) {
-                    continue;
-                }
-                JsonNode delta = choice.get("delta");
-                if (delta != null) {
-                    JsonNode reasoning = delta.get("reasoning_content");
-                    JsonNode content = delta.get("content");
-                    if (reasoning != null && reasoning.isString()) {
-                        reasoningChars += reasoning.asString().length();
+        final long reasoningChars;
+        final long contentChars;
+        final long toolCallChars;
+        final Object finishReason;
+        final Object chunkCount;
+        final String scope;
+        if (responseLog != null) {
+            reasoningChars = responseLog.reasoningCharsTotal();
+            contentChars = responseLog.contentCharsTotal();
+            toolCallChars = responseLog.toolCallCharsTotal();
+            String reason = responseLog.finishReasonValue();
+            finishReason = reason != null ? reason : "n/a";
+            chunkCount = responseLog.chunkCount();
+            scope = "";
+        } else {
+            long tailReasoning = 0L;
+            long tailContent = 0L;
+            long tailToolCalls = 0L;
+            String tailFinishReason = null;
+            for (String line : sseDataLines) {
+                try {
+                    JsonNode node = jsonMapper.readTree(line);
+                    JsonNode choice = !node.path("choices").isEmpty() ? node.path("choices").get(0) : null;
+                    if (choice == null) {
+                        continue;
                     }
-                    if (content != null && content.isString()) {
-                        contentChars += content.asString().length();
+                    JsonNode reasonNode = choice.get("finish_reason");
+                    if (reasonNode != null && reasonNode.isString()) {
+                        tailFinishReason = reasonNode.asString();
                     }
+                    JsonNode delta = choice.get("delta");
+                    if (delta != null) {
+                        tailReasoning += textLength(delta, "reasoning_content")
+                                + textLength(delta, "reasoning");
+                        tailContent += textLength(delta, "content");
+                        JsonNode toolCalls = delta.get("tool_calls");
+                        if (toolCalls != null && toolCalls.isArray()) {
+                            for (int i = 0; i < toolCalls.size(); i++) {
+                                JsonNode entry = toolCalls.get(i);
+                                tailToolCalls += textLength(entry == null ? null : entry.get("function"),
+                                        "arguments");
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    // ignore non-JSON / parse errors in diagnostic
                 }
-            } catch (Exception e) {
-                // ignore non-JSON / parse errors in diagnostic
             }
+            reasoningChars = tailReasoning;
+            contentChars = tailContent;
+            toolCallChars = tailToolCalls;
+            finishReason = tailFinishReason != null ? tailFinishReason : "n/a";
+            chunkCount = "n/a";
+            scope = " (tail-only scan, " + PROP_LOG_RESPONSES + " off)";
         }
-        LOG.info("Reasoning-output analysis: reasoningChars={}, contentChars={}, totalSseLines={}",
-                reasoningChars, contentChars, sseDataLines.size());
+        LOG.info("Reasoning-output analysis: reasoningChars={}, contentChars={}, toolCallChars={},"
+                        + " finishReason={}, chunks={}, usageSseLines={}{}",
+                reasoningChars, contentChars, toolCallChars, finishReason, chunkCount,
+                sseDataLines == null ? 0 : sseDataLines.size(), scope);
+    }
+
+    /**
+     * @param node  JSON object to read from, may be null
+     * @param field field name
+     * @return length of the string value under {@code field}, 0 when absent or not a string
+     */
+    private static int textLength(JsonNode node, String field) {
+        if (node == null) {
+            return 0;
+        }
+        JsonNode value = node.get(field);
+        return (value != null && value.isString()) ? value.asString().length() : 0;
     }
 
     /**
@@ -2012,6 +2195,11 @@ public class WebUiProxy {
             responseBody = rewriteReasoningFieldInBody(responseBody);
         }
 
+        // Response dump (webui.logResponses): the buffered body as the client receives it.
+        if (responseLogEnabled()) {
+            LOG.debug("LLM Response (buffered): {}", shortenResponseBody(responseBody));
+        }
+
         // Try to parse usage from the non-streaming JSON response
         try {
             JsonNode responseNode = jsonMapper.readTree(responseBody);
@@ -2067,7 +2255,9 @@ public class WebUiProxy {
      * no rates, so the Web UI cannot show live token/s statistics while streaming. The proxy
      * fills this gap by computing the prompt and generation rates from the cumulative token
      * counts and the wall-clock time of the incoming SSE chunks (plus the request send time),
-     * mirroring the {@code timings} shape llama.cpp sends.</p>
+     * mirroring the {@code timings} shape llama.cpp sends. Implausible rates are screened per
+     * rate, so a prompt rate beyond the ceiling no longer hides the generation rate the Web UI
+     * renders - see {@link #enrichVllmSseLine}.</p>
      *
      * @param in               source input stream
      * @param out              target output stream
@@ -2079,12 +2269,21 @@ public class WebUiProxy {
      *                         fallback PP/TG split (may be null)
      * @param rewriteFlashReasoning whether to apply the vLLM-specific SSE enrichment (reasoning rewrite + live timings)
      * @param tsStartNano      {@link System#nanoTime()} of the request start, reference for the prompt rate
+     * <p>Independently of the backend, the {@value #PROP_SUPPRESS_TOOLCALL_INTERLEAVE} switch
+     * removes blank answer content that arrives between two tool calls. The DEBUG lines below
+     * ({@code ResponseDump-debug}, {@code SSE line (early)}) intentionally still show the
+     * unfiltered payload, so the log keeps describing what the backend sent; the filtered line is
+     * logged separately and the number of removals is summarized at the end of the stream.</p>
+     *
+     * @param responseLog      optional collector for the {@value #PROP_LOG_RESPONSES} DEBUG dump;
+     *                         {@code null} disables the extra bookkeeping
      * @throws IOException if an I/O error occurs
      */
     private void copyStream(InputStream in, OutputStream out, List<String> sseDataLines,
                             AtomicReference<LocalDateTime> firstContentTime,
                             AtomicLong firstOutputNano,
-                            boolean rewriteFlashReasoning, long tsStartNano) throws IOException {
+                            boolean rewriteFlashReasoning, long tsStartNano,
+                            SseResponseLog responseLog) throws IOException {
         // Buffer for a partial SSE data line that was split across chunk boundaries.
         StringBuilder pendingData = new StringBuilder();
         byte[] buffer = new byte[4096];
@@ -2093,6 +2292,8 @@ public class WebUiProxy {
         List<String> lastTwoLines = new ArrayList<>();
         // vLLM per-chunk timing state (only consumed while rewriteFlashReasoning is active).
         VllmTimingState vllmTiming = new VllmTimingState();
+        // State of the blank-content-between-tool-calls filter (only used when the switch is on).
+        ToolCallInterleaveState interleaveState = new ToolCallInterleaveState();
 
         while ((bytesRead = in.read(buffer)) != -1) {
             String chunk = new String(buffer, 0, bytesRead, StandardCharsets.UTF_8);
@@ -2101,7 +2302,7 @@ public class WebUiProxy {
             // (reasoning or answer) for the client TTFT / fallback PP/TG split. The answer-content
             // token is also recorded for diagnostics only.
             if (sseDataLines != null || firstContentTime != null || firstOutputNano != null
-                    || rewriteFlashReasoning) {
+                    || rewriteFlashReasoning || responseLog != null || suppressToolCallInterleave) {
                 // Prepend any pending data from a previous partial line
                 String parseText;
                 if (!pendingData.isEmpty()) {
@@ -2131,6 +2332,11 @@ public class WebUiProxy {
                         // DONE-lines never carry a delta, so they are skipped here.
                         if (!isDoneLine) {
                             recordFirstTokenTiming(dataLine, firstContentTime, firstOutputNano);
+                            // Response dump (webui.logResponses): the raw payload, so the log shows
+                            // what the backend sent - not the "timings" synthesized for the client.
+                            if (responseLog != null) {
+                                responseLog.accept(dataLine);
+                            }
                         }
                         // The line forwarded to the client: for vLLM this is the reasoning rewrite
                         // plus a synthesized llama.cpp-style "timings" node (live token/s rates).
@@ -2143,12 +2349,25 @@ public class WebUiProxy {
                             clientLine = enrichVllmSseLine(dataLine, tsStartNano, vllmTiming);
                             collectedLine = rewriteReasoningField(dataLine);
                         }
+                        //LOG.debug("ResponseDump-debug: {}", clientLine);
                         if (lineCount < 2) {
                             LOG.debug("SSE line (early): {}", clientLine);
                         } else if (!isDoneLine) {
                             lastTwoLines.add(collectedLine);
                             if (lastTwoLines.size() > 2) {
                                 lastTwoLines.remove(0);
+                            }
+                        }
+
+                        // Optional workaround for the Web UI tool-call assembler: drop a blank
+                        // content delta that lands between two tool calls. Applied after the DEBUG
+                        // lines above, which keep describing the payload as the backend sent it.
+                        if (!isDoneLine) {
+                            String filteredLine = stripToolCallInterleaveContent(clientLine, interleaveState);
+                            if (!filteredLine.equals(clientLine)) {
+                                LOG.debug("SSE line filtered for client (blank content removed): {}",
+                                        filteredLine);
+                                clientLine = filteredLine;
                             }
                         }
                         lineCount++;
@@ -2175,6 +2394,140 @@ public class WebUiProxy {
 
         if (!lastTwoLines.isEmpty()) {
             LOG.debug("SSE last two lines: {}", lastTwoLines);
+        }
+
+        if (interleaveState.suppressedDeltas > 0) {
+            LOG.info("Suppressed {} blank content delta(s) ({} chars) between tool calls before"
+                            + " forwarding to the Web UI (model='{}', {}=true).",
+                    interleaveState.suppressedDeltas, interleaveState.suppressedChars,
+                    getModelName(), PROP_SUPPRESS_TOOLCALL_INTERLEAVE);
+        }
+
+        // Only nonzero while the vLLM enrichment ran: both counters say which fields the Web UI did
+        // not see. The first one is cosmetic (it drops the prompt rate), the second one removes the
+        // live token/s of that chunk and is worth investigating when it is not negligible.
+        if (vllmTiming.implausiblePromptRates > 0 || vllmTiming.implausibleGenerationRates > 0) {
+            LOG.info("Skipped synthesized timings fields above {} token/s (model='{}'): {} chunk(s)"
+                            + " without prompt_per_second, {} chunk(s) without timings. The prompt rate"
+                            + " is screened without the prefix-cache tokens; only the second counter"
+                            + " affects the live token/s of the Web UI.",
+                    (long) MAX_PLAUSIBLE_TOKENS_PER_SECOND, getModelName(),
+                    vllmTiming.implausiblePromptRates, vllmTiming.implausibleGenerationRates);
+        }
+
+        // The Web UI renders a token/s figure only for chunks carrying a timings node, so a stream
+        // without a single one needs an explanation of its own: either the backend never reported
+        // per-chunk counters (stream_options.continuous_usage_stats not in effect at the endpoint
+        // the proxy talks to) or every rate was screened out above.
+        if (rewriteFlashReasoning && vllmTiming.timingsChunks == 0) {
+            LOG.info("No timings synthesized for the Web UI in this vLLM stream: {} data line(s), {}"
+                            + " carrying usage counters, {} skipped as implausible (model='{}'). Without"
+                            + " per-chunk usage there is nothing to compute a live token/s rate from.",
+                    lineCount, vllmTiming.usageChunks, vllmTiming.implausibleGenerationRates,
+                    getModelName());
+        } else if (rewriteFlashReasoning) {
+            LOG.debug("Synthesized timings in {} of {} vLLM data line(s) ({} carried usage counters,"
+                            + " model='{}').", vllmTiming.timingsChunks, lineCount,
+                    vllmTiming.usageChunks, getModelName());
+        }
+    }
+
+    /**
+     * Removes blank answer content that a model emits <em>between two tool calls</em>.
+     *
+     * <p>Workaround for the Web UI tool-call assembler, which treats <em>any</em>
+     * {@code choices[].delta.content} as the end of a tool-call batch and adds the number of
+     * calls collected so far as an index offset to the following batch. A model/backend pair that
+     * terminates every tool-call block with a newline token therefore makes the assembler write
+     * the next call to {@code index + offset} and pad the list in between with an entry that has
+     * neither id, name nor arguments. The UI persists that phantom call into the chat history,
+     * where it survives as a tool call that was never made and that no tool result answers.</p>
+     *
+     * <p>Conservative by construction: only a {@code content} field whose text is blank is
+     * removed, only after a {@code tool_calls} delta appeared in the same stream, and only in the
+     * line forwarded to the client. Non-blank content, reasoning deltas, everything before the
+     * first tool call and any payload that cannot be parsed are forwarded unchanged. The remainder
+     * of a filtered chunk is kept, so a {@code finish_reason} or the synthesized {@code timings}
+     * node travelling on the same line survives.</p>
+     *
+     * <p>Note that the underlying assembler bug stays untouched: a model that writes <em>real</em>
+     * text between two parallel tool calls still triggers the offset mix-up. Fixing that needs the
+     * Web UI change (never pad an index beyond the end of the collected list).</p>
+     *
+     * @param clientLine the line about to be forwarded (already enriched, or {@code [DONE]})
+     * @param state      bookkeeping of the current {@link #copyStream} invocation
+     * @return the line to forward; identical to {@code clientLine} unless content was removed
+     */
+    String stripToolCallInterleaveContent(String clientLine, ToolCallInterleaveState state) {
+        if (!suppressToolCallInterleave || state == null || clientLine == null
+                || clientLine.isEmpty() || "[DONE]".equals(clientLine)) {
+            return clientLine;
+        }
+        JsonNode root;
+        try {
+            root = jsonMapper.readTree(clientLine);
+        } catch (RuntimeException e) {
+            // A payload that cannot be parsed is never dropped: forward it and let the client decide.
+            return clientLine;
+        }
+        JsonNode delta = root.path("choices").path(0).path("delta");
+        if (!(delta instanceof ObjectNode deltaObject)) {
+            return clientLine;
+        }
+
+        JsonNode toolCalls = deltaObject.get("tool_calls");
+        if (toolCalls != null && toolCalls.isArray() && toolCalls.size() > 0) {
+            // A batch is open as soon as an earlier chunk of this stream carried a tool call.
+            boolean batchWasOpen = state.maxToolCallIndex >= 0;
+            for (JsonNode toolCall : toolCalls) {
+                int index = toolCall.path("index").asInt(-1);
+                if (index > state.maxToolCallIndex) {
+                    state.maxToolCallIndex = index;
+                }
+            }
+            // Some backends put the tool calls and the stray newline into the same chunk; that
+            // content closes the batch in the Web UI just the same, so it goes as well.
+            return batchWasOpen ? dropBlankContent(root, deltaObject, state, clientLine) : clientLine;
+        }
+
+        // Without an open batch the newline belongs to the answer rather than to a tool-call
+        // interleave, so the switch is deliberately inactive before the first tool call.
+        if (state.maxToolCallIndex < 0) {
+            return clientLine;
+        }
+        return dropBlankContent(root, deltaObject, state, clientLine);
+    }
+
+    /**
+     * Removes a blank {@code content} field of a delta from the line and counts the removal. A
+     * delta without a content field, or with one that is not blank, is left alone.
+     *
+     * @param root         chunk the delta belongs to (mutated when the content is removed)
+     * @param delta        delta object of the chunk
+     * @param state        bookkeeping of the current {@link #copyStream} invocation
+     * @param fallbackLine line to return when nothing is removed or serialization fails
+     * @return the re-serialized line, or {@code fallbackLine}
+     */
+    private String dropBlankContent(JsonNode root, ObjectNode delta, ToolCallInterleaveState state,
+                                    String fallbackLine) {
+        JsonNode contentNode = delta.get("content");
+        if (contentNode == null || !contentNode.isString()) {
+            return fallbackLine;
+        }
+        String content = contentNode.asString("");
+        if (!content.isBlank()) {
+            // Real answer text is never touched.
+            return fallbackLine;
+        }
+
+        delta.remove("content");
+        state.suppressedDeltas++;
+        state.suppressedChars += content.length();
+        try {
+            return jsonMapper.writeValueAsString(root);
+        } catch (RuntimeException e) {
+            // Serialization failed after the removal: fall back to the untouched line.
+            return fallbackLine;
         }
     }
 
@@ -2334,18 +2687,26 @@ public class WebUiProxy {
      *       since the first completion token,</li>
      *   <li>{@code predicted_per_token_ms} - milliseconds per generated token.</li>
      * </ul>
-     * If either computed rate exceeds {@link #MAX_PLAUSIBLE_TOKENS_PER_SECOND} the timings
-     * enrichment is skipped for this chunk (the counters alone would otherwise present an
-     * artefact as a believable speed, e.g. measured over a near-zero millisecond span). The
-     * reasoning rewrite of {@link #rewriteReasoningField} is still applied in the same parse
-     * pass.</p>
+     * Both rates are screened against {@link #MAX_PLAUSIBLE_TOKENS_PER_SECOND} <em>separately</em>,
+     * because they protect different fields: an implausible <em>generation</em> rate skips the whole
+     * node (the Web UI recomputes the live rate from {@code predicted_n}/{@code predicted_ms}, so the
+     * counters alone would present the artefact as a believable speed, and a node without them would
+     * reset the counters the client already shows), while an implausible <em>prompt</em> rate only
+     * drops {@code prompt_per_second} and leaves the counters plus the generation rate in place. The
+     * prompt rate is judged on the tokens the prefix cache did not serve - its reported value stays
+     * the llama.cpp-style rate over all prompt tokens - since a warm cache drives the raw figure far
+     * past the ceiling without being an artefact. The reasoning rewrite of
+     * {@link #rewriteReasoningField} is still applied in the same parse pass.</p>
+     *
+     * <p>Package-private instead of private so the unit test (same package) can drive the
+     * enrichment without a running backend.</p>
      *
      * @param dataLine    the raw SSE data payload
      * @param tsStartNano {@link System#nanoTime()} of the request start (prompt rate reference)
-     * @param timing      per-stream timing state (generation-start time)
+     * @param timing      per-stream timing state (generation-start time, suppression counters)
      * @return the enriched data payload, or the original line if it is not a JSON object
      */
-    private String enrichVllmSseLine(String dataLine, long tsStartNano, VllmTimingState timing) {
+    String enrichVllmSseLine(String dataLine, long tsStartNano, VllmTimingState timing) {
         JsonNode node;
         try {
             node = jsonMapper.readTree(dataLine);
@@ -2362,6 +2723,7 @@ public class WebUiProxy {
 
         JsonNode usageNode = node.get("usage");
         if (usageNode != null && usageNode.isObject() && usageNode.has("completion_tokens")) {
+            timing.usageChunks++;
             long now = System.nanoTime();
 
             long promptN = usageNode.has("prompt_tokens") ? usageNode.get("prompt_tokens").asLong() : 0L;
@@ -2385,19 +2747,40 @@ public class WebUiProxy {
             double promptPerSecond = promptMs > 0 ? promptN * 1000.0 / promptMs : 0.0;
             double predictedPerSecond = genMs > 0 ? completionN * 1000.0 / genMs : 0.0;
 
-            // Implausible rates are timing artefacts, skip the timings enrichment for this chunk.
-            if (promptPerSecond <= MAX_PLAUSIBLE_TOKENS_PER_SECOND
-                    && predictedPerSecond <= MAX_PLAUSIBLE_TOKENS_PER_SECOND) {
+            // Generation rate: the Web UI derives its live token/s figure from predicted_n and
+            // predicted_ms, so an artefact rate cannot be filtered by dropping the rate field alone.
+            // Without the node the client simply keeps the state of the previous chunk, which is
+            // better than a partial node that zeroes the counters of the status line.
+            if (predictedPerSecond > MAX_PLAUSIBLE_TOKENS_PER_SECOND) {
+                timing.implausibleGenerationRates++;
+            } else {
                 ObjectNode timings = jsonMapper.createObjectNode();
                 timings.put("prompt_n", promptN);
                 timings.put("prompt_ms", promptMs);
-                timings.put("prompt_per_second", promptPerSecond);
+
+                // Prompt rate: judged without the tokens the prefix cache served. The reported value
+                // keeps the llama.cpp meaning (all prompt tokens over the prompt time), only the
+                // plausibility test is corrected - otherwise a cache-warm prompt (15k tokens in
+                // 370 ms = 40k token/s) would be mistaken for a timing artefact.
+                long cachedN = cachedPromptTokens(usageNode, promptN);
+                double promptRateCandidate = cachedN >= 0L && promptMs > 0
+                        ? (promptN - cachedN) * 1000.0 / promptMs
+                        : promptPerSecond;
+                if (promptRateCandidate <= MAX_PLAUSIBLE_TOKENS_PER_SECOND) {
+                    timings.put("prompt_per_second", promptPerSecond);
+                } else {
+                    // The counters stay, they feed the context display of the Web UI.
+                    timing.implausiblePromptRates++;
+                }
+
                 timings.put("predicted_n", completionN);
                 timings.put("predicted_ms", genMs);
-                timings.put("predicted_per_token_ms", genMs > 0 && completionN > 0 ? (double) genMs / completionN : 0.0);
+                timings.put("predicted_per_token_ms",
+                        genMs > 0 && completionN > 0 ? (double) genMs / completionN : 0.0);
                 timings.put("predicted_per_second", predictedPerSecond);
 
                 ((ObjectNode) node).set("timings", timings);
+                timing.timingsChunks++;
                 changed = true;
             }
         }
@@ -2417,14 +2800,411 @@ public class WebUiProxy {
     }
 
     /**
+     * Reads the prompt tokens served from the prefix cache out of a usage node
+     * ({@code usage.prompt_tokens_details.cached_tokens}, reported by vLLM).
+     *
+     * <p>The value is only used to screen the synthesized prompt rate, never reported on its own:
+     * {@code timings.prompt_n} keeps counting all prompt tokens, which is what the Web UI expects
+     * for its context size (it adds its own {@code cache_n}, which stays unreported here).</p>
+     *
+     * @param usageNode the {@code usage} node of the chunk
+     * @param promptN   total prompt tokens of the same node, used as a sanity bound
+     * @return the cached prompt tokens or {@code -1} if unreported, non-numeric or out of range
+     */
+    private static long cachedPromptTokens(JsonNode usageNode, long promptN) {
+        JsonNode cachedNode = usageNode.path("prompt_tokens_details").path("cached_tokens");
+        if (!cachedNode.isNumber()) {
+            return -1L;
+        }
+        long cachedTokens = cachedNode.asLong();
+        return (cachedTokens >= 0L && cachedTokens <= promptN) ? cachedTokens : -1L;
+    }
+
+    /**
+     * Collector for the {@value #PROP_LOG_RESPONSES} DEBUG dump of an LLM response: it merges the
+     * SSE chunks into one compact JSON object so an answer appears as a <em>single</em> log line
+     * next to the "LLM Request" line instead of hundreds of chunk lines.
+     *
+     * <p>{@link #accept(String)} is fed the raw {@code data:} payloads; reasoning and answer
+     * deltas are concatenated, the last reported {@code finish_reason}, {@code model} and
+     * {@code usage} are kept and the number of chunks is counted. A buffered (non-streaming)
+     * payload keeps its text in {@code choices[].message} instead of {@code choices[].delta} and
+     * is handled the same way, as is the vLLM spelling {@code reasoning} (llama.cpp and the Web UI
+     * use {@code reasoning_content}).</p>
+     *
+     * <p>Tool calls are captured too, keyed by the streamed {@code index}: a turn that ends with
+     * {@code finish_reason=tool_calls} carries its whole payload in {@code delta.tool_calls}, so
+     * without them the dump would show the finish reason while hiding both the invoked tool and
+     * its arguments - often the larger part of the generated tokens.</p>
+     *
+     * <p>Per-part character totals ({@link #reasoningCharsTotal()} and friends) are tallied over
+     * <em>every</em> chunk and are not subject to the capture cap, which makes them usable for
+     * {@link #analyzeReasoningOutput} without holding a long chain of thought in memory.</p>
+     *
+     * <p>It is instantiated only when {@link #responseLogEnabled()} answers true, so a disabled
+     * switch means no buffering and no per-chunk JSON work at all. Captured text is bounded
+     * ({@value #RESPONSE_LOG_MAX_CHARS_PER_PART} characters per part) - a long chain of thought
+     * must not be held in memory for a debug line; the dropped characters are named in the output
+     * and the whole line is shortened by {@link #shortenResponseBody} anyway.</p>
+     */
+    private static final class SseResponseLog {
+
+        /** Mapper for reading the chunks and rendering the summary. */
+        private final JsonMapper jsonMapper;
+        /** Concatenated chain-of-thought deltas. */
+        private final BoundedText reasoning = new BoundedText(RESPONSE_LOG_MAX_CHARS_PER_PART);
+        /** Concatenated answer deltas. */
+        private final BoundedText answer = new BoundedText(RESPONSE_LOG_MAX_CHARS_PER_PART);
+        /**
+         * Tool-call accumulators keyed by the streamed {@code index}
+         * ({@code choices[].delta.tool_calls[]}). Insertion order is kept, which matches the
+         * order in which the model emitted the calls.
+         */
+        private final Map<Integer, ToolCallLog> toolCalls = new LinkedHashMap<>();
+        /** Chain-of-thought characters seen in total, counted before the {@link BoundedText} cap. */
+        private long reasoningChars = 0L;
+        /** Answer characters seen in total, counted before the {@link BoundedText} cap. */
+        private long contentChars = 0L;
+        /** {@code function.arguments} characters seen in total, across all tool calls. */
+        private long toolCallChars = 0L;
+        /** Model name as reported by the server (first chunk naming one). */
+        private String model;
+        /** Last non-empty {@code finish_reason} (stop, length, tool_calls, ...). */
+        private String finishReason;
+        /** {@code usage} object of the last chunk that carried one. */
+        private JsonNode usage;
+        /** Number of chunks fed in. */
+        private int chunks = 0;
+        /** Number of chunks whose payload was not decodable JSON (keep-alive frames and alike). */
+        private int unparsableChunks = 0;
+
+        /**
+         * @param jsonMapper mapper used to parse the chunk payloads and to render the summary
+         */
+        SseResponseLog(JsonMapper jsonMapper) {
+            this.jsonMapper = jsonMapper;
+        }
+
+        /**
+         * Consumes a single SSE data payload (without the {@code data:} prefix). A payload that
+         * is not JSON only bumps the counters - the dump must never break a running stream.
+         *
+         * @param dataLine raw chunk payload
+         */
+        void accept(String dataLine) {
+            chunks++;
+            JsonNode node;
+            try {
+                node = jsonMapper.readTree(dataLine);
+            } catch (RuntimeException e) {
+                unparsableChunks++;
+                return;
+            }
+            if (node == null || !node.isObject()) {
+                return;
+            }
+            JsonNode modelNode = node.get("model");
+            if (model == null && modelNode != null && modelNode.isString()) {
+                model = modelNode.asString();
+            }
+            JsonNode usageNode = node.get("usage");
+            if (usageNode != null && usageNode.isObject()) {
+                // Last chunk carrying usage wins (stream_options.include_usage / continuous stats).
+                // Detached copy: the summary owns everything it renders.
+                usage = usageNode.deepCopy();
+            }
+            JsonNode choices = node.get("choices");
+            if (choices == null || !choices.isArray() || choices.isEmpty()) {
+                return;
+            }
+            JsonNode choice = choices.get(0);
+            JsonNode finishNode = choice.get("finish_reason");
+            if (finishNode != null && finishNode.isString()) {
+                finishReason = finishNode.asString();
+            }
+            // Streaming sends the deltas in "delta", a buffered response in "message".
+            JsonNode part = choice.get("delta");
+            if (part == null || !part.isObject()) {
+                part = choice.get("message");
+            }
+            if (part == null || !part.isObject()) {
+                return;
+            }
+            String reasoningContent = textOf(part, "reasoning_content");
+            String reasoningVllm = textOf(part, "reasoning");
+            String answerDelta = textOf(part, "content");
+            reasoning.append(reasoningContent);
+            reasoning.append(reasoningVllm);
+            answer.append(answerDelta);
+            // Tally over the whole stream, deliberately taken before the BoundedText cap: a
+            // longer chain of thought is truncated in the dump but must still be countable here.
+            reasoningChars += lengthOf(reasoningContent) + lengthOf(reasoningVllm);
+            contentChars += lengthOf(answerDelta);
+            collectToolCalls(part.get("tool_calls"));
+        }
+
+        /**
+         * Folds a {@code tool_calls} array into {@link #toolCalls}, for both shapes it occurs in:
+         * streamed {@code delta.tool_calls} fragments of one call spread over many chunks, and the
+         * complete {@code choices[].message.tool_calls} array of a buffered response.
+         *
+         * <p>Streaming opens a call with the fragment carrying {@code id} and
+         * {@code function.name}; later fragments append to {@code function.arguments} only. A
+         * captured {@code id}/{@code name} is therefore never overwritten by a later null, while
+         * the argument fragments are concatenated in arrival order. Arguments are kept as the
+         * JSON string the backend sends and are not re-parsed, so a stream that breaks mid-call
+         * still shows the part that arrived.</p>
+         *
+         * @param toolCallsNode the {@code tool_calls} node of a delta/message; null and non-array
+         *                      values are ignored, so an unexpected shape cannot break the stream
+         */
+        private void collectToolCalls(JsonNode toolCallsNode) {
+            if (toolCallsNode == null || !toolCallsNode.isArray()) {
+                return;
+            }
+            for (int position = 0; position < toolCallsNode.size(); position++) {
+                JsonNode entry = toolCallsNode.get(position);
+                if (entry == null || !entry.isObject()) {
+                    continue;
+                }
+                String id = textOf(entry, "id");
+                JsonNode function = entry.get("function");
+                boolean hasFunction = function != null && function.isObject();
+                String name = hasFunction ? textOf(function, "name") : null;
+                String arguments = hasFunction ? textOf(function, "arguments") : null;
+                if (id == null && name == null && arguments == null) {
+                    // Element carries nothing (some backends emit empty tool_calls placeholders);
+                    // registering it would put a nameless phantom call into the dump.
+                    continue;
+                }
+                // The streamed "index" identifies a call; buffered payloads commonly omit it,
+                // then the array position is the best available key.
+                int index = entry.path("index").asInt(position);
+                ToolCallLog call = toolCalls.computeIfAbsent(index, key -> new ToolCallLog());
+                if (id != null) {
+                    call.id = id;
+                }
+                if (name != null) {
+                    call.name = name;
+                }
+                if (arguments != null) {
+                    toolCallChars += arguments.length();
+                    call.arguments.append(arguments);
+                }
+            }
+        }
+
+        /**
+         * Renders what was collected as a compact JSON object, ready for
+         * {@link #shortenResponseBody}. Fields that never appeared in the stream are omitted.
+         *
+         * @return the response summary as JSON
+         */
+        String toLogString() {
+            ObjectNode summary = jsonMapper.createObjectNode();
+            if (model != null) {
+                summary.put("model", model);
+            }
+            summary.put("chunks", chunks);
+            if (unparsableChunks > 0) {
+                summary.put("unparsableChunks", unparsableChunks);
+            }
+            if (finishReason != null) {
+                summary.put("finish_reason", finishReason);
+            }
+            if (!reasoning.isEmpty()) {
+                summary.put("reasoning", reasoning.text());
+            }
+            if (!answer.isEmpty()) {
+                summary.put("content", answer.text());
+            }
+            if (!toolCalls.isEmpty()) {
+                ArrayNode toolCallArray = jsonMapper.createArrayNode();
+                for (ToolCallLog call : toolCalls.values()) {
+                    ObjectNode callNode = jsonMapper.createObjectNode();
+                    if (call.id != null) {
+                        callNode.put("id", call.id);
+                    }
+                    // Absent on a stream that was cut before the opening fragment arrived.
+                    callNode.put("name", call.name != null ? call.name : "<incomplete>");
+                    callNode.put("arguments", call.arguments.text());
+                    toolCallArray.add(callNode);
+                }
+                summary.set("tool_calls", toolCallArray);
+            }
+            if (usage != null) {
+                summary.set("usage", usage);
+            }
+            return jsonMapper.writeValueAsString(summary);
+        }
+
+        /**
+         * @return number of SSE chunk payloads fed in, including the {@code [DONE]} frame's
+         *         siblings; put smaller line counts (usage collection keeps only the tail) in
+         *         perspective
+         */
+        int chunkCount() {
+            return chunks;
+        }
+
+        /**
+         * @return last reported {@code finish_reason}, or null if the stream never named one
+         */
+        String finishReasonValue() {
+            return finishReason;
+        }
+
+        /**
+         * @return chain-of-thought characters of the whole stream, unaffected by the capture cap
+         */
+        long reasoningCharsTotal() {
+            return reasoningChars;
+        }
+
+        /**
+         * @return answer-content characters of the whole stream, unaffected by the capture cap
+         */
+        long contentCharsTotal() {
+            return contentChars;
+        }
+
+        /**
+         * @return {@code function.arguments} characters of the whole stream, across all tool calls
+         */
+        long toolCallCharsTotal() {
+            return toolCallChars;
+        }
+
+        /**
+         * Reads a text field of a delta/message node. Absent fields and explicit nulls - which
+         * OpenAI-compatible streams send while thinking, and again for everything but the changed
+         * field - yield null.
+         *
+         * @param part  the delta or message node
+         * @param field field name
+         * @return the text value or null
+         */
+        private static String textOf(JsonNode part, String field) {
+            JsonNode value = part.get(field);
+            return (value != null && value.isString()) ? value.asString() : null;
+        }
+
+        /**
+         * @param text text or null
+         * @return length of the text, 0 for null
+         */
+        private static int lengthOf(String text) {
+            return text == null ? 0 : text.length();
+        }
+
+        /**
+         * Accumulation slot of a single tool call within {@link SseResponseLog}: the identity
+         * scalars taken from the opening fragment plus the bounded argument text.
+         */
+        private static final class ToolCallLog {
+            /** Call id, from the fragment that opened this call. */
+            String id;
+            /** Function name, from the fragment that opened this call. */
+            String name;
+            /** Concatenated {@code function.arguments} fragments. */
+            final BoundedText arguments = new BoundedText(RESPONSE_LOG_MAX_CHARS_PER_PART);
+        }
+    }
+
+    /**
+     * Text accumulator with a hard character limit, used to capture the answer and the reasoning
+     * of a streamed response for the DEBUG dump. Once the limit is reached, further text is only
+     * counted; {@link #text()} then names the dropped characters so the log line does not look
+     * like the complete answer.
+     */
+    private static final class BoundedText {
+        /** Cap for the captured characters. */
+        private final int maxChars;
+        /** Captured characters. */
+        private final StringBuilder sb;
+        /** Characters seen beyond the cap. */
+        private long droppedChars = 0L;
+
+        /**
+         * @param maxChars maximum number of characters to keep
+         */
+        BoundedText(int maxChars) {
+            this.maxChars = maxChars;
+            this.sb = new StringBuilder(Math.min(256, maxChars));
+        }
+
+        /**
+         * Appends a delta; null, empty and over-limit text are ignored (and counted).
+         *
+         * @param text delta text or null
+         */
+        void append(String text) {
+            if (text == null || text.isEmpty()) {
+                return;
+            }
+            int free = maxChars - sb.length();
+            if (free <= 0) {
+                droppedChars += text.length();
+            } else if (text.length() > free) {
+                sb.append(text, 0, free);
+                droppedChars += text.length() - free;
+            } else {
+                sb.append(text);
+            }
+        }
+
+        /**
+         * @return true if nothing was captured
+         */
+        boolean isEmpty() {
+            return sb.isEmpty();
+        }
+
+        /**
+         * @return the captured text, suffixed by the number of dropped characters if any
+         */
+        String text() {
+            if (droppedChars == 0L) {
+                return sb.toString();
+            }
+            return sb.append(" [...").append(droppedChars).append(" more chars]").toString();
+        }
+    }
+
+    /**
      * Per-stream timing state for synthesizing llama.cpp-style {@code timings} on the vLLM path.
      * Lives for the duration of a single {@link #copyStream} invocation.
+     *
+     * <p>Package-private instead of private so the unit test (same package) can drive
+     * {@link #enrichVllmSseLine} directly.</p>
      */
-    private static final class VllmTimingState {
+    static final class VllmTimingState {
         /** nanoTime of the first chunk carrying a completion token (generation start). */
         long genStartNano = 0L;
         /** Whether the generation phase has started. */
         boolean genStarted = false;
+        /** Data lines that carried a {@code usage} object with completion counters. */
+        int usageChunks = 0;
+        /** Data lines whose synthesized {@code timings} node was forwarded to the client. */
+        int timingsChunks = 0;
+        /** Chunks whose synthesized {@code prompt_per_second} was dropped as implausible. */
+        int implausiblePromptRates = 0;
+        /** Chunks whose synthesized {@code timings} node was skipped as implausible. */
+        int implausibleGenerationRates = 0;
+    }
+
+    /**
+     * Per-stream bookkeeping for {@link #stripToolCallInterleaveContent}. Lives for the duration
+     * of a single {@link #copyStream} invocation. Package-private instead of private so the
+     * unit test (same package) can drive the filter directly.
+     */
+    static final class ToolCallInterleaveState {
+        /** Highest {@code tool_calls[].index} of this stream, {@code -1} while no tool call arrived. */
+        int maxToolCallIndex = -1;
+        /** Number of {@code content} fields removed from the lines forwarded to the client. */
+        int suppressedDeltas = 0;
+        /** Total number of characters dropped together with those {@code content} fields. */
+        int suppressedChars = 0;
     }
 
     /**
