@@ -206,12 +206,20 @@ public class JsMcpProxy implements AutoCloseable {
                 throw new JsUserRuntimeException("MCP tool '" + tool.name() + "' failed: " + errorText);
             }
 
-            Map<String, Object> resultMap = new HashMap<>();
+            // LinkedHashMap, not HashMap: NestedProxyObject keeps the map's iteration order, so
+            // Object.keys(result) and JSON.stringify stay stable across calls.
+            Map<String, Object> resultMap = new LinkedHashMap<>();
             resultMap.put("isError", false);
             resultMap.put("content", contentList);
             resultMap.put("text", textContent.toString());
 
-            return ProxyObject.fromMap(resultMap);
+            // toProxyObject, not ProxyObject.fromMap: 'content' is a List of Maps, and fromMap
+            // would hand it through as a java.util.ArrayList - a host object that the
+            // CONSTRAINED sandbox cannot read. The call would then report { isError: false,
+            // content: {}, text: "..." }, i.e. an answer whose payload is invisible while the
+            // flat fields look fine. NestedProxyObject/NestedProxyArray keep it traversable
+            // (content.length, content[i].type, JSON.stringify).
+            return GraalProxies.toProxyObject(resultMap);
         });
 
         // help method: mcp.toolName.help()
