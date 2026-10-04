@@ -8,7 +8,7 @@ import io.modelcontextprotocol.server.transport.HttpServletStreamableServerTrans
 import io.modelcontextprotocol.server.transport.HttpServletSseServerTransportProvider;
 import io.modelcontextprotocol.spec.McpSchema;
 
-import org.rogmann.mcp2sdk.review.ReviewStore;
+import org.rogmann.mcp2sdk.browser.BrowserTool;
 import org.rogmann.mcp2sdk.tools.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -44,8 +44,8 @@ public class McpConfig {
      * @return the shared review store
      */
     @Bean
-    public ReviewStore reviewStore() {
-        return ReviewStore.getInstance();
+    public org.rogmann.mcp2sdk.review.ReviewStore reviewStore() {
+        return org.rogmann.mcp2sdk.review.ReviewStore.getInstance();
     }
 
     // JsonMapper Bean for serialization
@@ -108,6 +108,9 @@ public class McpConfig {
         registry.registerToolDefinition(JavaScriptTool.createToolInstance());
 
         registry.registerToolDefinition(CallLlmTool.createToolInstance());
+
+        // Browser session: operate an internal web application jointly (M0: read, do not write)
+        registry.registerToolDefinition(BrowserTool.createToolInstance());
 
         //registry.registerToolDefinition(VideoPlayerTool.createToolInstance());
         //registry.registerToolDefinition(VideoSearchTool.createToolInstance());
