@@ -5,6 +5,7 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.node.ArrayNode;
 import tools.jackson.databind.node.ObjectNode;
 import tools.jackson.databind.json.JsonMapper;
+import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -50,6 +51,12 @@ import java.util.zip.GZIPInputStream;
  * - /chat/v1/chat/completions: LLM request forwarding (supports Streaming)
  * - /chat/cors-proxy     : CORS proxy placeholder
  * </p>
+ *
+ * <p>Server-side Web UI settings (the replacement for llama.cpp's {@code --ui-config}, which this
+ * application does not have because it serves the UI itself): {@code /chat/props} carries a
+ * {@code ui_settings} object built from {@code webui.uiConfig} / {@code webui.customCss}. The Web
+ * UI treats it as its default - a browser that already stores its own settings (Developer settings
+ * such as "Custom CSS" included) keeps them, see {@link #buildUiSettings()}.</p>
  */
 @RestController
 @RequestMapping("/chat")
@@ -77,6 +84,20 @@ public class WebUiProxy {
      * enable it only for the model/backend combination that shows the broken tool-call history.
      */
     private static final String PROP_SUPPRESS_TOOLCALL_INTERLEAVE = "webui.suppressToolCallInterleave";
+    /**
+     * Server-side UI defaults as a JSON object, served through {@code /props} in the
+     * {@code ui_settings} field. This is the counterpart of llama.cpp's {@code --ui-config}
+     * argument, e.g. {@code {"customCss": ".markdown-content { ... }"}}.
+     */
+    private static final String PROP_UI_CONFIG = "webui.uiConfig";
+    /** Convenience accessor for the single {@code customCss} UI setting (the "Custom CSS" field). */
+    private static final String PROP_CUSTOM_CSS = "webui.customCss";
+
+    /** Key of the "Custom CSS" setting inside {@code ui_settings} (Web UI: {@code customCss}). */
+    private static final String UI_SETTING_CUSTOM_CSS = "customCss";
+
+    /** Field name of the server-side UI defaults in the {@code /props} response. */
+    private static final String PROPS_FIELD_UI_SETTINGS = "ui_settings";
 
     /** Backend vLLM */
     private static final String BACKEND_VLLM = "vllm";
@@ -156,6 +177,21 @@ public class WebUiProxy {
      */
     @Value("${" + PROP_SUPPRESS_TOOLCALL_INTERLEAVE + ":false}")
     private boolean suppressToolCallInterleave;
+
+    /**
+     * Server-side UI defaults as JSON object (property {@value #PROP_UI_CONFIG}), served via
+     * {@code /props} as {@code ui_settings}. Empty by default, which keeps the field out of the
+     * response entirely.
+     */
+    @Value("${" + PROP_UI_CONFIG + ":}")
+    private String uiConfigJson;
+
+    /**
+     * The "Custom CSS" of the Web UI (property {@value #PROP_CUSTOM_CSS}). Takes precedence over a
+     * {@code customCss} entry of {@link #uiConfigJson} because it is the more specific switch.
+     */
+    @Value("${" + PROP_CUSTOM_CSS + ":}")
+    private String customCss;
 
     /** Vision capabilities */
     @Value("${" + PROP_HAS_VISION + ":false}")
@@ -983,6 +1019,13 @@ public class WebUiProxy {
         modalities.put("audio", hasAudio);
         mapProps.set("modalities", modalities);
 
+        // Server-side UI defaults (llama.cpp --ui-config counterpart). The Web UI reads this as
+        // props.ui_settings and seeds its settings store from it, see buildUiSettings().
+        ObjectNode uiSettings = buildUiSettings();
+        if (!uiSettings.isEmpty()) {
+            mapProps.set(PROPS_FIELD_UI_SETTINGS, uiSettings);
+        }
+
         // Deliver a chat_template so the Web UI can detect reasoning/thinking support
         // and offer the "Reasoning" menu (see buildChatTemplate / web.model.reasoning).
         String chatTemplate = buildChatTemplate();
@@ -999,6 +1042,75 @@ public class WebUiProxy {
             LOG.error("Error building props JSON", e);
             return "{}";
         }
+    }
+
+    /**
+     * Builds the {@code ui_settings} node of the {@code /props} response: the llama.cpp-compatible
+     * channel for server-side UI defaults (llama.cpp fills it from its {@code --ui-config}
+     * argument, here it is assembled from {@value #PROP_UI_CONFIG} and {@value #PROP_CUSTOM_CSS}).
+     *
+     * <p>Key naming follows the Web UI settings store: the keys are the camelCase names of the
+     * settings dialog ({@code customCss}, {@code sendOnEnter}, {@code theme}, ...), so whatever the
+     * "Settings" page can set can also be shipped from the server.</p>
+     *
+     * <p><b>It stays a default</b> (behaviour of the built Web UI, not of this proxy): a browser
+     * applies {@code ui_settings} only while it has no own copy of the settings in
+     * {@code localStorage}, only for entries it never changed itself, and otherwise on
+     * "Reset Settings to Default". A developer who has set "Custom CSS" locally therefore keeps the
+     * local value and is not disturbed by whatever the server ships.</p>
+     *
+     * <p>Note also that the Web UI only consults {@code ui_settings} when the generation settings
+     * of {@code default_generation_settings.params} yielded at least one known parameter (its
+     * sync step returns early otherwise), so those must stay part of the props response.</p>
+     *
+     * @return the node to serve, empty when neither property is configured
+     */
+    ObjectNode buildUiSettings() {
+        ObjectNode uiSettings = jsonMapper.createObjectNode();
+
+        if (uiConfigJson != null && !uiConfigJson.isBlank()) {
+            try {
+                JsonNode node = jsonMapper.readTree(uiConfigJson);
+                if (node != null && node.isObject()) {
+                    uiSettings.setAll((ObjectNode) node);
+                } else {
+                    LOG.warn("{} is not a JSON object, ignoring it (expected e.g. "
+                            + "{\"customCss\": \"...\"})", PROP_UI_CONFIG);
+                }
+            } catch (RuntimeException e) {
+                // A broken property must not break /props: the UI then simply uses its defaults.
+                LOG.warn("Cannot parse {} as JSON, ignoring it: {}", PROP_UI_CONFIG, e.getMessage());
+            }
+        }
+
+        // The dedicated property wins over a customCss entry of the JSON blob: it is the one that
+        // is written in multi-line YAML style, so it is what an operator actually edits.
+        if (customCss != null && !customCss.isBlank()) {
+            uiSettings.put(UI_SETTING_CUSTOM_CSS, customCss);
+        }
+
+        return uiSettings;
+    }
+
+    /**
+     * Logs once at startup which UI settings the server contributes, because {@code ui_settings}
+     * acts invisibly from the browser side: it is neither visible in the props response of a
+     * running page nor in the settings dialog once the browser has applied it.
+     */
+    @PostConstruct
+    public void logUiSettingsConfig() {
+        ObjectNode uiSettings = buildUiSettings();
+        if (uiSettings.isEmpty()) {
+            LOG.debug("No {} / {} configured, the Web UI keeps its own defaults.",
+                    PROP_UI_CONFIG, PROP_CUSTOM_CSS);
+            return;
+        }
+        List<String> keys = uiSettings.properties().stream().map(Map.Entry::getKey).toList();
+        LOG.info("Web UI defaults via /props {}={}: {} setting(s), customCss {} chars. They act as"
+                        + " defaults only: a browser with its own stored settings keeps those, they"
+                        + " are applied on the first visit or after 'Reset Settings to Default'.",
+                PROPS_FIELD_UI_SETTINGS, keys, keys.size(),
+                customCss == null ? 0 : customCss.length());
     }
 
     /**
