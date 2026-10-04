@@ -801,20 +801,14 @@ public class JavaScriptTool {
                 return buildTimeoutResult(e, sourceName, timeoutSeconds, baosOut);
             }
             StringBuilder sbMsg = new StringBuilder("Error during JavaScript execution: ");
-            String msgText = e.getMessage();
-            if (msgText != null && msgText.length() > MAX_EXCEPTION_MESSAGE_BEGIN + MAX_EXCEPTION_MESSAGE_TAIL + 1) {
-                msgText = msgText.substring(0, MAX_EXCEPTION_MESSAGE_BEGIN)
-                        + "[...removed %d chars...]".formatted(msgText.length() - MAX_EXCEPTION_MESSAGE_BEGIN - MAX_EXCEPTION_MESSAGE_TAIL)
-                        + msgText.substring(msgText.length() - MAX_EXCEPTION_MESSAGE_TAIL);
-            }
-            sbMsg.append(msgText);
+            sbMsg.append(shortenMessage(e.getMessage()));
             if (e instanceof PolyglotException pe) {
                 if (pe.isSyntaxError()) {
                     sbMsg.append("\nThe script contains a JavaScript syntax error.");
                 }
                 if (pe.isHostException() && pe.asHostException() != null) {
                     // Unwrap to show the original user-facing message (e.g. from fs.*/poi.*).
-                    sbMsg.append("\nRoot cause: ").append(pe.asHostException().getMessage());
+                    sbMsg.append("\nRoot cause: ").append(shortenMessage(pe.asHostException().getMessage()));
                 }
                 if (pe.getSourceLocation() != null) {
                     SourceSection loc = pe.getSourceLocation();
@@ -845,6 +839,20 @@ public class JavaScriptTool {
                 }
             }
         }
+    }
+
+    /**
+     * Shorten a very long message.
+     * @param msgText message text
+     * @return message text (maybe clipped)
+     */
+    private static String shortenMessage(String msgText) {
+        if (msgText != null && msgText.length() > MAX_EXCEPTION_MESSAGE_BEGIN + MAX_EXCEPTION_MESSAGE_TAIL + 1) {
+            msgText = msgText.substring(0, MAX_EXCEPTION_MESSAGE_BEGIN)
+                    + "[...removed %d chars...]".formatted(msgText.length() - MAX_EXCEPTION_MESSAGE_BEGIN - MAX_EXCEPTION_MESSAGE_TAIL)
+                    + msgText.substring(msgText.length() - MAX_EXCEPTION_MESSAGE_TAIL);
+        }
+        return msgText;
     }
 
     /**
