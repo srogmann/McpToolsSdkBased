@@ -39,6 +39,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipOutputStream;
 
+import org.rogmann.mcp2sdk.utils.ZipEntryReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -72,6 +73,25 @@ import org.slf4j.LoggerFactory;
  * (no decompression); extraction streams a single entry through an {@link InputStream}.
  * Zips cover {@code .zip}, {@code .jar}, {@code .war} and {@code .ear}. ({@code .har} is
  * JSON and is read with {@code fs.readFile} + {@code JSON.parse}, not an archive.)
+ * </p>
+ * <p>
+ * A ZIP source is a path, an archive <em>display path</em> ({@code outer.ear#inner.war#x.jar}) or
+ * the bytes of an archive. The in-memory case is read by {@link ZipEntryReader} through its central
+ * directory (the {@link java.util.zip.ZipInputStream} view would report zero sizes for exactly the
+ * writers that matter here &ndash; {@code ZipOutputStream} and Spring Boot's repackager put crc and
+ * sizes into a data descriptor, so only the central directory knows them). Neither variant writes
+ * anything out: an embedded jar can be listed and walked class by class while it stays inside its
+ * parent archive.
+ * </p>
+ *
+ * <h3>Archives inside archives</h3>
+ * <p>
+ * Every level of a display path after the file is an entry of the level before it, separated by
+ * {@value #ARCHIVE_SEPARATOR} &ndash; the syntax {@link JsSearch} and the {@code xml} module use for
+ * their virtual targets. Up to {@value #MAX_ARCHIVE_DEPTH} levels are followed; each one is opened
+ * with the format its bytes declare (ZIP or tar, gzip detected by its magic), so a realistic
+ * {@code .ear -> .war -> WEB-INF/lib/*.jar -> com/example/Foo.class} walk costs no extraction and
+ * no temporary file. {@link #entryBytes(String)} is the one-call form for a single entry.
  * </p>
  *
  * <h3>ZIP write access (opt-in, see {@value #PROP_READONLY})</h3>
@@ -134,6 +154,11 @@ import org.slf4j.LoggerFactory;
  * var gz = archive.gzip(data);                       // gzip-compress bytes
  * var raw = archive.gunzipFile("log.gz");            // gunzip a file (streamed)
  * fs.writeBytes("out.bin", content);                 // persist an extracted entry
+ *
+ * // embedded archives: bytes are a source, and '#' walks into them (nothing is extracted)
+ * var jarBytes = archive.zipEntry("app.ear#admin.war", "WEB-INF/lib/util.jar");
+ * var classes  = archive.zipEntries(jarBytes).map(e => e.name);
+ * var foo      = archive.entry("app.ear#admin.war#WEB-INF/lib/util.jar#com/example/Foo.class");
  *
  * archive.status();                                  // { readonly: true|false, ... }
  * archive.zipCreate("fixtures/book.xlsx", [          // requires -Dmcp.js.archive.readonly=false
@@ -212,6 +237,28 @@ public class JsArchive {
     /** Buffer size for streaming reads (data block size is not limited by this). */
     private static final int STREAM_BUFFER_SIZE = 64 * 1024;
 
+    /**
+     * Separator between archive levels of a display path:
+     * {@code app.ear#admin.war#WEB-INF/lib/x.jar#com/Foo.class}. The same syntax {@link JsSearch}
+     * uses for its virtual targets and the {@code xml} module uses for its sources, so one path
+     * string works everywhere; the value is pinned by a test against
+     * {@link JsSearch#ARCHIVE_SEPARATOR}.
+     */
+    public static final String ARCHIVE_SEPARATOR = "#";
+
+    /**
+     * Maximum number of nested archives a display path may descend into (the file itself is not
+     * counted). Same default as {@code search}'s {@code maxArchiveDepth}, so a caller who knows one
+     * module knows the other.
+     */
+    public static final int MAX_ARCHIVE_DEPTH = 8;
+
+    /** Bytes probed from the head of a container to decide ZIP vs tar (tar's magic sits at 257). */
+    private static final int CONTAINER_PROBE_BYTES = 512;
+
+    /** Entry names listed in a "not found" message of a display path. */
+    private static final int MAX_HINT_NAMES = 12;
+
     private JsArchive() {
         // Utility class
     }
@@ -229,9 +276,295 @@ public class JsArchive {
     private static Path requireRegularFile(String filePath) {
         Path path = JsFileSystem.resolveSafePath(filePath);
         if (!Files.isRegularFile(path)) {
+            if (filePath != null && filePath.contains(ARCHIVE_SEPARATOR)) {
+                // A display path is a read-only addressing syntax; writing needs a real file.
+                throw new JsUserRuntimeException("File not found: " + JsFileSystem.toRelative(path)
+                        + " - '" + filePath + "' looks like an archive display path (levels separated"
+                        + " by '" + ARCHIVE_SEPARATOR + "'); those are supported by the read"
+                        + " operations zipEntries/zipEntry/tarEntries/tarEntry/entry, but not by"
+                        + " write operations.");
+            }
             throw new JsUserRuntimeException("File not found: " + JsFileSystem.toRelative(path));
         }
         return path;
+    }
+
+    /**
+     * True when the string is a real file inside the base directory. A file may legitimately be
+     * called {@code fix#1.zip}, so the plain path always wins over the display syntax - exactly the
+     * rule {@link JsSearch} applies to its targets.
+     */
+    private static boolean isRegularFilePath(String candidate) {
+        try {
+            return Files.isRegularFile(JsFileSystem.resolveSafePath(candidate));
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    // ========================================================================
+    // Nested archives (display paths)
+    // ========================================================================
+
+    /**
+     * A ZIP/tar container to read from: a file inside the base directory, or bytes in memory
+     * because the caller passed them or because the container is nested in other archives.
+     *
+     * @param file    the resolved file ( {@code null} for an in-memory container)
+     * @param data    the container bytes ({@code null} for a file container)
+     * @param display name used in messages: relative path, display path or {@code <bytes:N>}
+     */
+    private record Container(Path file, byte[] data, String display) {
+
+        boolean inMemory() {
+            return data != null;
+        }
+
+        static Container ofFile(Path path) {
+            return new Container(path, null, JsFileSystem.toRelative(path));
+        }
+
+        static Container ofBytes(byte[] bytes, String display) {
+            return new Container(null, bytes, display);
+        }
+    }
+
+    /**
+     * Resolves the container a source string addresses: a plain path (random access on the file),
+     * or a display path whose last segment names an archive inside the archives before it. Every
+     * level is read from memory; nothing is extracted to disk.
+     *
+     * @param source archive path, display path ({@code outer.zip#inner.jar}) or blank
+     * @return the container to read
+     * @throws JsUserRuntimeException if a path leaves the base, a file or entry is missing, a level
+     *         is not a ZIP/tar container or the nesting exceeds {@link #MAX_ARCHIVE_DEPTH}
+     */
+    private static Container openContainer(String source) {
+        if (source == null || source.isBlank()) {
+            throw new JsUserRuntimeException("Archive path must not be empty - expected a path like"
+                    + " 'app.war', a display path like 'app.ear#WEB-INF/lib/x.jar', or archive bytes.");
+        }
+        String trimmed = source.trim();
+        if (!trimmed.contains(ARCHIVE_SEPARATOR) || isRegularFilePath(trimmed)) {
+            return Container.ofFile(requireRegularFile(trimmed));
+        }
+        String[] segments = splitDisplayPath(trimmed);
+        Path file = requireRegularFile(segments[0]);
+        byte[] current = null;
+        for (int i = 1; i < segments.length; i++) {
+            String display = displayOf(segments, i);
+            Container parent = (i == 1) ? Container.ofFile(file) : Container.ofBytes(current, display);
+            byte[] entry = (i == 1)
+                    ? readEntryOfPath(file, segments[i], display)
+                    : readEntryOfBytes(current, segments[i], display);
+            if (entry == null) {
+                throw entryNotFoundIn(parent, segments[i], display);
+            }
+            current = entry;
+        }
+        return Container.ofBytes(current, trimmed);
+    }
+
+    /**
+     * Error for a level of a display path whose entry does not exist. The names that <em>are</em>
+     * there are listed, so one retry needs no extra listing call - the difference between a caller
+     * that recovers and one that gives up.
+     */
+    private static JsUserRuntimeException entryNotFoundIn(Container container, String entryName,
+            String display) {
+        StringBuilder message = new StringBuilder("Entry '").append(entryName).append("' not found in ")
+                .append(display);
+        List<String> names = new ArrayList<>();
+        try {
+            for (Map<String, Object> row : containerRows(container)) {
+                Object name = row.get("name");
+                if (name != null) {
+                    names.add(String.valueOf(name));
+                }
+            }
+        } catch (RuntimeException e) {
+            names.clear(); // a hint is a bonus; the missing entry stays the point of the message
+        }
+        names.sort(Comparator.naturalOrder());
+        message.append(" (that level has ").append(names.size()).append(" entries)");
+        if (!names.isEmpty()) {
+            List<String> shown = names.size() > MAX_HINT_NAMES ? names.subList(0, MAX_HINT_NAMES) : names;
+            message.append(": ").append(String.join(", ", shown));
+            if (names.size() > shown.size()) {
+                message.append(", ... (").append(names.size() - shown.size()).append(" more)");
+            }
+        }
+        message.append(". Read one entry of a level with archive.entry('<display path>') and"
+                + " list a level with archive.zipEntries/archive.tarEntries.");
+        return new JsUserRuntimeException(message.toString());
+    }
+
+    /** Entry rows of a container, in its own format (ZIP or tar). */
+    private static List<Map<String, Object>> containerRows(Container container) {
+        if (container.inMemory()) {
+            return ZipEntryReader.looksLikeZip(container.data())
+                    ? zipEntriesFromBytes(container.data(), container.display())
+                    : tarEntries(container.data());
+        }
+        return ZipEntryReader.looksLikeZip(probeHeader(container.file()))
+                ? zipEntriesFromPath(container.file())
+                : tarEntriesFromPath(container.file());
+    }
+
+    /** Splits and validates a display path; the returned array starts with the file path. */
+    private static String[] splitDisplayPath(String display) {
+        // '#' carries no regex meaning, so the literal works as the pattern (as in xml's resolver).
+        String[] segments = display.split(ARCHIVE_SEPARATOR, -1);
+        for (int i = 0; i < segments.length; i++) {
+            if (segments[i].isEmpty()) {
+                throw new JsUserRuntimeException("Invalid archive path '" + display + "': empty"
+                        + " segment " + (i + 1) + " of " + segments.length + " (expected"
+                        + " 'outer.zip" + ARCHIVE_SEPARATOR + "inner.jar" + ARCHIVE_SEPARATOR
+                        + "pkg/Class.class')");
+            }
+        }
+        if (segments.length < 2) {
+            throw new JsUserRuntimeException("Invalid archive path '" + display + "': '"
+                    + ARCHIVE_SEPARATOR + "' must be followed by an entry name.");
+        }
+        int depth = segments.length - 1;
+        if (depth > MAX_ARCHIVE_DEPTH) {
+            throw new JsUserRuntimeException("Archive path '" + display + "' descends " + depth
+                    + " levels deep, the limit is " + MAX_ARCHIVE_DEPTH + " levels (as in search's"
+                    + " maxArchiveDepth).");
+        }
+        return segments;
+    }
+
+    /** Display path of the first {@code upTo} segments (inclusive), for precise error messages. */
+    private static String displayOf(String[] segments, int upTo) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i <= upTo; i++) {
+            if (i > 0) {
+                sb.append(ARCHIVE_SEPARATOR);
+            }
+            sb.append(segments[i]);
+        }
+        return sb.toString();
+    }
+
+    /** Reads one entry of a container, choosing ZIP or tar by the content of the container. */
+    private static byte[] readEntryOfContainer(Container container, String entryName, String display) {
+        return container.inMemory()
+                ? readEntryOfBytes(container.data(), entryName, display)
+                : readEntryOfPath(container.file(), entryName, display);
+    }
+
+    /** Reads one entry of a container that lives in memory (nested archive). */
+    private static byte[] readEntryOfBytes(byte[] container, String entryName, String display) {
+        if (container == null) {
+            throw new JsUserRuntimeException("Cannot read entry '" + entryName + "' of " + display
+                    + ": the container is empty.");
+        }
+        if (ZipEntryReader.looksLikeZip(container)) {
+            return readZipBytesEntry(container, display, entryName);
+        }
+        if (isGzip(container) || isTar(container)) {
+            // tarEntry(byte[]) decompresses a gzipped tarball itself, detected by its magic bytes.
+            return tarEntry(container, entryName);
+        }
+        throw notAContainer(display, entryName);
+    }
+
+    /** Reads one entry of a container that lives in a file (top level of a display path). */
+    private static byte[] readEntryOfPath(Path container, String entryName, String display) {
+        byte[] head = probeHeader(container);
+        if (ZipEntryReader.looksLikeZip(head)) {
+            return zipEntryFromPath(container, entryName);
+        }
+        if (isGzip(head) || isTar(head)) {
+            return tarEntryFromPath(container, entryName);
+        }
+        throw notAContainer(display, entryName);
+    }
+
+    private static JsUserRuntimeException notAContainer(String display, String entryName) {
+        return new JsUserRuntimeException("Not a ZIP or tar archive: " + display
+                + " (cannot read the entry '" + entryName + "' of it). Archive display paths need a"
+                + " ZIP (.zip/.jar/.war/.ear) or tar (.tar/.tar.gz/.tgz) container in every level"
+                + " before the last '" + ARCHIVE_SEPARATOR + "'.");
+    }
+
+    /** Reads the first bytes of a file to classify the container (a zip/tar is more than that). */
+    private static byte[] probeHeader(Path file) {
+        try (InputStream in = new BufferedInputStream(Files.newInputStream(file), STREAM_BUFFER_SIZE)) {
+            return in.readNBytes(CONTAINER_PROBE_BYTES);
+        } catch (IOException e) {
+            LOG.error("Failed to read archive header: {}", file, e);
+            throw new JsUserRuntimeException("Failed to read archive: " + JsFileSystem.toRelative(file), e);
+        }
+    }
+
+    /**
+     * Reads the entry a display path addresses, whatever the container format of the levels is.
+     * <p>
+     * This is the entry point of the "no unpacking" workflow: {@code app.ear#admin.war#WEB-INF/lib
+     * /util.jar#com/example/Util.class} yields the class bytes straight from memory, and every
+     * level in between is read from the central directory / tar headers of its parent - no
+     * temporary file, no {@code unzip} step. A path without {@code #} that names a real file simply
+     * reads that file.
+     * </p>
+     * @param displayPath display path (or a plain file path) whose last segment is the entry to read
+     * @return the entry bytes (never null)
+     * @throws JsUserRuntimeException if a file or entry is missing or a level is not a container
+     */
+    public static byte[] entryBytes(String displayPath) {
+        if (displayPath == null || displayPath.isBlank()) {
+            throw new JsUserRuntimeException("Archive path must not be empty - expected a display"
+                    + " path like 'app.ear#WEB-INF/lib/x.jar#com/example/Util.class' or a plain"
+                    + " file path.");
+        }
+        String trimmed = displayPath.trim();
+        if (!trimmed.contains(ARCHIVE_SEPARATOR) || isRegularFilePath(trimmed)) {
+            Path file = requireRegularFile(trimmed);
+            try {
+                long size = Files.size(file);
+                if (size > MAX_ENTRY_BYTES) {
+                    throw new JsUserRuntimeException("File '" + JsFileSystem.toRelative(file) + "' has "
+                            + size + " bytes, exceeding the single-entry limit of " + MAX_ENTRY_BYTES
+                            + " bytes.");
+                }
+                return Files.readAllBytes(file);
+            } catch (IOException e) {
+                LOG.error("Failed to read file: {}", file, e);
+                throw new JsUserRuntimeException("Failed to read file: " + JsFileSystem.toRelative(file), e);
+            }
+        }
+        int last = trimmed.lastIndexOf(ARCHIVE_SEPARATOR);
+        String entryName = trimmed.substring(last + 1);
+        if (entryName.isEmpty()) {
+            throw new JsUserRuntimeException("Invalid archive path '" + trimmed + "': '"
+                    + ARCHIVE_SEPARATOR + "' must be followed by an entry name.");
+        }
+        Container container = openContainer(trimmed.substring(0, last));
+        byte[] data = readEntryOfContainer(container, entryName, trimmed);
+        if (data == null) {
+            throw entryNotFoundIn(container, entryName, trimmed);
+        }
+        return data;
+    }
+
+    /** Display name of a byte-array source (used in messages instead of an absolute path). */
+    private static String bytesDisplay(byte[] data) {
+        return "<bytes:" + data.length + ">";
+    }
+
+    /** True for the three gzip magic bytes (RFC 1952), same test the tar reader applies. */
+    private static boolean isGzip(byte[] head) {
+        return head != null && head.length >= GZIP_MAGIC.length
+                && head[0] == GZIP_MAGIC[0] && head[1] == GZIP_MAGIC[1] && head[2] == GZIP_MAGIC[2];
+    }
+
+    /** True when the ustar magic ({@code 75 73 74 61 72}) sits at offset 257 of the block. */
+    private static boolean isTar(byte[] head) {
+        return head != null && head.length >= 262
+                && head[257] == 'u' && head[258] == 's' && head[259] == 't'
+                && head[260] == 'a' && head[261] == 'r';
     }
 
     // ========================================================================
@@ -240,35 +573,131 @@ public class JsArchive {
 
     /**
      * Lists all entries of a ZIP archive (central directory, no decompression).
-     * @param filePath archive path relative to the base directory
+     * @param filePath archive path relative to the base directory, or a display path that addresses
+     *                 an archive nested inside other archives
+     *                 ({@code app.ear#admin.war#WEB-INF/lib/x.jar})
      * @return list of maps {@code {name, size, compressedSize, method, crc32, isDirectory, comment}},
      *         sorted by name
      * @throws JsUserRuntimeException if the archive is missing or not a valid ZIP
      */
     public static List<Map<String, Object>> zipEntries(String filePath) {
-        Path path = requireRegularFile(filePath);
+        Container container = openContainer(filePath);
+        List<Map<String, Object>> entries = container.inMemory()
+                ? zipEntriesFromBytes(container.data(), container.display())
+                : zipEntriesFromPath(container.file());
+        entries.sort(Comparator.comparing((Map<String, Object> e) -> (String) e.get("name")));
+        return entries;
+    }
+
+    /**
+     * Lists all entries of a ZIP archive held in memory - the byte-array counterpart of
+     * {@link #zipEntries(String)}, e.g. for an embedded jar that {@link #zipEntry(String, String)}
+     * has returned. The central directory is read from the bytes (no temporary file), so sizes and
+     * crc are the real ones even when the writer put them behind a data descriptor.
+     * @param data zip/jar/war/ear bytes (must not be null)
+     * @return list of entry maps, sorted by name
+     * @throws IllegalArgumentException if data is null
+     * @throws JsUserRuntimeException if the data is not a valid ZIP
+     */
+    public static List<Map<String, Object>> zipEntries(byte[] data) {
+        if (data == null) {
+            throw new IllegalArgumentException("zip data must not be null");
+        }
+        List<Map<String, Object>> entries = zipEntriesFromBytes(data, bytesDisplay(data));
+        entries.sort(Comparator.comparing((Map<String, Object> e) -> (String) e.get("name")));
+        return entries;
+    }
+
+    /** Listing of a file-based ZIP archive (random access on the central directory). */
+    private static List<Map<String, Object>> zipEntriesFromPath(Path path) {
         try (ZipFile zf = openZip(path)) {
             List<Map<String, Object>> entries = new ArrayList<>();
             Enumeration<? extends ZipEntry> en = zf.entries();
             while (en.hasMoreElements()) {
                 ZipEntry e = en.nextElement();
-                Map<String, Object> m = new LinkedHashMap<>();
-                m.put("name", e.getName());
-                m.put("size", e.getSize());
-                m.put("compressedSize", e.getCompressedSize());
-                m.put("method", methodToString(e.getMethod()));
-                long crc = e.getCrc();
-                m.put("crc32", crc >= 0 ? String.format("%08x", crc) : null);
-                m.put("isDirectory", e.isDirectory() || e.getName().endsWith("/"));
-                m.put("comment", e.getComment());
-                entries.add(m);
+                entries.add(zipEntryRow(e.getName(), e.getSize(), e.getCompressedSize(), e.getMethod(),
+                        e.getCrc(), isDirectoryEntry(e), e.getComment()));
             }
-            entries.sort(Comparator.comparing((Map<String, Object> e) -> (String) e.get("name")));
             return entries;
         } catch (IOException e) {
             LOG.error("Failed to read zip archive: " + path, e);
             throw new JsUserRuntimeException("Failed to read zip archive: " + JsFileSystem.toRelative(path), e);
         }
+    }
+
+    /** Listing of an in-memory ZIP archive (same rows, read through {@link ZipEntryReader}). */
+    private static List<Map<String, Object>> zipEntriesFromBytes(byte[] data, String display) {
+        ZipEntryReader zip = openZipBytes(data, display);
+        List<Map<String, Object>> entries = new ArrayList<>(zip.size());
+        for (ZipEntryReader.Entry e : zip.entries()) {
+            entries.add(zipEntryRow(e.name(), e.size(), e.compressedSize(), e.method(), e.crc(),
+                    e.directory(), e.comment()));
+        }
+        return entries;
+    }
+
+    /**
+     * Opens an in-memory ZIP archive for reading.
+     *
+     * @param data    archive bytes
+     * @param display name used in messages (relative path, display path or {@code <bytes:N>})
+     * @return the reader, positioned on the central directory
+     * @throws JsUserRuntimeException if the bytes hold no readable ZIP
+     */
+    private static ZipEntryReader openZipBytes(byte[] data, String display) {
+        requireZipBytes(data, display);
+        try {
+            return new ZipEntryReader(data, display, MAX_ENTRY_BYTES);
+        } catch (IOException e) {
+            throw zipFailure(e, display);
+        }
+    }
+
+    /**
+     * Content check in front of the reader. The utility knows ZIP, this module knows the API - so
+     * the advice "that might be a tar" is decided here by the signature, not by the wording of an
+     * exception.
+     */
+    private static void requireZipBytes(byte[] data, String display) {
+        if (!ZipEntryReader.looksLikeZip(data)) {
+            throw new JsUserRuntimeException("Not a ZIP archive: " + display + " (the ZIP signature"
+                    + " 'PK' is missing at the start). If the data is a tar archive, use"
+                    + " archive.tarEntries/archive.tarEntry instead; a gzip stream is read with"
+                    + " archive.gunzip/gunzipFile.");
+        }
+    }
+
+    /** One entry of an in-memory ZIP archive; {@code null} when the archive has no such entry. */
+    private static byte[] readZipBytesEntry(byte[] data, String display, String entryName) {
+        try {
+            return openZipBytes(data, display).read(entryName);
+        } catch (IOException e) {
+            throw zipFailure(e, display);
+        }
+    }
+
+    /** The reader's {@link IOException} as a module error (its message already names the display). */
+    private static JsUserRuntimeException zipFailure(IOException e, String display) {
+        LOG.error("Failed to read zip data: {}", display, e);
+        String message = e.getMessage() == null ? "Failed to read ZIP data: " + display : e.getMessage();
+        return new JsUserRuntimeException(message, e);
+    }
+
+    /**
+     * One row of a ZIP listing; shared by the file and the in-memory reader so that both report the
+     * identical shape (only the way the metadata is reached differs).
+     */
+    private static Map<String, Object> zipEntryRow(String name, long size, long compressedSize,
+            int method, long crc, boolean directory, String comment) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("name", name);
+        m.put("size", size);
+        m.put("compressedSize", compressedSize);
+        m.put("method", methodToString(method));
+        m.put("crc32", crc >= 0 ? String.format("%08x", crc) : null);
+        m.put("isDirectory", directory);
+        m.put("comment", comment);
+        return m;
     }
 
     /**
@@ -277,7 +706,8 @@ public class JsArchive {
      * Only the requested entry is decompressed (streamed); it is limited to
      * {@link #MAX_ENTRY_BYTES} bytes.
      * </p>
-     * @param filePath archive path relative to the base directory
+     * @param filePath archive path relative to the base directory, or a display path that addresses
+     *                 the archive inside other archives ({@code outer.zip#inner.jar})
      * @param entryName name of the entry within the archive
      * @return entry content, {@code null} if the entry does not exist, an empty array for a directory
      * @throws JsUserRuntimeException if the archive is missing, not a valid ZIP or the entry is too large
@@ -286,7 +716,35 @@ public class JsArchive {
         if (entryName == null || entryName.isBlank()) {
             throw new IllegalArgumentException("entry name must not be empty");
         }
-        Path path = requireRegularFile(filePath);
+        Container container = openContainer(filePath);
+        if (container.inMemory()) {
+            return readZipBytesEntry(container.data(), container.display(), entryName);
+        }
+        return zipEntryFromPath(container.file(), entryName);
+    }
+
+    /**
+     * Extracts a single entry of an in-memory ZIP archive - the byte-array counterpart of
+     * {@link #zipEntry(String, String)}. This is what makes the nested walk work without ever
+     * touching the disk: {@code zipEntry(zipEntry("app.zip", "BOOT-INF/lib/x.jar"), "com/Foo.class")}.
+     * @param data zip/jar/war/ear bytes (must not be null)
+     * @param entryName name of the entry within the archive
+     * @return entry content, {@code null} if the entry does not exist, an empty array for a directory
+     * @throws IllegalArgumentException if data is null or the entry name is empty
+     * @throws JsUserRuntimeException if the data is not a valid ZIP or the entry is too large
+     */
+    public static byte[] zipEntry(byte[] data, String entryName) {
+        if (data == null) {
+            throw new IllegalArgumentException("zip data must not be null");
+        }
+        if (entryName == null || entryName.isBlank()) {
+            throw new IllegalArgumentException("entry name must not be empty");
+        }
+        return readZipBytesEntry(data, bytesDisplay(data), entryName);
+    }
+
+    /** Extraction from a file-based archive (the {@link ZipFile} path, unchanged behaviour). */
+    private static byte[] zipEntryFromPath(Path path, String entryName) {
         try (ZipFile zf = openZip(path)) {
             ZipEntry e = zf.getEntry(entryName);
             if (e == null) {
@@ -1437,7 +1895,15 @@ public class JsArchive {
      * @throws JsUserRuntimeException if the archive is missing or not a supported tar
      */
     public static List<Map<String, Object>> tarEntries(String filePath) {
-        Path path = requireRegularFile(filePath);
+        Container container = openContainer(filePath);
+        if (container.inMemory()) {
+            return tarEntries(container.data());
+        }
+        return tarEntriesFromPath(container.file());
+    }
+
+    /** Listing of a file-based tar archive. */
+    private static List<Map<String, Object>> tarEntriesFromPath(Path path) {
         try (InputStream file = new BufferedInputStream(Files.newInputStream(path), STREAM_BUFFER_SIZE);
                 InputStream in = gzipAwareStream(file)) {
             return new TarScanner(in).listEntries();
@@ -1466,7 +1932,15 @@ public class JsArchive {
         if (entryName == null || entryName.isBlank()) {
             throw new IllegalArgumentException("entry name must not be empty");
         }
-        Path path = requireRegularFile(filePath);
+        Container container = openContainer(filePath);
+        if (container.inMemory()) {
+            return tarEntry(container.data(), entryName);
+        }
+        return tarEntryFromPath(container.file(), entryName);
+    }
+
+    /** Extraction from a file-based tar archive. */
+    private static byte[] tarEntryFromPath(Path path, String entryName) {
         try (InputStream file = new BufferedInputStream(Files.newInputStream(path), STREAM_BUFFER_SIZE);
                 InputStream in = gzipAwareStream(file)) {
             return new TarScanner(in).readEntry(entryName);
@@ -2011,13 +2485,37 @@ public class JsArchive {
                 extracted bytes use fs.writeBytes(path, data). Modifying operations exist for ZIP
                 only and are disabled by default - see the write section and archive.status().
 
-                --- ZIP (java.util.zip; .jar/.war/.ear) ---
-                archive.zipEntries(path)              - List all entries as
+                --- ZIP (.jar/.war/.ear) ---
+                archive.zipEntries(source)            - List all entries as
                                                          [{name, size, compressedSize, method, crc32,
                                                            isDirectory, comment}], sorted by name.
-                archive.zipEntry(path, entryName)     - Extract one entry as a real Uint8Array
+                archive.zipEntry(source, entryName)   - Extract one entry as a real Uint8Array
                                                          (0-255), null if not found, empty array for
                                                          a directory.
+                source is a file path ("app.war"), a display path into nested archives
+                ("app.ear#admin.war#WEB-INF/lib/x.jar"), or archive bytes (Uint8Array - what
+                zipEntry returns for an embedded jar). An in-memory archive is read through its
+                central directory, so size/compressedSize/crc32 are correct even for the archives
+                whose writer moved them into a data descriptor (Spring Boot fat jars, jars built by
+                ZipOutputStream) - ZipInputStream would report zeros there.
+
+                --- Archives inside archives (display paths) ---
+                archive.entry(displayPath)            - Bytes of the entry a display path addresses,
+                                                         in any container format, at any depth.
+                A display path names the file first and every archive level after a '#':
+                    app.ear#admin.war#WEB-INF/lib/util.jar#com/example/Util.class
+                    app.zip#BOOT-INF/lib/x.jar#application.yml
+                    backup.tar.gz#src/main.c            (tar and gz levels work too)
+                Nothing is extracted: the outer file is opened with java.util.zip.ZipFile, every
+                inner archive is read from memory (central directory / tar headers), and only the
+                entry that is asked for is inflated. That is what makes "javap into an embedded jar"
+                a single call instead of an unpack step. Depth limit: 8 archive levels, the same
+                default as search's maxArchiveDepth. A level has to be a
+                ZIP (.zip/.jar/.war/.ear) or a tar (.tar/.tar.gz/.tgz); a gzip-wrapped ZIP is not
+                followed - gunzip it first with archive.gunzip. Entry names containing '#' cannot be
+                addressed by a display path (use zipEntry(bytes, name) for those), and a real file
+                whose own name contains '#' still wins over the display syntax.
+                The same '#' syntax addresses entries in search.* (displayPath) and xml.* sources.
 
                 """
                 + writeSection
@@ -2030,7 +2528,8 @@ public class JsArchive {
                 archive.tarEntry(pathOrBytes, name)   - Extract one entry as a real Uint8Array
                                                          (0-255), null if not found, empty array
                                                          for directories/links/devices.
-                pathOrBytes is a file path or raw tar bytes (gzipped ones included). A gzipped
+                pathOrBytes is a file path, a display path ("outer.zip#payload.tar") or raw tar
+                bytes (gzipped ones included). A gzipped
                 tarball (.tar.gz, .tgz) is decompressed transparently, so ONE call is enough:
                     var files = archive.tarEntries("backup.tar.gz");
                     var data  = archive.tarEntry("backup.tar.gz", files[0].name);
@@ -2070,6 +2569,13 @@ public class JsArchive {
                                         gzFiles[0].name);
                     var tarBytes = archive.gunzipFile("sources.tar.gz"); // only raw tar bytes
                     fs.writeBytes("extracted.xml", webXml);              // persist via fs
+
+                    // Archives inside archives, nothing extracted to disk:
+                    var jar  = archive.zipEntry("app.ear#admin.war", "WEB-INF/lib/util.jar");
+                    var clz  = archive.zipEntries(jar).map(e => e.name);     // bytes as source
+                    var one  = archive.entry("app.ear#admin.war#WEB-INF/lib/util.jar#"
+                                        + "com/example/Util.class");         // one call, any depth
+                    javap.disassemble(one, "bytecode", "Util.bytecode.txt"); // straight to javap
 
                     // Writing (requires -D%s=false): patch a single entry of an existing
                     // archive, e.g. an OOXML part of a workbook or a resource inside a jar.

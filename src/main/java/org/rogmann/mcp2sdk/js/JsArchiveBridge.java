@@ -25,8 +25,11 @@ import java.util.Set;
  * <p>
  * Creates a {@link ProxyObject} namespace {@code "archive"} exposing ZIP and tar archives
  * ({@code zipEntries}/{@code zipEntry}, {@code tarEntries}/{@code tarEntry} with the first
- * argument as file path or raw bytes; a gzipped tarball {@code .tar.gz}/{@code .tgz} is
- * decompressed automatically, detected by its magic bytes), gzip/deflate byte streams
+ * argument as file path, archive bytes or an archive <em>display path</em> that walks into
+ * archives inside archives ({@code app.ear#admin.war#WEB-INF/lib/x.jar}); a gzipped tarball
+ * {@code .tar.gz}/{@code .tgz} is
+ * decompressed automatically, detected by its magic bytes; {@code entry(displayPath)} reads one
+ * nested entry in a single call), gzip/deflate byte streams
  * ({@code gzip}, {@code gunzip}, {@code gunzipFile}, {@code deflate}, {@code inflate}) and -
  * if enabled by configuration - the ZIP write operations {@code zipCreate},
  * {@code zipEntryWrite} and
@@ -56,6 +59,12 @@ import java.util.Set;
  * var oneFile = archive.tarEntry("src.tar.gz", list2[0].name);  // no gunzip step needed
  * var gz = archive.gzip(new Uint8Array([1, 2, 3]));             // compress bytes
  * fs.writeBytes("out.bin", cfg);                                // persist via fs
+ *
+ * // Archives in archives - no unpacking, no temporary file:
+ * var jarBytes = archive.zipEntry("app.ear#admin.war", "WEB-INF/lib/util.jar"); // bytes as source
+ * var cls = archive.zipEntry(jarBytes, "com/example/Util.class");               // bytes as source
+ * var one = archive.entry("app.ear#admin.war#WEB-INF/lib/util.jar#com/example/Util.class");
+ * javap.disassemble(one, "bytecode", "Util.bytecode.txt");                      // straight to javap
  *
  * archive.status();                                             // { readonly: true|false, ... }
  * archive.zipCreate("out.zip", [{name: "a.txt", text: "hello"}]);
@@ -87,12 +96,13 @@ public class JsArchiveBridge implements JsModuleInterface {
     @Override
     public String getSummary() {
         return "`archive.help()` explains ZIP/tar/gzip access (.tar.gz/.tgz are read in one call,"
-                + " gzip is auto-detected; ZIP writing is opt-in, see `archive.status()`)";
+                + " gzip is auto-detected; archives inside archives via '#'-display paths or bytes,"
+                + " never unpacked; ZIP writing is opt-in, see `archive.status()`)";
     }
 
     @Override
     public String getHelpTip() {
-        return "archive.help() (ZIP/tar incl. .tar.gz/.tgz, gzip, ZIP write)";
+        return "archive.help() (ZIP/tar incl. .tar.gz/.tgz, nested 'a.ear#b.war#c.jar', gzip, ZIP write)";
     }
 
     @Override
@@ -113,13 +123,28 @@ public class JsArchiveBridge implements JsModuleInterface {
         Map<String, Object> methods = new HashMap<>();
 
         methods.put("zipEntries", (ProxyExecutable) args -> {
-            requireArgs(args, 1, "zipEntries(path)");
-            return toEntryArray(JsArchive.zipEntries(args[0].asString()));
+            requireArgs(args, 1, "zipEntries(path | 'outer.zip#inner.jar' | bytes)");
+            Value v = args[0];
+            if (v.isString()) {
+                return toEntryArray(JsArchive.zipEntries(v.asString()));
+            }
+            return toEntryArray(JsArchive.zipEntries(GraalProxies.toByteArray(v)));
         });
 
         methods.put("zipEntry", (ProxyExecutable) args -> {
-            requireArgs(args, 2, "zipEntry(path, entryName)");
-            return toU8(uint8ArrayCtor, JsArchive.zipEntry(args[0].asString(), args[1].asString()));
+            requireArgs(args, 2, "zipEntry(path | 'outer.zip#inner.jar' | bytes, entryName)");
+            Value v = args[0];
+            byte[] data = v.isString()
+                    ? JsArchive.zipEntry(v.asString(), args[1].asString())
+                    : JsArchive.zipEntry(GraalProxies.toByteArray(v), args[1].asString());
+            return toU8(uint8ArrayCtor, data);
+        });
+
+        // One-shot read of a nested archive entry: 'app.ear#admin.war#WEB-INF/lib/x.jar#..class'
+        // resolves every level in memory; nothing is extracted to disk.
+        methods.put("entry", (ProxyExecutable) args -> {
+            requireArgs(args, 1, "entry('outer.zip#inner.jar#dir/file.txt')");
+            return toU8(uint8ArrayCtor, JsArchive.entryBytes(args[0].asString()));
         });
 
         // ---- ZIP write (gated by the mcp.js.archive.readonly system property) ----

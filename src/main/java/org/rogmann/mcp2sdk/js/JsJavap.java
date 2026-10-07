@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -21,10 +22,12 @@ import java.util.concurrent.TimeUnit;
  * Disassembly of Java class files (bytecode) for JavaScript by invoking the {@code javap} tool
  * of the JDK.
  *
- * <p>The supplied source is either a file path relative to the project base directory or a raw
- * byte array (e.g. an entry extracted with {@code archive}). For byte arrays an intermediate
- * {@code .class} file (output name stem) is created next to the output file and kept on success,
- * so the disassembly stays re-runnable and diffable.</p>
+ * <p>The supplied source is either a file path relative to the project base directory, a raw
+ * byte array (e.g. an entry extracted with {@code archive}) or an archive display path that walks
+ * into embedded archives ({@code app.ear#admin.war#WEB-INF/lib/x.jar#com/example/Util.class}).
+ * For byte arrays and display paths an intermediate {@code .class} file (output name stem) is
+ * created next to the output file and kept on success, so the disassembly stays re-runnable and
+ * diffable - and so that a nested archive never has to be unpacked by hand.</p>
  *
  * <h3>Commands</h3>
  * <ul>
@@ -45,8 +48,9 @@ import java.util.concurrent.TimeUnit;
  *       shell is involved.</li>
  *   <li>All file paths (output, intermediate class file, source file) are validated with
  *       {@link JsFileSystem#resolveSafePath(String)}: no {@code ..}, no absolute paths outside
- *       the base directory, no symbolic links leaving the base.</li>
- *   <li>The input must start with the class magic {@code 0xCAFEBABE};</li>
+ *       the base directory, no symbolic links leaving the base. Archive display paths are checked
+ *       by {@link JsArchive} with the same rules, level by level.</li>
+ *   <li>The input must start with the class magic {@code 0xCAFEBABE}.</li>
  *   <li>User-facing error messages contain only relative paths; absolute paths are logged.</li>
  * </ul>
  *
@@ -55,6 +59,10 @@ import java.util.concurrent.TimeUnit;
  * var r = javap.disassemble("classes/Foo.class", "bytecode", "Foo.bytecode.txt");
  * var r2 = javap.disassemble(classBytes, "structure", "Foo.structure.txt");
  * var r3 = javap.disassemble(classBytes, null, "Foo.default.txt");   // default: bytecode
+ * // embedded jar, nothing unpacked:
+ * var r4 = javap.disassemble("app.ear#admin.war#WEB-INF/lib/x.jar#com/example/Util.class",
+ *                            "bytecode", "Util.bytecode.txt");
+ * var list = javap.classes("spring-app.jar", { contains: "Controller" });
  * }</pre>
  */
 public class JsJavap {
@@ -72,6 +80,12 @@ public class JsJavap {
 
     /** Java class magic bytes ({@code 0xCAFEBABE}). */
     private static final byte[] CLASS_MAGIC = {(byte) 0xCA, (byte) 0xFE, (byte) 0xBA, (byte) 0xBE};
+
+    /** ZIP local-header magic ({@code PK\x03\x04}) - an archive, not a class. */
+    private static final byte[] ARCHIVE_MAGIC = {'P', 'K', 0x03, 0x04};
+
+    /** Entry suffix of a compiled class inside an archive. */
+    private static final String CLASS_SUFFIX = ".class";
 
     /** Command used when the caller passes null/blank. */
     private static final String DEFAULT_COMMAND = "bytecode";
@@ -96,24 +110,41 @@ public class JsJavap {
     /**
      * Disassembles a Java class file into the requested output file.
      *
-     * @param sourcePath path of the {@code .class} file, relative to the base directory
+     * @param sourcePath path of the {@code .class} file, relative to the base directory, or an
+     *                   archive display path that addresses the class inside embedded archives
+     *                   ({@code app.zip#BOOT-INF/lib/x.jar#com/example/Util.class})
      * @param command {@code "bytecode"} (default), {@code "structure"} or {@code "verbose"}
      *                (case-insensitive; null/blank means default)
      * @param outputPath name of the generated disassembly file, relative to the base directory
-     * @return a map with keys {@code outputFile}, {@code classFile}, {@code command},
-     *         {@code javap}, {@code exitCode}, {@code bytesWritten} and {@code classVersion}
+     * @return a map with keys {@code outputFile}, {@code classFile}, {@code source},
+     *         {@code sourceBytes}, {@code command}, {@code javap}, {@code exitCode},
+     *         {@code bytesWritten} and {@code classVersion}
      * @throws JsUserRuntimeException if the source file is missing or not a Java class file, the
      *         command is unknown, javap is not available, the disassembly fails or any path is
      *         outside the base directory
      */
     public static Map<String, Object> disassemble(String sourcePath, String command, String outputPath) {
+        if (sourcePath == null || sourcePath.isBlank()) {
+            throw new JsUserRuntimeException("Source must not be empty - expected a .class path,"
+                    + " class bytes or a display path like 'app.jar#com/example/Foo.class'.");
+        }
+        if (sourcePath.contains(JsArchive.ARCHIVE_SEPARATOR)) {
+            // A class inside one or more archives: read it straight from the central directories,
+            // no unpacking and no temporary archive - only the .class itself is materialized.
+            // (A real file whose own name contains '#' still wins, see JsArchive.entryBytes.)
+            byte[] data = JsArchive.entryBytes(sourcePath);
+            return disassembleFromBytes(data, command, outputPath, sourcePath);
+        }
         Path source = JsFileSystem.resolveSafePath(sourcePath);
         if (!Files.isRegularFile(source)) {
-            throw new JsUserRuntimeException("Source file not found: " + JsFileSystem.toRelative(source));
+            throw new JsUserRuntimeException("Source file not found: " + JsFileSystem.toRelative(source)
+                    + (sourcePath.contains("/") && sourcePath.endsWith(".class")
+                            ? " (a class inside an archive is addressed as 'app.jar#com/example/Foo.class')"
+                            : ""));
         }
         requireClassMagic(readHeader(source), JsFileSystem.toRelative(source));
         Path outputPathSafe = JsFileSystem.resolveSafePath(outputPath);
-        return runJavap(source, outputPathSafe, command, false);
+        return runJavap(source, outputPathSafe, command, false, JsFileSystem.toRelative(source));
     }
 
     /**
@@ -125,8 +156,9 @@ public class JsJavap {
      * @param command {@code "bytecode"} (default), {@code "structure"} or {@code "verbose"}
      *                (case-insensitive; null/blank means default)
      * @param outputPath name of the generated disassembly file, relative to the base directory
-     * @return a map with keys {@code outputFile}, {@code classFile}, {@code command},
-     *         {@code javap}, {@code exitCode}, {@code bytesWritten} and {@code classVersion}
+     * @return a map with keys {@code outputFile}, {@code classFile}, {@code source},
+     *         {@code sourceBytes}, {@code command}, {@code javap}, {@code exitCode},
+     *         {@code bytesWritten} and {@code classVersion}
      * @throws IllegalArgumentException if {@code data} is null
      * @throws JsUserRuntimeException if the data is empty/too large or not a Java class file, the
      *         command is unknown, javap is not available, the disassembly fails or any path is
@@ -136,6 +168,22 @@ public class JsJavap {
         if (data == null) {
             throw new IllegalArgumentException("data must not be null");
         }
+        return disassembleFromBytes(data, command, outputPath, "<bytes:" + data.length + ">");
+    }
+
+    /**
+     * Shared body of the byte-array and the archive-entry source: validate, materialize the
+     * intermediate class file, run javap.
+     *
+     * @param data class bytes as they came from memory
+     * @param command requested command
+     * @param outputPath unresolved output path (validated here, before anything is written)
+     * @param sourceName how the bytes were addressed, reported as {@code source} and used in
+     *                   messages ("input bytes", a relative path or an archive display path)
+     * @return the result map
+     */
+    private static Map<String, Object> disassembleFromBytes(byte[] data, String command, String outputPath,
+            String sourceName) {
         if (data.length == 0) {
             throw new JsUserRuntimeException("Source data is empty; nothing to disassemble.");
         }
@@ -145,10 +193,10 @@ public class JsJavap {
         }
         // Validate the output direction before writing any intermediate file.
         Path outputPathSafe = JsFileSystem.resolveSafePath(outputPath);
-        requireClassMagic(data, "input bytes");
+        requireClassMagic(data, sourceName);
         Path classPath = deriveClassPath(outputPathSafe);
         writeClassFile(classPath, data);
-        return runJavap(classPath, outputPathSafe, command, true);
+        return runJavap(classPath, outputPathSafe, command, true, sourceName);
     }
 
     /**
@@ -174,6 +222,97 @@ public class JsJavap {
     }
 
     // ========================================================================
+    // Class discovery inside archives
+    // ========================================================================
+
+    /** Default limit of {@code javap.classes()}'s result list. */
+    public static final int DEFAULT_MAX_CLASSES = 2000;
+
+    /** Hard limit of {@code javap.classes()}'s result list. */
+    public static final int MAX_CLASSES_LIMIT = 50000;
+
+    /**
+     * Lists the compiled classes of an archive, so that a caller can pick what to disassemble
+     * without unpacking anything: a {@code .jar}/{@code .war}/{@code .ear}/{@code .zip} path, a
+     * display path into embedded archives ({@code app.ear#admin.war#WEB-INF/lib/x.jar}) or archive
+     * bytes.
+     *
+     * @param source archive path or display path into embedded archives
+     *               ({@code app.ear#admin.war#WEB-INF/lib/x.jar})
+     * @param options {@code maxEntries} (default {@value #DEFAULT_MAX_CLASSES}), {@code contains}
+     *                (case-insensitive substring of the entry or the class name)
+     * @return a map with keys {@code source}, {@code entries}, {@code total}, {@code returned},
+     *         {@code truncated} and {@code classes} ({@code [{entry, className, size}]})
+     * @throws JsUserRuntimeException if the archive is missing, is no ZIP or a path leaves the base
+     */
+    public static Map<String, Object> classes(String source, Map<String, Object> options) {
+        return classesOf(JsArchive.zipEntries(source), source, options);
+    }
+
+    /** Byte-array variant of {@link #classes(String, Map)}. */
+    public static Map<String, Object> classes(byte[] data, Map<String, Object> options) {
+        if (data == null) {
+            throw new IllegalArgumentException("data must not be null");
+        }
+        return classesOf(JsArchive.zipEntries(data), "<bytes:" + data.length + ">", options);
+    }
+
+    /**
+     * Filters the {@code .class} entries of an archive listing.
+     *
+     * @param entries rows as returned by {@link JsArchive#zipEntries(String)}
+     * @param source how the archive was addressed (reported back as {@code source})
+     * @param options {@code maxEntries} (default {@value #DEFAULT_MAX_CLASSES}),
+     *                {@code contains} (case-insensitive substring of the entry or class name)
+     * @return the result map
+     */
+    private static Map<String, Object> classesOf(List<Map<String, Object>> entries, String source,
+            Map<String, Object> options) {
+        Opts opts = new Opts(options, "maxEntries", "contains");
+        int maxEntries = opts.intInRange("maxEntries", DEFAULT_MAX_CLASSES, 1, MAX_CLASSES_LIMIT);
+        String contains = opts.string("contains");
+        String needle = contains == null ? null : contains.toLowerCase(Locale.ROOT);
+        List<Map<String, Object>> classes = new ArrayList<>();
+        long total = 0;
+        for (Map<String, Object> entry : entries) {
+            Object rawName = entry.get("name");
+            if (!(rawName instanceof String name) || !name.endsWith(CLASS_SUFFIX)) {
+                continue;
+            }
+            String className = toClassName(name);
+            if (needle != null && !name.toLowerCase(Locale.ROOT).contains(needle)
+                    && !className.toLowerCase(Locale.ROOT).contains(needle)) {
+                continue;
+            }
+            total++;
+            if (classes.size() < maxEntries) {
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("entry", name);
+                row.put("className", className);
+                row.put("size", entry.get("size"));
+                classes.add(row);
+            }
+        }
+        classes.sort(Comparator.comparing((Map<String, Object> row) -> String.valueOf(row.get("entry"))));
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("source", source);
+        result.put("entries", entries.size());
+        result.put("total", total);
+        result.put("returned", classes.size());
+        result.put("truncated", total > classes.size());
+        result.put("classes", classes);
+        return result;
+    }
+
+    /** Entry name of a compiled class ({@code com/example/Foo$Bar.class}) as class name. */
+    static String toClassName(String entryName) {
+        String withoutSuffix = entryName.endsWith(CLASS_SUFFIX)
+                ? entryName.substring(0, entryName.length() - CLASS_SUFFIX.length())
+                : entryName;
+        return withoutSuffix.replace('/', '.');
+    }
+
+    // ========================================================================
     // Disassembly core
     // ========================================================================
 
@@ -185,10 +324,11 @@ public class JsJavap {
      * @param command requested command (see {@link #resolveFlags(String)})
      * @param temporaryClass whether the class path is a generated file that should be removed
      *                       together with a partial output on failure
+     * @param sourceName how the class was addressed (relative path, display path or "input bytes")
      * @return the result map for the caller
      */
     private static Map<String, Object> runJavap(Path classPath, Path outputPath, String command,
-            boolean temporaryClass) {
+            boolean temporaryClass, String sourceName) {
         boolean success = false;
         try {
             Path parent = outputPath.getParent();
@@ -226,6 +366,8 @@ public class JsJavap {
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("outputFile", JsFileSystem.toRelative(outputPath));
             result.put("classFile", JsFileSystem.toRelative(classPath));
+            result.put("source", sourceName);
+            result.put("sourceBytes", fileSizeOrZero(classPath));
             result.put("command", normalizedCommand);
             result.put("javap", "javap");
             result.put("exitCode", 0);
@@ -379,10 +521,18 @@ public class JsJavap {
      * Verifies that the given bytes start with the Java class magic {@code 0xCAFEBABE}.
      *
      * @param header the first bytes of the input
-     * @param what source description for the error message (relative path or "input bytes")
+     * @param what source description for the error message (relative path, display path or "input bytes")
      * @throws JsUserRuntimeException if the magic is missing
      */
     private static void requireClassMagic(byte[] header, String what) {
+        if (header.length >= ARCHIVE_MAGIC.length && header[0] == ARCHIVE_MAGIC[0]
+                && header[1] == ARCHIVE_MAGIC[1] && header[2] == ARCHIVE_MAGIC[2]) {
+            // A container was addressed instead of a class inside it: say how that is done, because
+            // this is the one mistake the nested workflow invites.
+            throw new JsUserRuntimeException("Not a Java class file: " + what + " is a ZIP archive."
+                    + " List its classes with javap.classes(source) and address one as"
+                    + " 'source" + JsArchive.ARCHIVE_SEPARATOR + "com/example/Foo.class'.");
+        }
         if (header.length < CLASS_MAGIC.length) {
             throw new JsUserRuntimeException("Not a valid Java class file: " + what
                     + " (too short). javap only processes .class files.");
@@ -390,7 +540,7 @@ public class JsJavap {
         for (int i = 0; i < CLASS_MAGIC.length; i++) {
             if (header[i] != CLASS_MAGIC[i]) {
                 throw new JsUserRuntimeException("Not a valid Java class file: " + what
-                        + " (the class magic 0xCAFEBABE is missing). javap only processes .class.");
+                        + " (the class magic 0xCAFEBABE is missing). javap only processes .class files.");
             }
         }
     }
@@ -493,6 +643,76 @@ public class JsJavap {
         }
     }
 
+    /**
+     * Size of a file, or {@code 0} when it cannot be read (the value is informational only).
+     *
+     * @param path the resolved path
+     * @return size in bytes
+     */
+    private static long fileSizeOrZero(Path path) {
+        try {
+            return Files.size(path);
+        } catch (IOException e) {
+            return 0L;
+        }
+    }
+
+    // ========================================================================
+    // Options
+    // ========================================================================
+
+    /**
+     * Parsed option map with strict name checking (an unknown option is an error, so a typo can
+     * never silently widen or narrow a result), same contract as the other JS modules.
+     */
+    private static final class Opts {
+        private final Map<String, Object> raw;
+
+        Opts(Map<String, Object> raw, String... allowed) {
+            this.raw = raw == null ? Map.of() : raw;
+            for (String key : this.raw.keySet()) {
+                boolean known = false;
+                for (String name : allowed) {
+                    if (name.equals(key)) {
+                        known = true;
+                        break;
+                    }
+                }
+                if (!known) {
+                    throw new IllegalArgumentException("Unknown javap option '" + key
+                            + "'. Valid options here: " + String.join(", ", allowed) + ". See javap.help().");
+                }
+            }
+        }
+
+        String string(String name) {
+            Object value = raw.get(name);
+            if (value == null) {
+                return null;
+            }
+            if (!(value instanceof String text)) {
+                throw new IllegalArgumentException("Option '" + name + "' must be a string");
+            }
+            return text.isBlank() ? null : text;
+        }
+
+        int intInRange(String name, int fallback, int min, int max) {
+            Object value = raw.get(name);
+            if (value == null) {
+                return fallback;
+            }
+            if (!(value instanceof Number number)) {
+                throw new IllegalArgumentException("Option '" + name + "' must be a number");
+            }
+            long parsed = number.longValue();
+            if (parsed < min || parsed > max) {
+                throw new IllegalArgumentException("Option '" + name + "' must be between " + min
+                        + " and " + max + " (got " + parsed + ")");
+            }
+            return (int) parsed;
+        }
+    }
+
     // ========================================================================
     // Help / documentation
     // ========================================================================
@@ -508,14 +728,16 @@ public class JsJavap {
                 ================================
 
                 Disassembles Java class files (.class) with the javap tool of the JDK.
-                The source is either a
-                file path relative to the project base directory or a byte array (e.g. an entry
-                extracted with archive.*).
+                The source is a file path relative to the project base directory, a byte array
+                (e.g. an entry extracted with archive.*) or an archive display path - a class
+                inside one or more archives, addressed without unpacking anything.
 
                 javap.disassemble(source, command, outputPath)
-                    source       - .class file path (string) or bytes (Uint8Array / array 0-255).
+                    source       - .class file path (string), bytes (Uint8Array / array 0-255) or
+                                   a display path 'outer.ear#inner.war#x.jar#com/example/Foo.class'
+                                   ('#' separates the archive levels, as in search and xml).
                                    The input must start with the class magic 0xCAFEBABE; native
-                                   binaries are rejected.
+                                   binaries and archives are rejected (the error names the way).
                     command      - 'bytecode' (default): javap -c -p -constants (full bytecode,
                                    incl. private members and constant values)
                                    'structure'          : javap -protected (public/protected API)
@@ -524,22 +746,54 @@ public class JsJavap {
                     outputPath   - generated disassembly file (e.g. "Foo.bytecode.txt"),
                                    relative to the project base directory.
 
-                Returns a map: {outputFile, classFile, command, javap, exitCode, bytesWritten,
-                classVersion} - 'classVersion' is e.g. "61.0 (Java 17)". For a byte-array source
-                an intermediate '<stem>.class' is created next to the output file and kept on
-                success.
+                Returns a map: {outputFile, classFile, source, sourceBytes, command, javap,
+                exitCode, bytesWritten, classVersion} - 'classVersion' is e.g. "61.0 (Java 17)",
+                'source' says how the class was addressed (path, display path or "<bytes:N>").
+                For a byte-array or display-path source an intermediate '<stem>.class' is created
+                next to the output file and kept on success; the archives themselves are never
+                written out.
+
+                javap.classes(source[, options])
+                    source       - archive path, display path ('app.ear#admin.war#WEB-INF/lib
+                                   /x.jar') or archive bytes (Uint8Array).
+                    options      - maxEntries (default 2000, max 50000),
+                                   contains  - case-insensitive substring of the entry name or
+                                               the class name, e.g. 'Controller'
+                Returns {source, entries, total, returned, truncated, classes:
+                [{entry, className, size}]} - the .class entries of that archive, sorted by entry
+                name, ready to feed back into javap.disassemble(source + '#' + c.entry).
 
                 Examples:
                     javap.disassemble("classes/Foo.class", "bytecode", "Foo.bytecode.txt");
                     javap.disassemble(classBytes, "structure", "Foo.structure.txt");
                     javap.disassemble(classBytes, null, "Foo.bytecode.txt");  // default: bytecode
-                    fs.readFile("Foo.bytecode.txt", ...)  // afterwards read with fs.*
+
+                    // A Spring Boot fat jar: the library is an entry of the jar, and the class is
+                    // an entry of that entry - no unpacking step in between.
+                    var lib = "target/app.jar#BOOT-INF/lib/spring-core-7.0.8.jar";
+                    var found = javap.classes(lib, { contains: 'SpringVersion' });
+                    javap.disassemble(lib + '#' + found.classes[0].entry,
+                                      'bytecode', 'spring-version.bytecode.txt');
+                    // three levels deep, still one call:
+                    javap.disassemble("src/test/resources/js/js-javap.dummy.ear#js-javap.zip"
+                            + "#js-javap-test.jar#org/rogmann/mcp2sdk/js/JsJavapTest.class",
+                            'bytecode', 'nested.bytecode.txt');
+
+                    // with m2: the bytecode of a dependency, still without any unpacking
+                    var c = m2.findClass('org.springframework.core.SpringVersion', 'pom.xml');
+                    var b = m2.readEntry(c.artifact.gav, c.entry);      // the .class bytes
+                    javap.disassemble(b, 'structure', 'spring-version.txt');
 
                 Requirements / notes:
                     javap is part of a JDK (not a plain JRE). It is looked up on the PATH and,
                     as a fallback, in java.home/bin of the running server JVM. The command is
                     started without a shell and only with fixed flags (no caller arguments), and
                     all paths are validated like in fs.* (no '..', no paths outside the base).
+                    Nested levels are read from memory (central directory / tar headers), so a
+                    whole .ear -> .war -> .jar -> .class walk costs no extra files and no
+                    extraction; up to 8 archive levels are followed. A class name must be written
+                    as the archive stores it ('com/example/Foo.class', with '/'), not as
+                    'com.example.Foo'.
                 """;
     }
 }
