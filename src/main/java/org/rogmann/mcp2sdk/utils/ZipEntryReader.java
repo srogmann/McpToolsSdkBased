@@ -340,15 +340,21 @@ public final class ZipEntryReader {
         throw notAZip("no end-of-central-directory record found");
     }
 
-    /** Archive comment of the end record ({@code null} when the archive has none). */
-    private String readEndComment(int endRecord) {
+    /**
+     * Archive comment of the end record: it sits inside the record, right after its 22 fixed bytes.
+     *
+     * @return the comment, or {@code null} when the archive has none - and also when the data ends
+     *         before the declared comment length (a truncated archive): half a comment would be a
+     *         fabricated string, so the reader says "no comment" instead
+     */
+    private String readEndComment(int endRecord) throws IOException {
         int commentLength = (int) readUInt16(endRecord + 20);
         if (commentLength == 0) {
             return null;
         }
         long start = endRecord + (long) END_RECORD_SIZE;
         if (start + commentLength > data.length) {
-            return null; // the fallback record of data with trailing junk: no readable comment
+            return null;
         }
         return new String(data, (int) start, commentLength, StandardCharsets.UTF_8);
     }

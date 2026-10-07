@@ -293,11 +293,23 @@ public class JsArchive {
      * True when the string is a real file inside the base directory. A file may legitimately be
      * called {@code fix#1.zip}, so the plain path always wins over the display syntax - exactly the
      * rule {@link JsSearch} applies to its targets.
+     *
+     * <p>
+     * The {@code catch} is not about I/O: {@link Files#isRegularFile(Path, java.nio.file.LinkOption...)}
+     * swallows {@code IOException} by contract. It is about {@link JsFileSystem#resolveSafePath(String)},
+     * which <em>rejects</em> the string as a user error - {@link JsUserRuntimeException} for
+     * {@code ..}, for a path outside the base directory, for an unknown add-on mount and for a
+     * symlink escaping it, and {@link java.nio.file.InvalidPathException} (an
+     * {@code IllegalArgumentException}) for characters the file system cannot represent. "Cannot even
+     * be addressed as a project file" means "must be a display path", so those cases continue into the
+     * display-path branch - where {@code requireRegularFile(segments[0])} reports the very same
+     * rejection for the file part. Nothing is hidden, and the message stays the specific one.
+     * </p>
      */
     private static boolean isRegularFilePath(String candidate) {
         try {
             return Files.isRegularFile(JsFileSystem.resolveSafePath(candidate));
-        } catch (RuntimeException e) {
+        } catch (JsUserRuntimeException | IllegalArgumentException e) {
             return false;
         }
     }
@@ -383,7 +395,13 @@ public class JsArchive {
                 }
             }
         } catch (RuntimeException e) {
-            names.clear(); // a hint is a bonus; the missing entry stays the point of the message
+            // Expected: the listing of the parent goes through the same readers as a normal call, so
+            // a corrupt container ("invalid tar archive", "Failed to read zip archive: ..."), a header
+            // that cannot be probed, or a container that turns out to be neither ZIP nor tar surfaces
+            // here as JsUserRuntimeException. All of them mean "no hint", not "no error": this catch
+            // only guards the bonus, the actual failure (entry not found) keeps its own message.
+            names.clear();
+            LOG.debug("Entry hint for {} unavailable: {}", display, e.getMessage());
         }
         names.sort(Comparator.naturalOrder());
         message.append(" (that level has ").append(names.size()).append(" entries)");
@@ -535,13 +553,12 @@ public class JsArchive {
                 throw new JsUserRuntimeException("Failed to read file: " + JsFileSystem.toRelative(file), e);
             }
         }
-        int last = trimmed.lastIndexOf(ARCHIVE_SEPARATOR);
-        String entryName = trimmed.substring(last + 1);
-        if (entryName.isEmpty()) {
-            throw new JsUserRuntimeException("Invalid archive path '" + trimmed + "': '"
-                    + ARCHIVE_SEPARATOR + "' must be followed by an entry name.");
-        }
-        Container container = openContainer(trimmed.substring(0, last));
+        // Validated as a whole: empty segments and the depth limit apply to the complete path, not
+        // to the container part alone (otherwise one level below the limit could hide behind the
+        // entry that is being read).
+        String[] segments = splitDisplayPath(trimmed);
+        String entryName = segments[segments.length - 1];
+        Container container = openContainer(displayOf(segments, segments.length - 2));
         byte[] data = readEntryOfContainer(container, entryName, trimmed);
         if (data == null) {
             throw entryNotFoundIn(container, entryName, trimmed);

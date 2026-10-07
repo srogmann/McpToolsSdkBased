@@ -304,12 +304,16 @@ public class JsJavap {
         return result;
     }
 
-    /** Entry name of a compiled class ({@code com/example/Foo$Bar.class}) as class name. */
+    /**
+     * Entry name of a compiled class ({@code com/example/Foo$Bar.class}) as class name. A name that
+     * is not a class stays as it is - this is a display helper, not a converter, and inventing a
+     * dotted "class name" for {@code web.xml} would be a lie.
+     */
     static String toClassName(String entryName) {
-        String withoutSuffix = entryName.endsWith(CLASS_SUFFIX)
-                ? entryName.substring(0, entryName.length() - CLASS_SUFFIX.length())
-                : entryName;
-        return withoutSuffix.replace('/', '.');
+        if (entryName == null || !entryName.endsWith(CLASS_SUFFIX)) {
+            return entryName;
+        }
+        return entryName.substring(0, entryName.length() - CLASS_SUFFIX.length()).replace('/', '.');
     }
 
     // ========================================================================
@@ -535,12 +539,14 @@ public class JsJavap {
         }
         if (header.length < CLASS_MAGIC.length) {
             throw new JsUserRuntimeException("Not a valid Java class file: " + what
-                    + " (too short). javap only processes .class files.");
+                    + " (too short). javap only processes .class files; use 'objdump' for native "
+                    + "binaries.");
         }
         for (int i = 0; i < CLASS_MAGIC.length; i++) {
             if (header[i] != CLASS_MAGIC[i]) {
                 throw new JsUserRuntimeException("Not a valid Java class file: " + what
-                        + " (the class magic 0xCAFEBABE is missing). javap only processes .class files.");
+                        + " (the class magic 0xCAFEBABE is missing). javap only processes .class "
+                        + "files; use 'objdump' for native binaries.");
             }
         }
     }
