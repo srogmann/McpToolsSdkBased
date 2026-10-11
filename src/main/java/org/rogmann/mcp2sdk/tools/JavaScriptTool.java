@@ -16,16 +16,7 @@ import org.graalvm.polyglot.proxy.ProxyExecutable;
 import org.graalvm.polyglot.proxy.ProxyObject;
 import org.rogmann.mcp2sdk.ToolSpecWithState;
 import org.rogmann.mcp2sdk.ToolState;
-import org.rogmann.mcp2sdk.js.JsArchiveBridge;
-import org.rogmann.mcp2sdk.js.JsCryptoBridge;
-import org.rogmann.mcp2sdk.js.JsFileSystem;
-import org.rogmann.mcp2sdk.js.JsFileSystemBridge;
-import org.rogmann.mcp2sdk.js.JsJavapBridge;
-import org.rogmann.mcp2sdk.js.JsM2Bridge;
-import org.rogmann.mcp2sdk.js.JsMcpProxyBridge;
-import org.rogmann.mcp2sdk.js.JsModuleInterface;
-import org.rogmann.mcp2sdk.js.JsSearchBridge;
-import org.rogmann.mcp2sdk.js.JsSQLiteBridge;
+import org.rogmann.mcp2sdk.js.*;
 import org.rogmann.mcp2sdk.xml.JsXmlBridge;
 import org.rogmann.mcp2sdk.poi.DocxToolBoxJsBridge;
 import org.rogmann.mcp2sdk.poi.PoiToolBoxJsBridge;
@@ -177,6 +168,7 @@ public class JavaScriptTool {
         // -Dmcp2sdk.module.m2.enabled=false.
         modules.put("m2", new JsM2Bridge());
         modules.put("xml", new JsXmlBridge());
+        modules.put("pdf", new JsPdfBridge());
         modules.put("poi", new PoiToolBoxJsBridge());
         modules.put("docx", new DocxToolBoxJsBridge());
         modules.put("pptx", new PptxToolBoxJsBridge());
