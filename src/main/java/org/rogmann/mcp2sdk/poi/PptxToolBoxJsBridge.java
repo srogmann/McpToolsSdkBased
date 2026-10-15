@@ -18,6 +18,14 @@ import java.util.Map;
  * closes all presentations of that instance when the call ends.
  * </p>
  *
+ * <h3>Argument conversion</h3>
+ * <p>
+ * Every argument is read through {@link PoiJsArgs.Call}, so a wrong or missing argument names
+ * the function, the argument and the valid range. Reading {@code args[5].asDouble()} directly
+ * answered a short call with an {@code ArrayIndexOutOfBoundsException}, and a bare
+ * {@code asDouble()} accepted any number - including NaN and 1e300 pt.
+ * </p>
+ *
  * <h3>Usage in JavaScript</h3>
  * <pre>{@code
  * var show = pptx.openFile("demo.pptx");
@@ -28,6 +36,9 @@ import java.util.Map;
  * }</pre>
  */
 public class PptxToolBoxJsBridge implements JsModuleInterface {
+
+    /** Shared conversion rules of the three POI namespaces. */
+    private static final PoiJsArgs A = PoiJsArgs.PPTX;
 
     public PptxToolBoxJsBridge() {
         // Utility class
@@ -63,121 +74,183 @@ public class PptxToolBoxJsBridge implements JsModuleInterface {
     public static ProxyObject createPptxNamespace(PptxToolBox box) {
         Map<String, Object> methods = new HashMap<>();
 
-        methods.put("openFile", (ProxyExecutable) args -> box.openFile(args[0].asString()));
+        // --- presentation ---
+        methods.put("openFile", (ProxyExecutable) args ->
+                box.openFile(A.bind("openFile", args).string("path", 0)));
         methods.put("createPresentation", (ProxyExecutable) args -> box.createPresentation());
         methods.put("save", (ProxyExecutable) args -> {
-            box.save(args[0].asString(), args[1].asString());
+            PoiJsArgs.Call c = A.bind("save", args);
+            box.save(c.string("showHandle", 0), c.string("path", 1));
             return null;
         });
         methods.put("close", (ProxyExecutable) args -> {
-            box.close(args[0].asString());
+            box.close(A.bind("close", args).string("showHandle", 0));
             return null;
         });
 
+        // --- slides and layouts ---
         methods.put("getSlides", (ProxyExecutable) args ->
-                GraalProxies.toProxyObject(box.getSlides(args[0].asString())));
+                GraalProxies.toProxyObject(box.getSlides(presentation("getSlides", args))));
         methods.put("getPageSize", (ProxyExecutable) args ->
-                GraalProxies.toProxyObject(box.getPageSize(args[0].asString())));
-        methods.put("createSlide", (ProxyExecutable) args -> box.createSlide(args[0].asString()));
-        methods.put("createBlankSlide", (ProxyExecutable) args -> box.createBlankSlide(args[0].asString()));
+                GraalProxies.toProxyObject(box.getPageSize(presentation("getPageSize", args))));
+        methods.put("createSlide", (ProxyExecutable) args ->
+                box.createSlide(presentation("createSlide", args)));
+        methods.put("createBlankSlide", (ProxyExecutable) args ->
+                box.createBlankSlide(presentation("createBlankSlide", args)));
         methods.put("getLayouts", (ProxyExecutable) args ->
-                GraalProxies.toProxyObject(box.getLayouts(args[0].asString())));
-        methods.put("createSlideFromLayout", (ProxyExecutable) args ->
-                box.createSlideFromLayout(args[0].asString(), args[1].asString()));
-        methods.put("createSlideLike", (ProxyExecutable) args ->
-                box.createSlideLike(args[0].asString(), args[1].asString()));
-        methods.put("duplicateSlide", (ProxyExecutable) args ->
-                box.duplicateSlide(args[0].asString(), args[1].asString()));
-        methods.put("createTextBox", (ProxyExecutable) args -> {
-            String text = args.length > 1 && !args[1].isNull() ? args[1].asString() : "";
-            return box.createTextBox(args[0].asString(), text);
+                GraalProxies.toProxyObject(box.getLayouts(presentation("getLayouts", args))));
+        methods.put("createSlideFromLayout", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("createSlideFromLayout", args);
+            return box.createSlideFromLayout(c.string("showHandle", 0), c.string("layoutHandle", 1));
         });
-        methods.put("getShapeText", (ProxyExecutable) args -> box.getShapeText(args[0].asString()));
+        methods.put("createSlideLike", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("createSlideLike", args);
+            return box.createSlideLike(c.string("showHandle", 0), c.string("slideHandle", 1));
+        });
+        methods.put("duplicateSlide", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("duplicateSlide", args);
+            return box.duplicateSlide(c.string("showHandle", 0), c.string("slideHandle", 1));
+        });
+
+        // --- shapes ---
+        methods.put("createTextBox", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("createTextBox", args);
+            return box.createTextBox(c.string("slideHandle", 0), c.optionalString("text", 1));
+        });
+        methods.put("addTextBox", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("addTextBox", args);
+            return box.addTextBox(c.string("slideHandle", 0), c.optionalString("text", 1),
+                    c.number("x", 2, -PptxToolBox.MAX_COORD_PT, PptxToolBox.MAX_COORD_PT),
+                    c.number("y", 3, -PptxToolBox.MAX_COORD_PT, PptxToolBox.MAX_COORD_PT),
+                    c.number("width", 4, 0.0, PptxToolBox.MAX_SIZE_PT),
+                    c.number("height", 5, 0.0, PptxToolBox.MAX_SIZE_PT));
+        });
+        methods.put("createShape", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("createShape", args);
+            return box.createShape(c.string("slideHandle", 0), c.optionalString("text", 1),
+                    c.number("x", 2, -PptxToolBox.MAX_COORD_PT, PptxToolBox.MAX_COORD_PT),
+                    c.number("y", 3, -PptxToolBox.MAX_COORD_PT, PptxToolBox.MAX_COORD_PT),
+                    c.number("width", 4, 0.0, PptxToolBox.MAX_SIZE_PT),
+                    c.number("height", 5, 0.0, PptxToolBox.MAX_SIZE_PT));
+        });
+        methods.put("createLine", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("createLine", args);
+            return box.createLine(c.string("slideHandle", 0),
+                    c.number("x1", 1, -PptxToolBox.MAX_COORD_PT, PptxToolBox.MAX_COORD_PT),
+                    c.number("y1", 2, -PptxToolBox.MAX_COORD_PT, PptxToolBox.MAX_COORD_PT),
+                    c.number("x2", 3, -PptxToolBox.MAX_COORD_PT, PptxToolBox.MAX_COORD_PT),
+                    c.number("y2", 4, -PptxToolBox.MAX_COORD_PT, PptxToolBox.MAX_COORD_PT));
+        });
+        methods.put("getShapeText", (ProxyExecutable) args ->
+                box.getShapeText(shape("getShapeText", args)));
         methods.put("setShapeText", (ProxyExecutable) args -> {
-            box.setShapeText(args[0].asString(), args[1].asString());
+            PoiJsArgs.Call c = A.bind("setShapeText", args);
+            box.setShapeText(c.string("shapeHandle", 0), c.string("text", 1));
             return null;
         });
         methods.put("appendParagraph", (ProxyExecutable) args -> {
-            box.appendParagraph(args[0].asString(), args[1].asString());
+            PoiJsArgs.Call c = A.bind("appendParagraph", args);
+            box.appendParagraph(c.string("shapeHandle", 0), c.string("text", 1));
             return null;
         });
         methods.put("getTableData", (ProxyExecutable) args ->
-                GraalProxies.toProxyObject(box.getTableData(args[0].asString())));
+                GraalProxies.toProxyObject(box.getTableData(shape("getTableData", args))));
         methods.put("getTableText", (ProxyExecutable) args ->
-                GraalProxies.toProxyObject(box.getTableText(args[0].asString())));
-
-        methods.put("addTextBox", (ProxyExecutable) args -> {
-            String text = args.length > 1 && !args[1].isNull() ? args[1].asString() : "";
-            return box.addTextBox(args[0].asString(), text,
-                    args[2].asDouble(), args[3].asDouble(), args[4].asDouble(), args[5].asDouble());
-        });
-        methods.put("createShape", (ProxyExecutable) args -> {
-            String text = args.length > 1 && !args[1].isNull() ? args[1].asString() : "";
-            return box.createShape(args[0].asString(), text,
-                    args[2].asDouble(), args[3].asDouble(), args[4].asDouble(), args[5].asDouble());
-        });
+                GraalProxies.toProxyObject(box.getTableText(shape("getTableText", args))));
         methods.put("setShapePosition", (ProxyExecutable) args -> {
-            box.setShapePosition(args[0].asString(), args[1].asDouble(), args[2].asDouble());
+            PoiJsArgs.Call c = A.bind("setShapePosition", args);
+            box.setShapePosition(c.string("shapeHandle", 0),
+                    c.number("x", 1, -PptxToolBox.MAX_COORD_PT, PptxToolBox.MAX_COORD_PT),
+                    c.number("y", 2, -PptxToolBox.MAX_COORD_PT, PptxToolBox.MAX_COORD_PT));
             return null;
         });
         methods.put("setShapeSize", (ProxyExecutable) args -> {
-            box.setShapeSize(args[0].asString(), args[1].asDouble(), args[2].asDouble());
+            PoiJsArgs.Call c = A.bind("setShapeSize", args);
+            box.setShapeSize(c.string("shapeHandle", 0),
+                    c.number("width", 1, 0.0, PptxToolBox.MAX_SIZE_PT),
+                    c.number("height", 2, 0.0, PptxToolBox.MAX_SIZE_PT));
             return null;
         });
         methods.put("setShapeRotation", (ProxyExecutable) args -> {
-            box.setShapeRotation(args[0].asString(), args[1].asDouble());
+            PoiJsArgs.Call c = A.bind("setShapeRotation", args);
+            box.setShapeRotation(c.string("shapeHandle", 0),
+                    c.number("degrees", 1, -PptxToolBox.MAX_ROTATION_DEG, PptxToolBox.MAX_ROTATION_DEG));
             return null;
         });
         methods.put("setShapeGeometry", (ProxyExecutable) args -> {
-            box.setShapeGeometry(args[0].asString(), args[1].asString());
+            PoiJsArgs.Call c = A.bind("setShapeGeometry", args);
+            box.setShapeGeometry(c.string("shapeHandle", 0), c.string("typeName", 1));
             return null;
         });
         methods.put("removeShape", (ProxyExecutable) args -> {
-            box.removeShape(args[0].asString());
+            box.removeShape(shape("removeShape", args));
             return null;
         });
         methods.put("setShapeFillColor", (ProxyExecutable) args -> {
-            box.setShapeFillColor(args[0].asString(), args[1].asString());
+            PoiJsArgs.Call c = A.bind("setShapeFillColor", args);
+            box.setShapeFillColor(c.string("shapeHandle", 0), c.string("hexColor", 1));
             return null;
         });
         methods.put("setShapeLineColor", (ProxyExecutable) args -> {
-            box.setShapeLineColor(args[0].asString(), args[1].asString());
+            PoiJsArgs.Call c = A.bind("setShapeLineColor", args);
+            box.setShapeLineColor(c.string("shapeHandle", 0), c.string("hexColor", 1));
             return null;
         });
         methods.put("setShapeLineWidth", (ProxyExecutable) args -> {
-            box.setShapeLineWidth(args[0].asString(), args[1].asDouble());
+            PoiJsArgs.Call c = A.bind("setShapeLineWidth", args);
+            box.setShapeLineWidth(c.string("shapeHandle", 0),
+                    c.number("widthPt", 1, 0.0, PptxToolBox.MAX_LINE_WIDTH_PT));
             return null;
         });
-        methods.put("createLine", (ProxyExecutable) args -> box.createLine(args[0].asString(),
-                args[1].asDouble(), args[2].asDouble(), args[3].asDouble(), args[4].asDouble()));
 
+        // --- run formatting ---
         methods.put("setRunText", (ProxyExecutable) args -> {
-            box.setRunText(args[0].asString(), args[1].asString());
+            PoiJsArgs.Call c = A.bind("setRunText", args);
+            box.setRunText(c.string("runHandle", 0), c.string("text", 1));
             return null;
         });
         methods.put("setRunBold", (ProxyExecutable) args -> {
-            box.setRunBold(args[0].asString(), args[1].asBoolean());
+            PoiJsArgs.Call c = A.bind("setRunBold", args);
+            box.setRunBold(c.string("runHandle", 0), c.bool("bold", 1));
             return null;
         });
         methods.put("setRunItalic", (ProxyExecutable) args -> {
-            box.setRunItalic(args[0].asString(), args[1].asBoolean());
+            PoiJsArgs.Call c = A.bind("setRunItalic", args);
+            box.setRunItalic(c.string("runHandle", 0), c.bool("italic", 1));
             return null;
         });
         methods.put("setRunFontSize", (ProxyExecutable) args -> {
-            box.setRunFontSize(args[0].asString(), args[1].asDouble());
+            PoiJsArgs.Call c = A.bind("setRunFontSize", args);
+            box.setRunFontSize(c.string("runHandle", 0),
+                    c.number("sizePoints", 1, PptxToolBox.MIN_FONT_PT, PptxToolBox.MAX_FONT_PT));
             return null;
         });
         methods.put("setRunFontFamily", (ProxyExecutable) args -> {
-            box.setRunFontFamily(args[0].asString(), args[1].asString());
+            PoiJsArgs.Call c = A.bind("setRunFontFamily", args);
+            box.setRunFontFamily(c.string("runHandle", 0), c.string("fontName", 1));
             return null;
         });
         methods.put("setRunFontColor", (ProxyExecutable) args -> {
-            box.setRunFontColor(args[0].asString(), args[1].asString());
+            PoiJsArgs.Call c = A.bind("setRunFontColor", args);
+            box.setRunFontColor(c.string("runHandle", 0), c.string("hexColor", 1));
             return null;
         });
 
         methods.put("help", (ProxyExecutable) args -> box.help());
 
         return ProxyObject.fromMap(methods);
+    }
+
+    /**
+     * The presentation handle of a one-argument call, named in the message when the caller
+     * passed nothing or something that is not a string.
+     */
+    private static String presentation(String fn, Value[] args) {
+        return A.bind(fn, args).string("showHandle", 0);
+    }
+
+    /** The shape handle of a one-argument call. */
+    private static String shape(String fn, Value[] args) {
+        return A.bind(fn, args).string("shapeHandle", 0);
     }
 }

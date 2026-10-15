@@ -1,14 +1,12 @@
 package org.rogmann.mcp2sdk.poi;
 
 import org.graalvm.polyglot.Value;
-import org.graalvm.polyglot.proxy.ProxyArray;
 import org.graalvm.polyglot.proxy.ProxyExecutable;
 import org.graalvm.polyglot.proxy.ProxyObject;
 import org.rogmann.mcp2sdk.js.GraalProxies;
 import org.rogmann.mcp2sdk.js.JsModuleInterface;
 
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
@@ -18,6 +16,16 @@ import java.util.Map;
  * operations to JavaScript running in a GraalVM Polyglot context.
  * The resulting object is intended to be bound as {@code "poi"} in the
  * JavaScript bindings.
+ * </p>
+ *
+ * <h3>Argument conversion</h3>
+ * <p>
+ * Arguments are read through {@link PoiJsArgs.Call}, so a wrong argument names the function,
+ * the argument and the valid range. The raw {@code args[1].asInt()} it replaces was silent in
+ * three ways: a fractional or quoted index ({@code 1.5}, {@code "B2"}) failed with Graal's own
+ * coercion text, a negative one reached Apache POI (which either throws an
+ * {@code IllegalArgumentException} or reads nothing at all), and {@code (short) asInt()} wrapped
+ * a font size of 70000 into a different size without a word.
  * </p>
  *
  * <h3>Per-call isolation</h3>
@@ -44,11 +52,14 @@ import java.util.Map;
  *
  * <h3>Security</h3>
  * <p>
- * File access is subject to the restrictions configured in {@link PoiToolBox}
+ * File access is subject to the restrictions configured in {@link PoiPaths}
  * (project base directory from system property {@code IDE_PROJECT_DIR}).
  * </p>
  */
 public class PoiToolBoxJsBridge implements JsModuleInterface {
+
+    /** Shared conversion rules of the three POI namespaces. */
+    private static final PoiJsArgs A = PoiJsArgs.XLSX;
 
     public PoiToolBoxJsBridge() {
         // Utility class
@@ -91,64 +102,79 @@ public class PoiToolBoxJsBridge implements JsModuleInterface {
 
         // ---- Workbook-level ----
         methods.put("openFile", (ProxyExecutable) args ->
-                poi.openFile(args[0].asString()));
+                poi.openFile(A.bind("openFile", args).string("path", 0)));
 
         methods.put("createWorkbook", (ProxyExecutable) args -> {
-            if (args.length > 0 && !args[0].isNull()) {
-                return poi.createWorkbook(args[0].asString());
+            PoiJsArgs.Call c = A.bind("createWorkbook", args);
+            Value nameArg = c.optionalValue(0);
+            if (nameArg == null || nameArg.isNull()) {
+                return poi.createWorkbook();
             }
-            return poi.createWorkbook();
+            return poi.createWorkbook(c.string("initialSheetName", 0));
         });
 
         methods.put("save", (ProxyExecutable) args -> {
-            poi.save(args[0].asString(), args[1].asString());
+            PoiJsArgs.Call c = A.bind("save", args);
+            poi.save(c.string("wbHandle", 0), c.string("path", 1));
             return null;
         });
 
         methods.put("close", (ProxyExecutable) args -> {
-            poi.close(args[0].asString());
+            poi.close(A.bind("close", args).string("wbHandle", 0));
             return null;
         });
 
         // ---- Sheet-level ----
         methods.put("getSheetNames", (ProxyExecutable) args ->
-                ProxyArray.fromArray((Object[]) poi.getSheetNames(args[0].asString())));
+                GraalProxies.toProxyArray((Object[]) poi.getSheetNames(workbook("getSheetNames", args))));
 
-        methods.put("getSheet", (ProxyExecutable) args ->
-                poi.getSheet(args[0].asString(), args[1].asString()));
+        methods.put("getSheet", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("getSheet", args);
+            return poi.getSheet(c.string("wbHandle", 0), c.string("sheetName", 1));
+        });
 
-        methods.put("getSheetByIndex", (ProxyExecutable) args ->
-                poi.getSheetByIndex(args[0].asString(), args[1].asInt()));
+        methods.put("getSheetByIndex", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("getSheetByIndex", args);
+            return poi.getSheetByIndex(c.string("wbHandle", 0), c.index("sheetIndex", 1));
+        });
 
-        methods.put("createSheet", (ProxyExecutable) args ->
-                poi.createSheet(args[0].asString(), args[1].asString()));
+        methods.put("createSheet", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("createSheet", args);
+            return poi.createSheet(c.string("wbHandle", 0), c.string("sheetName", 1));
+        });
 
         methods.put("removeSheet", (ProxyExecutable) args -> {
-            poi.removeSheet(args[0].asString(), args[1].asString());
+            PoiJsArgs.Call c = A.bind("removeSheet", args);
+            poi.removeSheet(c.string("wbHandle", 0), c.string("sheetName", 1));
             return null;
         });
 
         methods.put("getSheetName", (ProxyExecutable) args ->
-                poi.getSheetName(args[0].asString()));
+                poi.getSheetName(sheet("getSheetName", args)));
 
         // ---- Cell-level ----
-        methods.put("getCellValue", (ProxyExecutable) args ->
-                poi.getCellValue(args[0].asString(), args[1].asInt(), args[2].asInt()));
+        methods.put("getCellValue", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("getCellValue", args);
+            return poi.getCellValue(c.string("sheetHandle", 0), c.index("row", 1), c.index("col", 2));
+        });
 
         methods.put("setCellValue", (ProxyExecutable) args -> {
-            String sheetHandle = args[0].asString();
-            int row = args[1].asInt();
-            int col = args[2].asInt();
-            Object value = args.length > 3 ? GraalProxies.fromValue(args[3]) : null;
-            poi.setCellValue(sheetHandle, row, col, value);
+            PoiJsArgs.Call c = A.bind("setCellValue", args);
+            Value raw = c.optionalValue(3);
+            Object value = raw == null ? null : GraalProxies.fromValue(raw);
+            poi.setCellValue(c.string("sheetHandle", 0), c.index("row", 1), c.index("col", 2), value);
             return null;
         });
 
-        methods.put("getCellType", (ProxyExecutable) args ->
-                poi.getCellType(args[0].asString(), args[1].asInt(), args[2].asInt()));
+        methods.put("getCellType", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("getCellType", args);
+            return poi.getCellType(c.string("sheetHandle", 0), c.index("row", 1), c.index("col", 2));
+        });
 
-        methods.put("getCellFormula", (ProxyExecutable) args ->
-                poi.getCellFormula(args[0].asString(), args[1].asInt(), args[2].asInt()));
+        methods.put("getCellFormula", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("getCellFormula", args);
+            return poi.getCellFormula(c.string("sheetHandle", 0), c.index("row", 1), c.index("col", 2));
+        });
 
         // ---- Range / Data ----
         // toProxyObject (not ProxyObject.fromMap) on all result maps: fromMap hands member
@@ -156,145 +182,155 @@ public class PoiToolBoxJsBridge implements JsModuleInterface {
         // that the CONSTRAINED sandbox cannot read. Today these two maps are flat, but the
         // wrapper must not decide that a future nested field silently becomes unreadable.
         methods.put("getUsedRange", (ProxyExecutable) args -> {
-            Map<String, Object> range = poi.getUsedRange(args[0].asString());
+            Map<String, Object> range = poi.getUsedRange(sheet("getUsedRange", args));
             return range != null ? GraalProxies.toProxyObject(range) : null;
         });
 
         methods.put("getRangeAsJson", (ProxyExecutable) args -> {
-            Map<String, Object> rangeMap = poi.getRangeAsJson(args[0].asString(),
-                    args[1].asInt(), args[2].asInt(), args[3].asInt(), args[4].asInt());
+            PoiJsArgs.Call c = A.bind("getRangeAsJson", args);
+            Map<String, Object> rangeMap = poi.getRangeAsJson(c.string("sheetHandle", 0),
+                    c.index("startRow", 1), c.index("endRow", 2), c.index("startCol", 3),
+                    c.index("endCol", 4));
             return rangeMap != null ? GraalProxies.toProxyObject(rangeMap) : null;
         });
 
         methods.put("getRowCount", (ProxyExecutable) args ->
-                poi.getRowCount(args[0].asString()));
+                poi.getRowCount(sheet("getRowCount", args)));
 
         methods.put("getAllData", (ProxyExecutable) args ->
-                GraalProxies.toProxyArray(poi.getAllData(args[0].asString())));
+                GraalProxies.toProxyArray(poi.getAllData(sheet("getAllData", args))));
 
         methods.put("setAllData", (ProxyExecutable) args -> {
-            String sheetHandle = args[0].asString();
-            Value dataVal = args[1];
-            int rows = (int) dataVal.getArraySize();
-            Object[][] data = new Object[rows][];
-            for (int r = 0; r < rows; r++) {
-                Value rowVal = dataVal.getArrayElement(r);
-                if (rowVal != null && rowVal.hasArrayElements()) {
-                    int cols = (int) rowVal.getArraySize();
-                    data[r] = new Object[cols];
-                    for (int c = 0; c < cols; c++) {
-                        data[r][c] = GraalProxies.fromValue(rowVal.getArrayElement(c));
-                    }
-                } else {
-                    data[r] = new Object[0];
-                }
-            }
-            int startRow = args.length > 2 ? args[2].asInt() : 0;
-            int startCol = args.length > 3 ? args[3].asInt() : 0;
-            poi.setAllData(sheetHandle, data, startRow, startCol);
+            PoiJsArgs.Call c = A.bind("setAllData", args);
+            String sheetHandle = c.string("sheetHandle", 0);
+            Object[][] data = matrixArg("setAllData", c.value("data", 1,
+                    "an array of rows (array of arrays)"));
+            poi.setAllData(sheetHandle, data, c.optionalIndex("startRow", 2, 0),
+                    c.optionalIndex("startCol", 3, 0));
             return null;
         });
 
         // ---- Style / Format ----
         methods.put("getCellStyle", (ProxyExecutable) args -> {
-            Map<String, Object> style = poi.getCellStyle(args[0].asString(),
-                    args[1].asInt(), args[2].asInt());
+            PoiJsArgs.Call c = A.bind("getCellStyle", args);
+            Map<String, Object> style = poi.getCellStyle(c.string("sheetHandle", 0),
+                    c.index("row", 1), c.index("col", 2));
             return style != null ? GraalProxies.toProxyObject(style) : null;
         });
 
         methods.put("setCellBold", (ProxyExecutable) args -> {
-            poi.setCellBold(args[0].asString(), args[1].asInt(), args[2].asInt(), args[3].asBoolean());
+            PoiJsArgs.Call c = A.bind("setCellBold", args);
+            poi.setCellBold(c.string("sheetHandle", 0), c.index("row", 1), c.index("col", 2),
+                    c.bool("bold", 3));
             return null;
         });
 
         methods.put("setCellItalic", (ProxyExecutable) args -> {
-            poi.setCellItalic(args[0].asString(), args[1].asInt(), args[2].asInt(), args[3].asBoolean());
+            PoiJsArgs.Call c = A.bind("setCellItalic", args);
+            poi.setCellItalic(c.string("sheetHandle", 0), c.index("row", 1), c.index("col", 2),
+                    c.bool("italic", 3));
             return null;
         });
 
         methods.put("setCellFontSize", (ProxyExecutable) args -> {
-            poi.setCellFontSize(args[0].asString(), args[1].asInt(), args[2].asInt(), (short) args[3].asInt());
+            PoiJsArgs.Call c = A.bind("setCellFontSize", args);
+            poi.setCellFontSize(c.string("sheetHandle", 0), c.index("row", 1), c.index("col", 2),
+                    (short) c.wholeNumber("sizePoints", 3, PoiToolBox.MIN_FONT_PT, PoiToolBox.MAX_FONT_PT));
             return null;
         });
 
         methods.put("setCellFontName", (ProxyExecutable) args -> {
-            poi.setCellFontName(args[0].asString(), args[1].asInt(), args[2].asInt(), args[3].asString());
+            PoiJsArgs.Call c = A.bind("setCellFontName", args);
+            poi.setCellFontName(c.string("sheetHandle", 0), c.index("row", 1), c.index("col", 2),
+                    c.string("fontName", 3));
             return null;
         });
 
         methods.put("setCellFontColor", (ProxyExecutable) args -> {
-            poi.setCellFontColor(args[0].asString(), args[1].asInt(), args[2].asInt(), args[3].asString());
+            PoiJsArgs.Call c = A.bind("setCellFontColor", args);
+            poi.setCellFontColor(c.string("sheetHandle", 0), c.index("row", 1), c.index("col", 2),
+                    c.string("hexColor", 3));
             return null;
         });
 
         methods.put("setCellBackgroundColor", (ProxyExecutable) args -> {
-            poi.setCellBackgroundColor(args[0].asString(), args[1].asInt(), args[2].asInt(), args[3].asString());
+            PoiJsArgs.Call c = A.bind("setCellBackgroundColor", args);
+            poi.setCellBackgroundColor(c.string("sheetHandle", 0), c.index("row", 1),
+                    c.index("col", 2), c.string("hexColor", 3));
             return null;
         });
 
         methods.put("setCellDataFormat", (ProxyExecutable) args -> {
-            poi.setCellDataFormat(args[0].asString(), args[1].asInt(), args[2].asInt(), args[3].asString());
+            PoiJsArgs.Call c = A.bind("setCellDataFormat", args);
+            poi.setCellDataFormat(c.string("sheetHandle", 0), c.index("row", 1), c.index("col", 2),
+                    c.string("formatString", 3));
             return null;
         });
 
         // ---- Advanced ----
         methods.put("getMergedRegions", (ProxyExecutable) args ->
-                GraalProxies.toProxyArray(poi.getMergedRegions(args[0].asString())));
+                GraalProxies.toProxyArray(poi.getMergedRegions(sheet("getMergedRegions", args))));
 
         methods.put("getFormulas", (ProxyExecutable) args ->
-                GraalProxies.toProxyArray(poi.getFormulas(args[0].asString())));
+                GraalProxies.toProxyArray(poi.getFormulas(sheet("getFormulas", args))));
 
         methods.put("setColumnWidth", (ProxyExecutable) args -> {
-            poi.setColumnWidth(args[0].asString(), args[1].asInt(), args[2].asInt());
+            PoiJsArgs.Call c = A.bind("setColumnWidth", args);
+            poi.setColumnWidth(c.string("sheetHandle", 0), c.index("col", 1),
+                    c.wholeNumber("widthChars", 2, 0, PoiToolBox.MAX_COLUMN_WIDTH_CHARS));
             return null;
         });
 
         methods.put("autoSizeColumn", (ProxyExecutable) args -> {
-            poi.autoSizeColumn(args[0].asString(), args[1].asInt());
+            PoiJsArgs.Call c = A.bind("autoSizeColumn", args);
+            poi.autoSizeColumn(c.string("sheetHandle", 0), c.index("col", 1));
             return null;
         });
 
         // ---- Conditional Formatting ----
         methods.put("addConditionalFormatCellIs", (ProxyExecutable) args -> {
-            String f2 = (args.length > 4 && !args[4].isNull()) ? args[4].asString() : null;
-            Map<String, Object> style = (args.length > 5 && !args[5].isNull())
-                    ? toStyleMap(args[5]) : null;
-            return poi.addConditionalFormatCellIs(args[0].asString(), args[1].asString(),
-                    args[2].asString(), args[3].asString(), f2, style);
+            PoiJsArgs.Call c = A.bind("addConditionalFormatCellIs", args);
+            return poi.addConditionalFormatCellIs(c.string("sheetHandle", 0), c.string("range", 1),
+                    c.string("operator", 2), c.string("f1", 3), c.optionalString("f2", 4),
+                    c.optionalOptions(5));
         });
 
         methods.put("addConditionalFormatExpression", (ProxyExecutable) args -> {
-            Map<String, Object> style = (args.length > 3 && !args[3].isNull())
-                    ? toStyleMap(args[3]) : null;
-            return poi.addConditionalFormatExpression(args[0].asString(), args[1].asString(),
-                    args[2].asString(), style);
+            PoiJsArgs.Call c = A.bind("addConditionalFormatExpression", args);
+            return poi.addConditionalFormatExpression(c.string("sheetHandle", 0),
+                    c.string("range", 1), c.string("formula", 2), c.optionalOptions(3));
         });
 
         methods.put("addConditionalFormatColorScale", (ProxyExecutable) args -> {
-            String[] colors = toStringArray(args[2]);
-            return poi.addConditionalFormatColorScale(args[0].asString(), args[1].asString(), colors);
+            PoiJsArgs.Call c = A.bind("addConditionalFormatColorScale", args);
+            return poi.addConditionalFormatColorScale(c.string("sheetHandle", 0),
+                    c.string("range", 1), c.stringArray("colors", 2));
         });
 
         methods.put("addConditionalFormatDataBar", (ProxyExecutable) args -> {
-            return poi.addConditionalFormatDataBar(args[0].asString(), args[1].asString(),
-                    args[2].asString());
+            PoiJsArgs.Call c = A.bind("addConditionalFormatDataBar", args);
+            return poi.addConditionalFormatDataBar(c.string("sheetHandle", 0),
+                    c.string("range", 1), c.string("color", 2));
         });
 
         methods.put("addConditionalFormatIconSet", (ProxyExecutable) args -> {
-            return poi.addConditionalFormatIconSet(args[0].asString(), args[1].asString(),
-                    args[2].asString());
+            PoiJsArgs.Call c = A.bind("addConditionalFormatIconSet", args);
+            return poi.addConditionalFormatIconSet(c.string("sheetHandle", 0),
+                    c.string("range", 1), c.string("iconSet", 2));
         });
 
         methods.put("getConditionalFormattings", (ProxyExecutable) args ->
-                GraalProxies.toProxyArray(poi.getConditionalFormattings(args[0].asString())));
+                GraalProxies.toProxyArray(poi.getConditionalFormattings(
+                        sheet("getConditionalFormattings", args))));
 
         methods.put("removeConditionalFormat", (ProxyExecutable) args -> {
-            poi.removeConditionalFormat(args[0].asString(), args[1].asString());
+            PoiJsArgs.Call c = A.bind("removeConditionalFormat", args);
+            poi.removeConditionalFormat(c.string("sheetHandle", 0), c.string("cfHandle", 1));
             return null;
         });
 
         methods.put("removeAllConditionalFormats", (ProxyExecutable) args ->
-                poi.removeAllConditionalFormats(args[0].asString()));
+                poi.removeAllConditionalFormats(sheet("removeAllConditionalFormats", args)));
 
         // ---- Help ----
         methods.put("help", (ProxyExecutable) args -> poi.help());
@@ -303,58 +339,45 @@ public class PoiToolBoxJsBridge implements JsModuleInterface {
     }
 
     /**
-     * Converts a JavaScript style object (e.g. {@code {backgroundColor: "FFC7CE", bold: true}})
-     * into a Java map. Unlike {@link GraalProxies#fromValue}, which only converts scalars,
-     * this reads the object members explicitly.
-     * @param value the JS style object
-     * @return the style map, or {@code null} for a null/undefined value
+     * The workbook handle of a one-argument call, named in the message when it is missing or
+     * not a string.
      */
-    private static Map<String, Object> toStyleMap(Value value) {
-        if (value == null || value.isNull()) {
-            return null;
-        }
-        if (!value.hasMembers()) {
-            throw new IllegalArgumentException("style must be an object with keys like "
-                    + "fontColor, backgroundColor, bold, italic, got a non-object value.");
-        }
-        Map<String, Object> style = new LinkedHashMap<>();
-        for (String key : value.getMemberKeys()) {
-            Value member = value.getMember(key);
-            if (member == null || member.isNull()) {
-                continue;
-            }
-            if (member.isString()) {
-                style.put(key, member.asString());
-            } else if (member.isBoolean()) {
-                style.put(key, member.asBoolean());
-            } else if (member.isNumber()) {
-                style.put(key, member.as(Number.class));
-            } else {
-                throw new IllegalArgumentException("style." + key + " must be a string, "
-                        + "boolean or number.");
-            }
-        }
-        return style;
+    private static String workbook(String fn, Value[] args) {
+        return A.bind(fn, args).string("wbHandle", 0);
+    }
+
+    /** The sheet handle of a one-argument call. */
+    private static String sheet(String fn, Value[] args) {
+        return A.bind(fn, args).string("sheetHandle", 0);
     }
 
     /**
-     * Converts a JavaScript array of strings (e.g. color scale colors) into a Java array.
-     * @param value the JS array
-     * @return the string array
+     * Reads the 2D data of {@code poi.setAllData}. A row that is not an array is an error:
+     * silently writing an empty row in its place loses the caller's data without a word.
      */
-    private static String[] toStringArray(Value value) {
-        if (value == null || value.isNull() || !value.hasArrayElements()) {
-            throw new IllegalArgumentException("Expected an array of strings, got: " + value);
+    private static Object[][] matrixArg(String fn, Value data) {
+        if (!data.hasArrayElements()) {
+            throw A.badArg(fn, "data", data, "an array of rows (each an array of cell values)");
         }
-        int size = (int) value.getArraySize();
-        String[] result = new String[size];
-        for (int i = 0; i < size; i++) {
-            Value element = value.getArrayElement(i);
-            if (element == null || !element.isString()) {
-                throw new IllegalArgumentException("Element " + i + " of the array must be a string.");
+        int rows = (int) data.getArraySize();
+        Object[][] matrix = new Object[rows][];
+        for (int r = 0; r < rows; r++) {
+            Value rowValue = data.getArrayElement(r);
+            if (rowValue == null || rowValue.isNull()) {
+                matrix[r] = new Object[0];
+                continue;
             }
-            result[i] = element.asString();
+            if (!rowValue.hasArrayElements()) {
+                throw A.badArg(fn, "data[" + r + "]", rowValue,
+                        "an array of cell values (or null for an empty row)");
+            }
+            int cols = (int) rowValue.getArraySize();
+            Object[] row = new Object[cols];
+            for (int col = 0; col < cols; col++) {
+                row[col] = GraalProxies.fromValue(rowValue.getArrayElement(col));
+            }
+            matrix[r] = row;
         }
-        return result;
+        return matrix;
     }
 }

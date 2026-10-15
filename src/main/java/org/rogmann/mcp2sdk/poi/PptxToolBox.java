@@ -77,6 +77,24 @@ public class PptxToolBox {
 
     private static final Logger LOG = LoggerFactory.getLogger(PptxToolBox.class);
 
+    /** Smallest font size (pt) accepted by {@link #setRunFontSize(String, double)}. */
+    public static final double MIN_FONT_PT = 1.0;
+
+    /** Largest font size (pt) accepted by {@link #setRunFontSize(String, double)}. */
+    public static final double MAX_FONT_PT = 4000.0;
+
+    /** Largest line width (pt) accepted by {@link #setShapeLineWidth(String, double)}. */
+    public static final double MAX_LINE_WIDTH_PT = 500.0;
+
+    /** Largest absolute position (pt) accepted by the geometry setters. */
+    public static final double MAX_COORD_PT = 1_000_000.0;
+
+    /** Largest width/height (pt) accepted by the geometry setters. */
+    public static final double MAX_SIZE_PT = 1_000_000.0;
+
+    /** Largest rotation (degrees) accepted by {@link #setShapeRotation(String, double)}. */
+    public static final double MAX_ROTATION_DEG = 3600.0;
+
     /** Map: presentation-handle -> XMLSlideShow */
     private final Map<String, XMLSlideShow> shows = new ConcurrentHashMap<>();
 
@@ -124,7 +142,7 @@ public class PptxToolBox {
      * @return presentation handle (e.g. "show-1")
      */
     public String openFile(String filePath) {
-        Path path = PoiToolBox.resolveSafePath(filePath);
+        Path path = PoiPaths.resolveSafePath(filePath);
         if (!Files.exists(path)) {
             throw new PoiUserRuntimeException("File not found: " + filePath);
         }
@@ -165,7 +183,7 @@ public class PptxToolBox {
         if (show == null) {
             throw new PoiUserRuntimeException("Presentation not found (invalid handle): " + showHandle);
         }
-        Path path = PoiToolBox.resolveSafePath(filePath);
+        Path path = PoiPaths.resolveSafePath(filePath);
         try {
             Path parent = path.getParent();
             if (parent != null && !Files.exists(parent)) {
@@ -413,6 +431,12 @@ public class PptxToolBox {
      * with {@code text} and {@code paragraphs}/{@code runs} (including run handles and
      * styling), plus its {@code col} index.
      * </p>
+     * <p>
+     * Merged cells are reported the same way {@code docx.getTables} reports them: the cell
+     * that starts a merge carries {@code colSpan}/{@code rowSpan}, the cells the merge covers
+     * are listed as their own grid position with {@code merged: true} and no text. Without
+     * that flag a merged range looks like several empty cells.
+     * </p>
      * @param shapeHandle handle of a table shape (shapeType "TABLE")
      * @return Map with the table content
      * @throws PoiUserRuntimeException if the shape is not a table
@@ -449,6 +473,9 @@ public class PptxToolBox {
                     cellMap.put("text", "");
                 }
                 cellMap.put("col", c);
+                if (cell != null) {
+                    putMergeInfo(cellMap, cell);
+                }
                 cellsList.add(cellMap);
             }
             rowMap.put("cells", cellsList);
@@ -462,11 +489,13 @@ public class PptxToolBox {
      * Reads only the cell texts of a table shape as a 2D structure.
      * <p>
      * The returned map contains {@code rowCount}, {@code colCount} and {@code rows}
-     * (a list of rows, each a list of cell texts). Empty/merged cells are represented
-     * as empty strings.
+     * (a list of rows, each a list of cell texts) plus {@code merges} - the grid
+     * positions that take part in a merge, with {@code row}, {@code col} and their
+     * {@code colSpan}/{@code rowSpan}/{@code merged}. A covered cell reads as an empty
+     * string, which is why it is listed separately.
      * </p>
      * @param shapeHandle handle of a table shape (shapeType "TABLE")
-     * @return Map with the cell texts as a 2D list under key "rows"
+     * @return Map with the cell texts under "rows" and the merge list under "merges"
      * @throws PoiUserRuntimeException if the shape is not a table
      */
     public Map<String, Object> getTableText(String shapeHandle) {
@@ -477,13 +506,23 @@ public class PptxToolBox {
                     + " (type: " + shape.getClass().getSimpleName() + ")");
         }
         List<List<String>> data = new ArrayList<>();
+        List<Map<String, Object>> merges = new ArrayList<>();
         List<XSLFTableRow> tableRows = table.getRows();
-        for (XSLFTableRow row : tableRows) {
-            List<XSLFTableCell> rowCells = row.getCells();
+        for (int r = 0; r < tableRows.size(); r++) {
+            List<XSLFTableCell> rowCells = tableRows.get(r).getCells();
             List<String> rowList = new ArrayList<>();
             for (int c = 0; c < table.getNumberOfColumns(); c++) {
                 XSLFTableCell cell = c < rowCells.size() ? rowCells.get(c) : null;
                 rowList.add(cell != null && cell.getText() != null ? cell.getText() : "");
+                if (cell != null) {
+                    Map<String, Object> merge = new LinkedHashMap<>();
+                    putMergeInfo(merge, cell);
+                    if (!merge.isEmpty()) {
+                        merge.put("row", r);
+                        merge.put("col", c);
+                        merges.add(merge);
+                    }
+                }
             }
             data.add(rowList);
         }
@@ -491,7 +530,28 @@ public class PptxToolBox {
         result.put("rowCount", table.getNumberOfRows());
         result.put("colCount", table.getNumberOfColumns());
         result.put("rows", data);
+        result.put("merges", merges);
         return result;
+    }
+
+    /**
+     * Merge state of one table cell, spelled like the docx read side. PowerPoint keeps one
+     * {@code a:tc} element per grid position: the cell that starts a merge carries
+     * {@code gridSpan}/{@code rowSpan}, the covered cells are flagged {@code hMerge}/
+     * {@code vMerge} - which is what {@link XSLFTableCell#isMerged()} reports.
+     */
+    private static void putMergeInfo(Map<String, Object> target, XSLFTableCell cell) {
+        int gridSpan = cell.getGridSpan();
+        if (gridSpan > 1) {
+            target.put("colSpan", gridSpan);
+        }
+        int rowSpan = cell.getRowSpan();
+        if (rowSpan > 1) {
+            target.put("rowSpan", rowSpan);
+        }
+        if (cell.isMerged()) {
+            target.put("merged", true);
+        }
     }
 
     /**
@@ -526,6 +586,7 @@ public class PptxToolBox {
      */
     public String addTextBox(String slideHandle, String text, double x, double y, double width, double height) {
         XSLFSlide slide = getSlide(slideHandle);
+        requireBox(x, y, width, height);
         XSLFTextBox tb = slide.createTextBox();
         tb.setAnchor(new Rectangle2D.Double(x, y, width, height));
         tb.setText(text == null ? "" : text);
@@ -544,6 +605,7 @@ public class PptxToolBox {
      */
     public String createShape(String slideHandle, String text, double x, double y, double width, double height) {
         XSLFSlide slide = getSlide(slideHandle);
+        requireBox(x, y, width, height);
         XSLFAutoShape shape = slide.createAutoShape();
         shape.setAnchor(new Rectangle2D.Double(x, y, width, height));
         shape.setText(text == null ? "" : text);
@@ -566,6 +628,10 @@ public class PptxToolBox {
      */
     public String createLine(String slideHandle, double x1, double y1, double x2, double y2) {
         XSLFSlide slide = getSlide(slideHandle);
+        requireCoord(x1, "x1");
+        requireCoord(y1, "y1");
+        requireCoord(x2, "x2");
+        requireCoord(y2, "y2");
         double dx = x2 - x1;
         double dy = y2 - y1;
         double minX = Math.min(x1, x2);
@@ -599,6 +665,8 @@ public class PptxToolBox {
      */
     public void setShapePosition(String shapeHandle, double x, double y) {
         PlaceableShape<?, ?> ps = getPlaceable(shapeHandle);
+        requireCoord(x, "x");
+        requireCoord(y, "y");
         Rectangle2D a = ps.getAnchor();
         ps.setAnchor(new Rectangle2D.Double(x, y, a.getWidth(), a.getHeight()));
     }
@@ -611,6 +679,8 @@ public class PptxToolBox {
      */
     public void setShapeSize(String shapeHandle, double width, double height) {
         PlaceableShape<?, ?> ps = getPlaceable(shapeHandle);
+        requireNumber(width, 0.0, MAX_SIZE_PT, "width (pt)");
+        requireNumber(height, 0.0, MAX_SIZE_PT, "height (pt)");
         Rectangle2D a = ps.getAnchor();
         ps.setAnchor(new Rectangle2D.Double(a.getX(), a.getY(), width, height));
     }
@@ -622,6 +692,7 @@ public class PptxToolBox {
      */
     public void setShapeRotation(String shapeHandle, double degrees) {
         PlaceableShape<?, ?> ps = getPlaceable(shapeHandle);
+        requireNumber(degrees, -MAX_ROTATION_DEG, MAX_ROTATION_DEG, "rotation (deg)");
         ps.setRotation(degrees);
     }
 
@@ -685,10 +756,11 @@ public class PptxToolBox {
     /**
      * Sets the line width of a shape (in points).
      * @param shapeHandle shape handle
-     * @param width width in points
+     * @param width width in points, 0.0 .. 500.0
      */
     public void setShapeLineWidth(String shapeHandle, double width) {
         XSLFSimpleShape simple = asSimple(shapeHandle);
+        requireNumber(width, 0.0, MAX_LINE_WIDTH_PT, "line width (pt)");
         simple.setLineWidth(width);
     }
 
@@ -729,10 +801,11 @@ public class PptxToolBox {
     /**
      * Sets the font size of a run (in points).
      * @param runHandle run handle
-     * @param sizePoints font size in points
+     * @param sizePoints font size in points, 1.0 .. 4000.0 (half-point steps are kept)
      */
     public void setRunFontSize(String runHandle, double sizePoints) {
         XSLFTextRun run = getRun(runHandle);
+        requireNumber(sizePoints, MIN_FONT_PT, MAX_FONT_PT, "font size (pt)");
         run.setFontSize(sizePoints);
     }
 
@@ -802,14 +875,18 @@ public class PptxToolBox {
                                                    {rowCount, colCount, rows:[{rowNum,cells:
                                                    [{col,text,paragraphs,runs}]}]}
                 pptx.getTableText(sp)          - Read only the cell texts of a table as
-                                                   {rowCount, colCount, rows:[[...],...]}
+                                                   {rowCount, colCount, rows:[[...],...],
+                                                    merges:[{row,col,colSpan,rowSpan,merged}]}
+                Note: merged cells are reported like in docx - colSpan/rowSpan on the cell
+                that starts the merge, "merged": true on the cells it covers.
                 Note: shapes expose a semantic "shapeType" (TABLE, GROUP, PICTURE, CHART,
                 CONNECTOR, TEXT_BOX, AUTO_SHAPE, SIMPLE_SHAPE) plus the raw "javaClass".
                 For tables, combine getSlides (find shapeType "TABLE") with getTableData/getTableText.
 
-                --- More shape operations ---
-                pptx.addTextBox(slide,t,w,h,h)  - Create a positioned text box
-                pptx.createShape(slide,t,w,h,h) - Create a positioned auto shape
+                --- More shape operations (all lengths in points) ---
+                positions accept -1000000.0 .. 1000000.0, a width/height 0.0 .. 1000000.0
+                pptx.addTextBox(slide,text,x,y,w,h) - Create a positioned text box
+                pptx.createShape(slide,text,x,y,w,h) - Create a positioned auto shape
                 pptx.setShapePosition(sp,x,y)   - Move a shape
                 pptx.setShapeSize(sp,w,h)       - Resize a shape
                 pptx.setShapeRotation(sp,deg)   - Rotate a shape
@@ -817,14 +894,14 @@ public class PptxToolBox {
                 pptx.createLine(slide,x1,y1,x2,y2)- Create an arrow line between two points
                 pptx.setShapeFillColor(sp,c)    - Set filling color of a shape
                 pptx.setShapeLineColor(sp,c)    - Set line (outline) color
-                pptx.setShapeLineWidth(sp,w)    - Set line width in points
+                pptx.setShapeLineWidth(sp,w)    - Set line width in points (0 - 500)
                 pptx.removeShape(sp)            - Remove a shape
 
                 --- Run formatting (runs from getSlides) ---
                 pptx.setRunText(run, t)        - Set run text
                 pptx.setRunBold(run, b)        - Set bold (true/false)
                 pptx.setRunItalic(run, i)      - Set italic (true/false)
-                pptx.setRunFontSize(run, s)    - Set font size in points
+                pptx.setRunFontSize(run, s)    - Set font size in points (1 - 4000, half steps kept)
                 pptx.setRunFontFamily(run, fn) - Set font name (e.g. "Arial")
                 pptx.setRunFontColor(run, c)   - Set font color (hex e.g. "FF0000")
 
@@ -833,12 +910,37 @@ public class PptxToolBox {
                 2. var sp = slides.slides[0].shapes[0].h;
                 3. pptx.setShapeText(sp, "Neuer Titel");
                 4. pptx.save(show, "out.pptx");
-                """;
+                """ + PoiJsArgs.PPTX.helpNotes();
     }
 
     // ========================================================================
     // Helper methods
     // ========================================================================
+
+    /**
+     * Range check for a geometry or font number. NaN and infinity fail here as well: they are
+     * what a caller gets when a computed value or a parsed string goes wrong, and POI would
+     * happily write them into the file as a nonsense EMU value.
+     */
+    private static void requireNumber(double value, double min, double max, String what) {
+        if (Double.isNaN(value) || Double.isInfinite(value) || value < min || value > max) {
+            throw new PoiUserRuntimeException("Invalid " + what + ": " + value
+                    + " (valid range: " + min + " - " + max + ").");
+        }
+    }
+
+    /** Range check for one coordinate of a shape anchor. */
+    private static void requireCoord(double value, String name) {
+        requireNumber(value, -MAX_COORD_PT, MAX_COORD_PT, name + " (pt)");
+    }
+
+    /** Range check for a full shape anchor (position plus size). */
+    private static void requireBox(double x, double y, double width, double height) {
+        requireCoord(x, "x");
+        requireCoord(y, "y");
+        requireNumber(width, 0.0, MAX_SIZE_PT, "width (pt)");
+        requireNumber(height, 0.0, MAX_SIZE_PT, "height (pt)");
+    }
 
     /**
      * Classifies a shape into a stable, language-independent semantic type name.

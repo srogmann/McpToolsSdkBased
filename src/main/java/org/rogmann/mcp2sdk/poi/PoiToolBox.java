@@ -54,7 +54,6 @@ import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import org.rogmann.mcp2sdk.WorkProject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -69,7 +68,7 @@ import org.slf4j.LoggerFactory;
  * <p>
  * File access is restricted to the project base directory (from system property {@code IDE_PROJECT_DIR}).
  * Only files within this directory may be opened, created, or saved.
- * Relative paths are resolved against this base directory.
+ * Relative paths are resolved against this base directory; see {@link PoiPaths}.
  * </p>
  *
  * <h3>Handle system</h3>
@@ -98,6 +97,15 @@ public class PoiToolBox {
 
     private static final Logger LOG = LoggerFactory.getLogger(PoiToolBox.class);
 
+    /** Smallest font size (points) accepted by {@link #setCellFontSize}. */
+    public static final int MIN_FONT_PT = 1;
+
+    /** Largest font size (points) accepted by {@link #setCellFontSize} - the Excel limit. */
+    public static final int MAX_FONT_PT = 409;
+
+    /** Largest column width (characters) accepted by {@link #setColumnWidth} - the Excel limit. */
+    public static final int MAX_COLUMN_WIDTH_CHARS = 255;
+
     /** Map: workbook-handle -> XSSFWorkbook */
     private final Map<String, XSSFWorkbook> workbooks = new ConcurrentHashMap<>();
 
@@ -125,69 +133,6 @@ public class PoiToolBox {
         // Per-call instance with isolated state
     }
 
-    /**
-     * Returns the project base directory for file access.
-     * <p>
-     * The base directory is determined via {@link WorkProject#lookupProject(Map)}.
-     * </p>
-     * @return the resolved base path
-     * @throws PoiUserRuntimeException if {@code IDE_PROJECT_DIR} is not available
-     */
-    static Path getBasePath() {
-        Map<String, Object> result = new HashMap<>();
-        WorkProject workProject = WorkProject.lookupProject(result);
-        if (workProject == null) {
-            String error = (String) result.get("error");
-            throw new PoiUserRuntimeException(
-                    "No project base directory available. Ensure IDE_PROJECT_DIR is set. "
-                    + (error != null ? error : ""));
-        }
-        Path projectBaseDir = workProject.projectBaseDir();
-        LOG.debug("Using project base directory as POI base path: {}", projectBaseDir);
-        return projectBaseDir;
-    }
-
-    /**
-     * Resolves a file path against the base directory and validates it.
-     * @param filePath relative path (or absolute within base directory)
-     * @return the resolved absolute path
-     * @throws PoiUserRuntimeException if the path is invalid or outside the base directory
-     */
-    static Path resolveSafePath(String filePath) {
-        if (filePath == null || filePath.isBlank()) {
-            throw new PoiUserRuntimeException("File path must not be empty.");
-        }
-        // Add-on mount syntax: "/addonName/path/within/addon"
-        if (filePath.startsWith("/")) {
-            int firstSlash = filePath.indexOf('/', 1);
-            if (firstSlash > 1) {
-                String addonName = filePath.substring(1, firstSlash);
-                Path addonRoot = WorkProject.addonPath(addonName);
-                if (addonRoot != null) {
-                    String remainder = filePath.substring(firstSlash);
-                    String rel = remainder.startsWith("/") ? remainder.substring(1) : remainder;
-                    Path resolved = addonRoot.resolve(rel).normalize();
-                    if (!resolved.startsWith(addonRoot)) {
-                        LOG.warn("Path traversal attempt in add-on '{}': filePath='{}'", addonName, filePath);
-                        throw new PoiUserRuntimeException(
-                                "Access denied: the specified path is not within the permitted add-on directory.");
-                    }
-                    return resolved;
-                }
-                throw new PoiUserRuntimeException("Add-on directory not configured: '" + addonName
-                        + "'. Available add-ons: " + String.join(", ", WorkProject.addonNames()));
-            }
-        }
-        Path basePath = getBasePath();
-        // Normalize to prevent path traversal
-        Path resolved = basePath.resolve(filePath).normalize();
-        if (!resolved.startsWith(basePath)) {
-            LOG.warn("Path traversal attempt detected: filePath='{}' resolved to '{}'", filePath, resolved);
-            throw new PoiUserRuntimeException("Access denied: the specified path is not within the permitted directory.");
-        }
-        return resolved;
-    }
-
     // ========================================================================
     // Workbook-level operations
     // ========================================================================
@@ -199,7 +144,7 @@ public class PoiToolBox {
      * @throws PoiUserRuntimeException if the file cannot be opened or is not found
      */
     public String openFile(String filePath) {
-        Path path = resolveSafePath(filePath);
+        Path path = PoiPaths.resolveSafePath(filePath);
         if (!Files.exists(path)) {
             throw new PoiUserRuntimeException("File not found: " + filePath);
         }
@@ -210,10 +155,10 @@ public class PoiToolBox {
             XSSFWorkbook wb = new XSSFWorkbook(fis);
             String handle = generateWorkbookHandle();
             workbooks.put(handle, wb);
-            LOG.info("Opened workbook: {} -> {}", getBasePath().relativize(path), handle);
+            LOG.info("Opened workbook: {} -> {}", PoiPaths.getBasePath().relativize(path), handle);
             return handle;
         } catch (IOException e) {
-            LOG.error("Failed to open file: " + getBasePath().relativize(path), e);
+            LOG.error("Failed to open file: " + PoiPaths.getBasePath().relativize(path), e);
             throw new PoiUserRuntimeException("Failed to open file: " + filePath, e);
         }
     }
@@ -264,7 +209,7 @@ public class PoiToolBox {
         if (wb == null) {
             throw new PoiUserRuntimeException("Workbook not found (invalid handle): " + wbHandle);
         }
-        Path path = resolveSafePath(filePath);
+        Path path = PoiPaths.resolveSafePath(filePath);
         try {
             Path parent = path.getParent();
             if (parent != null && !Files.exists(parent)) {
@@ -273,9 +218,9 @@ public class PoiToolBox {
             try (FileOutputStream fos = new FileOutputStream(path.toFile())) {
                 wb.write(fos);
             }
-            LOG.info("Saved workbook {} to {}", wbHandle, getBasePath().relativize(path));
+            LOG.info("Saved workbook {} to {}", wbHandle, PoiPaths.getBasePath().relativize(path));
         } catch (IOException e) {
-            LOG.error("Failed to save workbook " + wbHandle + " to " + getBasePath().relativize(path), e);
+            LOG.error("Failed to save workbook " + wbHandle + " to " + PoiPaths.getBasePath().relativize(path), e);
             throw new PoiUserRuntimeException("Failed to save workbook to: " + filePath, e);
         }
     }
@@ -985,13 +930,22 @@ public class PoiToolBox {
 
     /**
      * Sets the font size of a cell.
+     * <p>
+     * The spreadsheet format stores a cell font size as a whole number of points here, so
+     * 9,5 pt (a normal Word size) is not representable - the bridge says so instead of
+     * silently rounding.
+     * </p>
      * @param sheetHandle sheet handle
      * @param row 0-based row index
      * @param col 0-based column index
-     * @param sizePoints font size in points
-     * @throws PoiUserRuntimeException if the sheet handle is invalid
+     * @param sizePoints font size in points, {@value #MIN_FONT_PT} .. {@value #MAX_FONT_PT}
+     * @throws PoiUserRuntimeException if the sheet handle is invalid or the size is out of range
      */
     public void setCellFontSize(String sheetHandle, int row, int col, short sizePoints) {
+        if (sizePoints < MIN_FONT_PT || sizePoints > MAX_FONT_PT) {
+            throw new PoiUserRuntimeException("Invalid font size: " + sizePoints
+                    + " pt (valid range: " + MIN_FONT_PT + " - " + MAX_FONT_PT + ").");
+        }
         modifyCellFont(sheetHandle, row, col, font -> font.setFontHeightInPoints(sizePoints));
     }
 
@@ -1130,10 +1084,14 @@ public class PoiToolBox {
      * Sets the column width.
      * @param sheetHandle sheet handle
      * @param col 0-based column index
-     * @param widthChars width in characters
-     * @throws PoiUserRuntimeException if the sheet handle is invalid
+     * @param widthChars width in characters, 0 .. {@value #MAX_COLUMN_WIDTH_CHARS}
+     * @throws PoiUserRuntimeException if the sheet handle is invalid or the width is out of range
      */
     public void setColumnWidth(String sheetHandle, int col, int widthChars) {
+        if (widthChars < 0 || widthChars > MAX_COLUMN_WIDTH_CHARS) {
+            throw new PoiUserRuntimeException("Invalid column width: " + widthChars
+                    + " characters (valid range: 0 - " + MAX_COLUMN_WIDTH_CHARS + ").");
+        }
         Sheet sh = getSheetByHandle(sheetHandle);
         sh.setColumnWidth(col, widthChars * 256);
     }
@@ -1825,7 +1783,7 @@ public class PoiToolBox {
                 poi.getCellStyle(sh, row, col)    - Get style info (bold, italic, colors, etc.)
                 poi.setCellBold(sh, row, col, b)  - Set bold (true/false)
                 poi.setCellItalic(sh, row, col, i)- Set italic (true/false)
-                poi.setCellFontSize(sh, r, c, s)  - Set font size in points
+                poi.setCellFontSize(sh, r, c, s)  - Set font size in whole points (1-409)
                 poi.setCellFontName(sh, r, c, fn) - Set font name (e.g. "Arial")
                 poi.setCellFontColor(sh,r,c,hex)  - Set font color (hex e.g. "FF0000" or name "RED")
                 poi.setCellBackgroundColor(...)   - Set background color
@@ -1861,7 +1819,7 @@ public class PoiToolBox {
                 --- Advanced ---
                 poi.getMergedRegions(sh)          - Get merged regions
                 poi.getFormulas(sh)               - Get all formulas with cell references
-                poi.setColumnWidth(sh, col, w)    - Set column width in characters
+                poi.setColumnWidth(sh, col, w)    - Set column width in characters (0-255)
                 poi.autoSizeColumn(sh, col)       - Auto-fit column width
                 
                 Note: row/col are 0-based. On errors a PoiUserRuntimeException is thrown.
@@ -1897,7 +1855,7 @@ public class PoiToolBox {
                 // Close workbook
                 poi.close(wb);
                 ```
-                """;
+                """ + PoiJsArgs.XLSX.helpNotes();
     }
 
     // ========================================================================

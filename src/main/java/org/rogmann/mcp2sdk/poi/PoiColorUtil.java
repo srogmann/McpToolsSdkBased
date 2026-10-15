@@ -47,6 +47,31 @@ public final class PoiColorUtil {
     }
 
     /**
+     * Renders a colour value that came from an XmlBeans accessor as a 6-digit uppercase
+     * hex string.
+     * <p>
+     * Hex-colour attributes ({@code w:fill}, {@code w:color}, {@code a:srgbClr} and friends)
+     * are derived from {@code hexBinary}, so XmlBeans returns them as {@code byte[]} - a plain
+     * {@code String.valueOf(...)} would print {@code "[B@6a8598e7"}. Text values pass through.
+     * </p>
+     * @param value the raw XmlBeans value (byte[], String or null)
+     * @return hex string (e.g. "2A6099"), or null when the value is null
+     */
+    public static String hexOf(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof byte[] bytes) {
+            StringBuilder sb = new StringBuilder(bytes.length * 2);
+            for (byte b : bytes) {
+                sb.append(String.format("%02X", b));
+            }
+            return sb.toString();
+        }
+        return String.valueOf(value);
+    }
+
+    /**
      * Removes a leading '#' from a hex string and trims whitespace.
      * @param hex input value
      * @return hex string without leading '#', or null if null/blank

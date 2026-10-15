@@ -6,8 +6,11 @@ import org.graalvm.polyglot.proxy.ProxyObject;
 import org.rogmann.mcp2sdk.js.GraalProxies;
 import org.rogmann.mcp2sdk.js.JsModuleInterface;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Bridge between GraalVM JavaScript and {@link DocxToolBox}.
@@ -18,12 +21,20 @@ import java.util.Map;
  * closes all documents of that instance when the call ends.
  * </p>
  *
+ * <h3>Argument conversion</h3>
+ * <p>
+ * Every argument goes through the {@link PoiJsArgs} helpers (shimmed below), so a wrong
+ * argument names the function, the argument and the valid range. GraalVM's own message
+ * ({@code Cannot convert '9.5' … Invalid or lossy primitive coercion}) names none of the
+ * three and used to surface raw {@link ClassCastException}s.
+ * </p>
+ *
  * <h3>Usage in JavaScript</h3>
  * <pre>{@code
  * var doc = docx.openFile("demo.docx");
- * var paras = docx.getParagraphs(doc);
- * var ph = paras.paragraphs[0].h;
- * docx.setRunBold(paras.paragraphs[0].runs[0].h, true);
+ * var info = docx.getDocumentInfo(doc);
+ * var paras = docx.getParagraphs(doc, {props: true});
+ * docx.setRunFontSize(paras.paragraphs[0].runs[0].h, 9.5);
  * docx.save(doc, "demo.docx");   // must save explicitly
  * }</pre>
  */
@@ -63,83 +74,349 @@ public class DocxToolBoxJsBridge implements JsModuleInterface {
     public static ProxyObject createDocxNamespace(DocxToolBox box) {
         Map<String, Object> methods = new HashMap<>();
 
-        methods.put("openFile", (ProxyExecutable) args -> box.openFile(args[0].asString()));
+        // --- document ---
+        methods.put("openFile", (ProxyExecutable) args ->
+                box.openFile(stringArg("openFile", "path", arg(args, 0))));
         methods.put("createDocument", (ProxyExecutable) args -> box.createDocument());
         methods.put("save", (ProxyExecutable) args -> {
-            box.save(args[0].asString(), args[1].asString());
+            box.save(stringArg("save", "docHandle", arg(args, 0)),
+                    stringArg("save", "path", arg(args, 1)));
             return null;
         });
         methods.put("close", (ProxyExecutable) args -> {
-            box.close(args[0].asString());
+            box.close(stringArg("close", "docHandle", arg(args, 0)));
             return null;
         });
 
-        methods.put("getParagraphs", (ProxyExecutable) args ->
-                GraalProxies.toProxyObject(box.getParagraphs(args[0].asString())));
-        methods.put("getDocumentText", (ProxyExecutable) args -> box.getDocumentText(args[0].asString()));
+        // --- reading / inspection ---
+        methods.put("getDocumentInfo", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.getDocumentInfo(stringArg("getDocumentInfo", "docHandle", arg(args, 0)))));
+        methods.put("getBodyElements", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.getBodyElements(stringArg("getBodyElements", "docHandle", arg(args, 0)))));
+        methods.put("getParagraphs", (ProxyExecutable) args -> {
+            String docHandle = stringArg("getParagraphs", "docHandle", arg(args, 0));
+            boolean props = optionBool("getParagraphs", arg(args, 1), "props",
+                    Set.of("props", "detailed"), false);
+            return GraalProxies.toProxyObject(box.getParagraphs(docHandle, props));
+        });
+        methods.put("getParagraphProps", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.getParagraphProps(stringArg("getParagraphProps", "paragraphHandle", arg(args, 0)))));
+        methods.put("getRuns", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.getRuns(stringArg("getRuns", "paragraphHandle", arg(args, 0)))));
+        methods.put("getRunProps", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.getRunProps(stringArg("getRunProps", "runHandle", arg(args, 0)))));
+        methods.put("getFields", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.getFields(stringArg("getFields", "paragraphHandle", arg(args, 0)))));
+        methods.put("getStylesInfo", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.getStylesInfo(stringArg("getStylesInfo", "docHandle", arg(args, 0)))));
+        methods.put("getNumberingInfo", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.getNumberingInfo(stringArg("getNumberingInfo", "docHandle", arg(args, 0)))));
+        methods.put("getHeadersFooters", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.getHeadersFooters(stringArg("getHeadersFooters", "docHandle", arg(args, 0)))));
+        methods.put("getPictures", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.getPictures(stringArg("getPictures", "docHandle", arg(args, 0)))));
+        methods.put("getShapes", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.getShapes(stringArg("getShapes", "docHandle", arg(args, 0)))));
+        methods.put("getHyperlinks", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.getHyperlinks(stringArg("getHyperlinks", "docHandle", arg(args, 0)))));
         methods.put("getTables", (ProxyExecutable) args ->
-                GraalProxies.toProxyObject(box.getTables(args[0].asString())));
-        methods.put("addRow", (ProxyExecutable) args -> {
-            String docHandle = args[0].asString();
-            int tableIndex = args[1].asInt();
-            Value textArr = args[2];
-            int len = (int) textArr.getArraySize();
-            String[] cellTexts = new String[len];
-            for (int i = 0; i < len; i++) {
-                cellTexts[i] = textArr.getArrayElement(i).asString();
-            }
-            box.addRow(docHandle, tableIndex, cellTexts);
-            return null;
+                GraalProxies.toProxyObject(box.getTables(stringArg("getTables", "docHandle", arg(args, 0)))));
+        methods.put("getDocumentText", (ProxyExecutable) args -> {
+            String docHandle = stringArg("getDocumentText", "docHandle", arg(args, 0));
+            Value options = arg(args, 1);
+            boolean tables = optionBool("getDocumentText", options, "tables", Set.of("tables", "sdt"), false);
+            boolean sdt = optionBool("getDocumentText", options, "sdt", Set.of("tables", "sdt"), false);
+            return box.getDocumentText(docHandle, tables, sdt);
         });
-        methods.put("removeRow", (ProxyExecutable) args -> {
-            box.removeRow(args[0].asString(), args[1].asInt(), args[2].asInt());
-            return null;
-        });
-        methods.put("setRowFontColor", (ProxyExecutable) args -> {
-            box.setRowFontColor(args[0].asString(), args[1].asInt(), args[2].asInt(), args[3].asString());
-            return null;
-        });
-        methods.put("setCellFontColor", (ProxyExecutable) args -> {
-            box.setCellFontColor(args[0].asString(), args[1].asInt(), args[2].asInt(), args[3].asInt(), args[4].asString());
-            return null;
-        });
+        methods.put("getParagraphText", (ProxyExecutable) args ->
+                box.getParagraphText(stringArg("getParagraphText", "paragraphHandle", arg(args, 0))));
+
+        // --- writing: paragraphs and runs ---
         methods.put("createParagraph", (ProxyExecutable) args -> {
-            String text = args.length > 1 && !args[1].isNull() ? args[1].asString() : "";
-            return box.createParagraph(args[0].asString(), text);
+            String docHandle = stringArg("createParagraph", "docHandle", arg(args, 0));
+            String text = optionalString("createParagraph", "text", arg(args, 1));
+            return box.createParagraph(docHandle, text);
         });
         methods.put("addRun", (ProxyExecutable) args -> {
-            String text = args.length > 1 && !args[1].isNull() ? args[1].asString() : "";
-            return box.addRun(args[0].asString(), text);
+            String paragraphHandle = stringArg("addRun", "paragraphHandle", arg(args, 0));
+            String text = optionalString("addRun", "text", arg(args, 1));
+            return box.addRun(paragraphHandle, text);
         });
-        methods.put("getParagraphText", (ProxyExecutable) args -> box.getParagraphText(args[0].asString()));
 
         methods.put("setRunText", (ProxyExecutable) args -> {
-            box.setRunText(args[0].asString(), args[1].asString());
+            box.setRunText(stringArg("setRunText", "runHandle", arg(args, 0)),
+                    stringArg("setRunText", "text", arg(args, 1)));
             return null;
         });
         methods.put("setRunBold", (ProxyExecutable) args -> {
-            box.setRunBold(args[0].asString(), args[1].asBoolean());
+            box.setRunBold(stringArg("setRunBold", "runHandle", arg(args, 0)),
+                    boolArg("setRunBold", "bold", arg(args, 1)));
             return null;
         });
         methods.put("setRunItalic", (ProxyExecutable) args -> {
-            box.setRunItalic(args[0].asString(), args[1].asBoolean());
+            box.setRunItalic(stringArg("setRunItalic", "runHandle", arg(args, 0)),
+                    boolArg("setRunItalic", "italic", arg(args, 1)));
             return null;
         });
         methods.put("setRunFontSize", (ProxyExecutable) args -> {
-            box.setRunFontSize(args[0].asString(), args[1].asInt());
+            box.setRunFontSize(stringArg("setRunFontSize", "runHandle", arg(args, 0)),
+                    numberArg("setRunFontSize", "sizePoints", arg(args, 1),
+                            DocxToolBox.MIN_FONT_PT, DocxToolBox.MAX_FONT_PT));
             return null;
         });
         methods.put("setRunFontName", (ProxyExecutable) args -> {
-            box.setRunFontName(args[0].asString(), args[1].asString());
+            box.setRunFontName(stringArg("setRunFontName", "runHandle", arg(args, 0)),
+                    stringArg("setRunFontName", "fontName", arg(args, 1)));
             return null;
         });
         methods.put("setRunFontColor", (ProxyExecutable) args -> {
-            box.setRunFontColor(args[0].asString(), args[1].asString());
+            box.setRunFontColor(stringArg("setRunFontColor", "runHandle", arg(args, 0)),
+                    stringArg("setRunFontColor", "hexColor", arg(args, 1)));
+            return null;
+        });
+
+        // --- writing: paragraph formatting (M1, Aufgabe 2 - setter part) ---
+        methods.put("setParagraphStyle", (ProxyExecutable) args -> {
+            box.setParagraphStyle(stringArg("setParagraphStyle", "paragraphHandle", arg(args, 0)),
+                    stringArg("setParagraphStyle", "style", arg(args, 1)));
+            return null;
+        });
+        methods.put("setParagraphAlignment", (ProxyExecutable) args -> {
+            box.setParagraphAlignment(stringArg("setParagraphAlignment", "paragraphHandle", arg(args, 0)),
+                    stringArg("setParagraphAlignment", "alignment", arg(args, 1)));
+            return null;
+        });
+        methods.put("setParagraphIndent", (ProxyExecutable) args -> {
+            box.setParagraphIndent(stringArg("setParagraphIndent", "paragraphHandle", arg(args, 0)),
+                    optionsArg("setParagraphIndent", arg(args, 1)));
+            return null;
+        });
+        methods.put("setParagraphSpacing", (ProxyExecutable) args -> {
+            box.setParagraphSpacing(stringArg("setParagraphSpacing", "paragraphHandle", arg(args, 0)),
+                    optionsArg("setParagraphSpacing", arg(args, 1)));
+            return null;
+        });
+        methods.put("listStyleKeys", (ProxyExecutable) args ->
+                GraalProxies.toProxyArray(box.listStyleKeys(
+                        stringArg("listStyleKeys", "docHandle", arg(args, 0)))));
+
+        // --- writing: styles and numbering parts (M1, Aufgabe 2 and 3) ---
+        methods.put("ensureStyles", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.ensureStyles(
+                        stringArg("ensureStyles", "docHandle", arg(args, 0)))));
+        methods.put("ensureNumbering", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.ensureNumbering(
+                        stringArg("ensureNumbering", "docHandle", arg(args, 0)))));
+        methods.put("setParagraphNumbering", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.setParagraphNumbering(
+                        stringArg("setParagraphNumbering", "paragraphHandle", arg(args, 0)),
+                        optionsArg("setParagraphNumbering", arg(args, 1)))));
+        methods.put("removeParagraphNumbering", (ProxyExecutable) args -> {
+            box.removeParagraphNumbering(stringArg("removeParagraphNumbering", "paragraphHandle",
+                    arg(args, 0)));
+            return null;
+        });
+
+        // --- writing: tables (M1, Aufgabe 1) ---
+        methods.put("createTable", (ProxyExecutable) args -> box.createTable(
+                stringArg("createTable", "docHandle", arg(args, 0)),
+                indexArg("createTable", "rows", arg(args, 1)),
+                indexArg("createTable", "cols", arg(args, 2)),
+                optionsArg("createTable", arg(args, 3))));
+        methods.put("setCellText", (ProxyExecutable) args -> {
+            String fn = "setCellText";
+            String docHandle = stringArg(fn, "docHandle", arg(args, 0));
+            Value tableRef = arg(args, 1);
+            int rowIndex = indexArg(fn, "rowIndex", arg(args, 2));
+            int colIndex = indexArg(fn, "colIndex", arg(args, 3));
+            String text = optionalString(fn, "text", arg(args, 4));
+            Map<String, Object> options = optionsArg(fn, arg(args, 5));
+            if (isTableHandle(tableRef)) {
+                box.setCellTextByHandle(docHandle, tableRef.asString(), rowIndex, colIndex, text, options);
+            } else {
+                box.setCellText(docHandle, indexArg(fn, "tableIndex", tableRef),
+                        rowIndex, colIndex, text, options);
+            }
+            return null;
+        });
+        methods.put("getCellProps", (ProxyExecutable) args -> {
+            String fn = "getCellProps";
+            String docHandle = stringArg(fn, "docHandle", arg(args, 0));
+            Value tableRef = arg(args, 1);
+            int rowIndex = indexArg(fn, "rowIndex", arg(args, 2));
+            int colIndex = indexArg(fn, "colIndex", arg(args, 3));
+            Map<String, Object> props = isTableHandle(tableRef)
+                    ? box.getCellPropsByHandle(docHandle, tableRef.asString(), rowIndex, colIndex)
+                    : box.getCellProps(docHandle, indexArg(fn, "tableIndex", tableRef), rowIndex, colIndex);
+            return GraalProxies.toProxyObject(props);
+        });
+        methods.put("addRow", (ProxyExecutable) args -> {
+            String fn = "addRow";
+            String docHandle = stringArg(fn, "docHandle", arg(args, 0));
+            Value tableRef = arg(args, 1);
+            String[] cellTexts = stringArrayArg(fn, "cellTexts", arg(args, 2));
+            if (isTableHandle(tableRef)) {
+                box.addRow(docHandle, tableRef.asString(), cellTexts);
+            } else {
+                box.addRow(docHandle, indexArg(fn, "tableIndex", tableRef), cellTexts);
+            }
+            return null;
+        });
+        methods.put("removeRow", (ProxyExecutable) args -> {
+            box.removeRow(stringArg("removeRow", "docHandle", arg(args, 0)),
+                    indexArg("removeRow", "tableIndex", arg(args, 1)),
+                    indexArg("removeRow", "rowIndex", arg(args, 2)));
+            return null;
+        });
+        methods.put("setRowFontColor", (ProxyExecutable) args -> {
+            box.setRowFontColor(stringArg("setRowFontColor", "docHandle", arg(args, 0)),
+                    indexArg("setRowFontColor", "tableIndex", arg(args, 1)),
+                    indexArg("setRowFontColor", "rowIndex", arg(args, 2)),
+                    stringArg("setRowFontColor", "hexColor", arg(args, 3)));
+            return null;
+        });
+        methods.put("setCellFontColor", (ProxyExecutable) args -> {
+            box.setCellFontColor(stringArg("setCellFontColor", "docHandle", arg(args, 0)),
+                    indexArg("setCellFontColor", "tableIndex", arg(args, 1)),
+                    indexArg("setCellFontColor", "rowIndex", arg(args, 2)),
+                    indexArg("setCellFontColor", "colIndex", arg(args, 3)),
+                    stringArg("setCellFontColor", "hexColor", arg(args, 4)));
+            return null;
+        });
+
+        // --- writing: drawings (docs/js/docx.md §1.4) ---
+        methods.put("createDrawing", (ProxyExecutable) args -> box.createDrawing(
+                stringArg("createDrawing", "paragraphHandle", arg(args, 0)),
+                optionsArg("createDrawing", arg(args, 1))));
+        methods.put("addShape", (ProxyExecutable) args -> box.addShape(
+                stringArg("addShape", "targetHandle", arg(args, 0)),
+                optionsArg("addShape", arg(args, 1))));
+        methods.put("addShapeGroup", (ProxyExecutable) args -> box.addShapeGroup(
+                stringArg("addShapeGroup", "targetHandle", arg(args, 0)),
+                optionsArg("addShapeGroup", arg(args, 1))));
+        methods.put("createShapes", (ProxyExecutable) args -> {
+            String fn = "createShapes";
+            String paragraphHandle = stringArg(fn, "paragraphHandle", arg(args, 0));
+            Map<String, Object> options = optionsArg(fn, arg(args, 1));
+            return box.createShapes(paragraphHandle, options, optionsArray(fn, "shapes", arg(args, 2)));
+        });
+        methods.put("setShapeFill", (ProxyExecutable) args -> {
+            box.setShapeFill(stringArg("setShapeFill", "shapeHandle", arg(args, 0)),
+                    stringArg("setShapeFill", "color", arg(args, 1)));
+            return null;
+        });
+        methods.put("setShapeLine", (ProxyExecutable) args -> {
+            box.setShapeLine(stringArg("setShapeLine", "shapeHandle", arg(args, 0)),
+                    optionsArg("setShapeLine", arg(args, 1)));
+            return null;
+        });
+        methods.put("removeShape", (ProxyExecutable) args -> {
+            box.removeShape(stringArg("removeShape", "shapeHandle", arg(args, 0)));
             return null;
         });
 
         methods.put("help", (ProxyExecutable) args -> box.help());
 
         return ProxyObject.fromMap(methods);
+    }
+
+    // ========================================================================
+    // Argument helpers - implemented once for all POI namespaces in PoiJsArgs
+    // ========================================================================
+
+    /**
+     * The shared conversion rules. These shims only pin the namespace and keep the call
+     * sites above short; the behaviour (and every error text) lives in {@link PoiJsArgs}.
+     */
+    private static final PoiJsArgs A = PoiJsArgs.DOCX;
+
+    private static Value arg(Value[] args, int index) {
+        return PoiJsArgs.arg(args, index);
+    }
+
+    private static String stringArg(String fn, String name, Value value) {
+        return A.stringArg(fn, name, value);
+    }
+
+    private static String optionalString(String fn, String name, Value value) {
+        return A.optionalString(fn, name, value);
+    }
+
+    private static boolean boolArg(String fn, String name, Value value) {
+        return A.boolArg(fn, name, value);
+    }
+
+    private static int indexArg(String fn, String name, Value value) {
+        return A.indexArg(fn, name, value);
+    }
+
+    private static double numberArg(String fn, String name, Value value, double min, double max) {
+        return A.numberArg(fn, name, value, min, max);
+    }
+
+    private static boolean optionBool(String fn, Value options, String key, Set<String> knownKeys,
+                                      boolean fallback) {
+        return A.optionBool(fn, options, key, knownKeys, fallback);
+    }
+
+    private static String[] stringArrayArg(String fn, String name, Value value) {
+        return A.stringArrayArg(fn, name, value);
+    }
+
+    private static Map<String, Object> optionsArg(String fn, Value value) {
+        return A.optionsArg(fn, value);
+    }
+
+    /**
+     * An array of option objects - the shapes of {@code docx.createShapes(doc, opts, shapes)}.
+     * {@link PoiJsArgs#toPlain} stops at flat values on purpose, so each element is flattened
+     * here with the very same rules.
+     */
+    private static List<Map<String, Object>> optionsArray(String fn, Value value) {
+        if (value == null || value.isNull()) {
+            return List.of();
+        }
+        if (!value.hasArrayElements()) {
+            throw A.badArg(fn, "shapes", value, "an array of objects, e.g. [{shape: \"ellipse\", "
+                    + "widthCm: 2, heightCm: 2}]");
+        }
+        List<Map<String, Object>> entries = new ArrayList<>();
+        for (int i = 0; i < value.getArraySize(); i++) {
+            Value element = value.getArrayElement(i);
+            if (element == null || element.isNull() || !element.hasMembers()) {
+                throw A.badArg(fn, "shapes[" + i + "]", element, "an object ({shape: ..., ...})");
+            }
+            entries.add(A.optionalOptionsArg(fn, element));
+        }
+        return entries;
+    }
+
+    /**
+     * Reads an array of option objects, e.g. the shapes of
+     * {@code docx.createShapes(par, {widthCm…}, [{shape…}, …])}. {@link PoiJsArgs#toPlain}
+     * stops at flat values on purpose, so every element is flattened with the same rules here.
+     */
+    private static List<Map<String, Object>> optionsArray(String fn, String name, Value value) {
+        if (value == null || value.isNull()) {
+            return List.of();
+        }
+        if (!value.hasArrayElements()) {
+            throw A.badArg(fn, name, value, "an array of objects, e.g. [{shape: \"ellipse\", "
+                    + "widthCm: 2, heightCm: 2}]");
+        }
+        List<Map<String, Object>> entries = new ArrayList<>();
+        for (int i = 0; i < value.getArraySize(); i++) {
+            Value element = value.getArrayElement(i);
+            if (element == null || element.isNull() || !element.hasMembers()) {
+                throw A.badArg(fn, name + "[" + i + "]", element, "an object ({shape: …, …})");
+            }
+            entries.add(A.optionalOptionsArg(fn, element));
+        }
+        return entries;
+    }
+
+    /** A table reference may be an index (0, 1, …) or a "t-n" handle - docx only. */
+    private static boolean isTableHandle(Value value) {
+        return value != null && value.isString() && value.asString().startsWith("t-");
     }
 }
