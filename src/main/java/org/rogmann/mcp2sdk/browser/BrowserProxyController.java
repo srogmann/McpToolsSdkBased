@@ -159,7 +159,17 @@ public class BrowserProxyController {
                               + "</a> <span class=\"small muted\">own listener</span>"
                             : "<span class=\"muted\">path mode</span>")
                     .append("</td><td>").append(escape(app.auth())).append("</td><td class=\"muted\">")
-                    .append(escape(app.note())).append("</td></tr>");
+                    .append(escape(app.note()));
+            // Active rewrite rules are an intervention in what the browser receives - they stay
+            // named where the operator reads what the proxy does to an application (L9 pattern).
+            if (!app.rewriteRules().isEmpty()) {
+                html.append(" <span class=\"small\">rewrite: ");
+                app.rewriteRules().forEach(rule ->
+                        html.append(escape(rule.display())).append("&rarr;").append(escape(rule.to()))
+                                .append(" "));
+                html.append("</span>");
+            }
+            html.append("</td></tr>");
         }
         html.append("</table>");
         if (!backend.apps().loadErrors().isEmpty()) {
@@ -254,7 +264,12 @@ public class BrowserProxyController {
         html.append("<li>inject bridge: ").append(backend.settings().injectBridge())
                 .append("</li><li>relax CSP when needed: ").append(backend.settings().relaxCsp())
                 .append("</li><li>long-poll: ").append(backend.settings().pollSeconds())
-                .append(" s</li><li>registry: <code>")
+                .append(" s</li>")
+                .append("<li>IdP simulation (browser.idp.port): <code>")
+                .append(escape(BrowserIdpServer.idpOrigin())).append("</code>")
+                .append(" <span class=\"muted\">- the 2FA excursion of the demo, own listener, no"
+                        + " session of the proxy (docs/browser.md §3a)</span></li>")
+                .append("<li>registry: <code>")
                 .append(escape(String.valueOf(backend.apps().source()))).append("</code></li>")
                 .append("<li>session logs: <code>")
                 .append(backend.loggingProblem() == null

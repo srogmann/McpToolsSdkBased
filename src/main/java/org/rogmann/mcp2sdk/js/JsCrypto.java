@@ -167,7 +167,10 @@ public class JsCrypto {
     /**
      * Encrypts a single 16-byte block with AES-ECB (raw bytes, big-endian standard
      * convention, no padding). Supports AES-128/192/256 keys (16/24/32 bytes).
-     *
+     * <p>
+     * This is the core primitive used for {@code H = E_K(0^16)}, {@code E_K(J0)} and the
+     * per-block keystream {@code E_K(counter)} of the extended set.
+     * </p>
      * @param key raw key bytes (16, 24 or 32)
      * @param block 16 bytes to encrypt
      * @return 16 encrypted bytes
@@ -623,8 +626,7 @@ public class JsCrypto {
 
     /**
      * Returns the sections of the core help text: hashing, HMAC, AES-CBC/CTR and
-     * deflate/inflate. {@link JsCryptoExt#help()} puts them in front of its own sections, so
-     * the namespace ships as one single help document.
+     * deflate/inflate.
      * @return help text as a multi-line string
      */
     public static String helpSections() {

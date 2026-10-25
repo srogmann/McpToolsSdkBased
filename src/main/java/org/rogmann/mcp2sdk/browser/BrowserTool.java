@@ -296,6 +296,13 @@ public final class BrowserTool {
             if (!app.irreversiblePaths().isEmpty()) {
                 sb.append("  irreversible=").append(app.irreversiblePaths());
             }
+            // Rewrite rules change what the browser receives - they belong on the same line the
+            // operator reads the other interventions from (docs/browser.md §3a).
+            if (!app.rewriteRules().isEmpty()) {
+                sb.append("  rewriteRules=");
+                app.rewriteRules().forEach(rule ->
+                        sb.append(rule.display()).append("->").append(rule.to()).append(' '));
+            }
             sb.append('\n');
             if (!app.note().isEmpty()) {
                 sb.append("        ").append(app.note()).append('\n');

@@ -6,19 +6,17 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 
@@ -33,11 +31,20 @@ import java.util.jar.JarFile;
  * {@code -sources.jar} into the repository (can be disabled via system property
  * {@code tools.m2.allow-sources-download=false}).
  * </p>
- * <h3>Maven process gate</h3>
+ * <h3>Maven process gate and guard</h3>
  * <p>
- * At most one Maven process is run by this class at a time. A competing caller waits up to
- * {@code tools.m2.lock-wait-seconds} (default 120) and then fails with an error that names
- * the PID of the running Maven process, so the user can kill it from a shell if needed.
+ * Nothing here starts a process any more: every run goes through {@link MavenProcess}, which asks
+ * {@link MavenGuard} first (a changed POM means a human decides - {@code docs/maven-guard.md}),
+ * holds the one gate for the whole server (a competing caller waits up to
+ * {@code tools.m2.lock-wait-seconds}, default 120, and the error names the PID of the running
+ * Maven), enforces {@code tools.m2.timeout-seconds} and sends the process output to a file
+ * instead of a pipe.
+ * </p>
+ * <p>
+ * Read paths run offline by default ({@code -o -nsu}): they resolve what is already in the
+ * repository and fetch nothing. Fetching is {@link #fetchSources}, and a fetch is the one case
+ * the guard asks about even when no project input changed. {@code tools.m2.offline=false}
+ * restores the online behaviour, {@code tools.mvn.pomGuard=warn|off} steps the guard back.
  * </p>
  * <h3>Configuration (system properties)</h3>
  * <ul>
@@ -47,6 +54,9 @@ import java.util.jar.JarFile;
  *   <li>{@code tools.m2.lock-wait-seconds} - max wait for the Maven gate (default 120)</li>
  *   <li>{@code tools.m2.cache-ttl-seconds} - classpath cache TTL (default 300)</li>
  *   <li>{@code tools.m2.allow-sources-download} - allow fetchSources (default true)</li>
+ *   <li>{@code tools.m2.offline} - read paths run with {@code -o} (default true)</li>
+ *   <li>{@code tools.mvn.dependencyPluginVersion} - pin the dependency plugin's version in the
+ *       goal reference (default empty: Maven decides, see {@link MavenProcess})</li>
  * </ul>
  */
 public final class M2Resolver {
@@ -136,99 +146,70 @@ public final class M2Resolver {
         }
     }
 
-    /** One cached classpath resolution of a POM. */
+    /** One cached classpath resolution of a POM, for one scope filter. */
     private record CacheEntry(long pomSize, long pomMtime, long resolvedAtMillis,
-                              List<Artifact> artifacts) {
+                              List<Artifact> artifacts, List<Path> dropped) {
         boolean stillValid(long pomSize, long pomMtime, long now) {
             return pomSize == this.pomSize && pomMtime == this.pomMtime
                     && now - resolvedAtMillis < cacheTtlMillis();
         }
     }
 
-    private static final Map<Path, CacheEntry> CACHE = new ConcurrentHashMap<>();
+    /**
+     * What a resolution was asked for. The scope belongs in the key: "main" and "test" of one POM
+     * are two different answers, and sharing one cache slot between them would let whichever came
+     * first decide what the other one sees.
+     */
+    private record CacheKey(Path pom, String includeScope) {
+    }
+
+    private static final Map<CacheKey, CacheEntry> CACHE = new ConcurrentHashMap<>();
 
     // ---------------------------------------------------------------
-    // Maven process gate (at most one mvn at a time)
+    // Maven process (gate, budget and guard live in MavenProcess)
     // ---------------------------------------------------------------
-
-    private static final ReentrantLock MAVEN_GATE = new ReentrantLock(true);
-    private static volatile long runningMavenPid = -1;
 
     /**
-     * Runs a Maven command in the directory of {@code pomPath} and returns its merged output.
-     * Serialized by {@link #MAVEN_GATE}; on contention the error names the PID of the running
-     * Maven process so that the user can terminate it from a shell.
+     * Runs a read-only Maven command in the directory of {@code pomPath} and returns its merged
+     * output: {@link MavenGuard} decides, {@link MavenProcess} serializes and enforces the budget.
      */
     private static String runMaven(Path pomPath, String... args) throws IOException {
         Path dir = pomPath.getParent();
-        return runMavenInDir(dir != null ? dir : Path.of("."), args);
+        // null here means "a POM without a directory part": MavenProcess anchors the run at
+        // PomWatch.projectDirectory() in that case - not at Path.of("."), which is wherever this
+        // server was started and would leave Maven reading a file the guard never compared
+        // (docs/open-points.md §5).
+        return MavenProcess.run(new MavenProcess.Options(pomPath,
+                dir, mavenCommand(), List.of(args),
+                processTimeoutSeconds(), lockWaitSeconds(), false));
     }
 
-    /** Runs a Maven command in the given working directory (see {@link #runMaven}). */
-    private static String runMavenInDir(Path workingDir, String... args) throws IOException {
-        boolean locked;
-        try {
-            locked = MAVEN_GATE.tryLock(lockWaitSeconds(), TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Interrupted while waiting for the Maven process gate", e);
-        }
-        if (!locked) {
-            long pid = runningMavenPid;
-            throw new IOException("Another Maven process is already running (PID "
-                    + (pid > 0 ? pid : "unknown") + "); waited " + lockWaitSeconds()
-                    + " seconds. You can terminate it from a shell (kill " + (pid > 0 ? pid : "<pid>")
-                    + ") and retry.");
-        }
-        // Output goes to a temp file, not a pipe: a full 'dependency:tree' can exceed the pipe
-        // buffer, which would block the process while this side waits in waitFor() (deadlock).
-        Path outFile = Files.createTempFile("mcp-m2-mvn-", ".log");
-        try {
-            List<String> cmd = new ArrayList<>();
-            cmd.add(mavenCommand());
-            cmd.addAll(List.of(args));
-            ProcessBuilder pb = new ProcessBuilder(cmd);
-            pb.redirectErrorStream(true);
-            pb.redirectOutput(ProcessBuilder.Redirect.to(outFile.toFile()));
-            pb.directory(workingDir.toFile());
-            Process process = pb.start();
-            runningMavenPid = process.pid();
-            try {
-                boolean finished;
-                try {
-                    finished = process.waitFor(processTimeoutSeconds(), TimeUnit.SECONDS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    process.destroyForcibly();
-                    throw new IOException("Interrupted while waiting for Maven", e);
-                }
-                if (!finished) {
-                    process.destroyForcibly();
-                    throw new IOException("Maven command timed out after " + processTimeoutSeconds()
-                            + " seconds: " + String.join(" ", cmd));
-                }
-                String output = Files.readString(outFile, StandardCharsets.UTF_8);
-                if (process.exitValue() != 0) {
-                    throw new IOException("Maven command failed with exit code " + process.exitValue()
-                            + ": " + String.join(" ", cmd) + "\n" + abbreviateTail(output));
-                }
-                return output;
-            } finally {
-                runningMavenPid = -1;
-            }
-        } finally {
-            Files.deleteIfExists(outFile);
-            MAVEN_GATE.unlock();
-        }
+    /**
+     * Runs a Maven command that fetches into the repository. The guard is told so
+     * ({@code networkRun}) and asks even when nothing of the project changed; {@code pomHint} is
+     * the POM whose inputs are still worth comparing and may be null for a neutral directory.
+     */
+    private static String runMavenFetch(Path workingDir, Path pomHint, String... args)
+            throws IOException {
+        return MavenProcess.run(new MavenProcess.Options(pomHint, workingDir, mavenCommand(),
+                List.of(args), processTimeoutSeconds(), lockWaitSeconds(), true));
     }
 
-    /** Last lines of a failed Maven output, so the real error stays visible. */
-    private static String abbreviateTail(String output) {
-        String s = output.strip();
-        if (s.length() <= 4000) {
-            return s;
-        }
-        return "...(truncated)...\n" + s.substring(s.length() - 4000);
+    /**
+     * A {@code fetchSources} hint as an absolute path: a relative spelling is anchored at
+     * {@link PomWatch#projectDirectory()} like every other Maven input of this server, so the
+     * directory the process starts in and the POM the guard compares are below the same root.
+     */
+    private static Path anchoredHint(String raw) {
+        return PomWatch.anchor(Path.of(raw)).toAbsolutePath().normalize();
+    }
+
+    /** The arguments of a dependency-plugin read: the offline flags, the goal, then the rest. */
+    private static String[] readArgs(String goal, String... rest) {
+        List<String> args = new ArrayList<>(MavenProcess.readFlags());
+        args.add(MavenProcess.dependencyGoal(goal));
+        args.addAll(List.of(rest));
+        return args.toArray(new String[0]);
     }
 
     // ---------------------------------------------------------------
@@ -236,46 +217,160 @@ public final class M2Resolver {
     // ---------------------------------------------------------------
 
     /**
+     * A classpath resolution and how it was obtained. The way an answer arrived belongs in the
+     * answer: {@code espresso.compile} reports it, so a reader can tell a 2.6 s Maven run from a
+     * cache hit and can see which POM and which scope filter produced the entries.
+     *
+     * @param pom          the anchored POM that was resolved
+     * @param includeScope the scope filter asked for (null: the unfiltered, test-scoped view)
+     * @param artifacts    the entries, in Maven order
+     * @param dropped      classpath entries Maven named that are not repository artifacts (a
+     *                     sibling module's {@code target/classes}, a system-scoped jar) and are
+     *                     therefore absent from {@code artifacts}
+     * @param cached       true when no Maven process was started for this call
+     * @param durationMs   wall clock of the call (0 for a cache hit)
+     */
+    public record Resolution(Path pom, String includeScope, List<Artifact> artifacts,
+                             List<Path> dropped, boolean cached, long durationMs) {
+
+        /** @return the operator-facing view (never a bare list, so the scope stays visible) */
+        public Map<String, Object> toMap() {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("pom", pom.toString());
+            m.put("scope", (includeScope == null) ? "test" : includeScope);
+            m.put("entries", artifacts.size());
+            if (!dropped.isEmpty()) {
+                m.put("droppedEntries", dropped.size());
+            }
+            m.put("resolution", cached ? "cached" : "mvn");
+            if (!cached) {
+                m.put("durationMs", durationMs);
+            }
+            return m;
+        }
+    }
+
+    /**
      * Resolves the artifact list of a POM (cached).
-     * @param pomPath absolute path of the pom.xml
-     * @return artifacts on the compile classpath, in Maven order
+     *
+     * @param pomPath path of the pom.xml; a relative path is anchored at
+     *        {@link PomWatch#projectDirectory()}, like every other Maven input of this server
+     * @return artifacts in Maven order - the classpath of the <b>test</b> scope, see
+     *         {@link #resolveClasspath(Path, String)}
      */
     public static List<Artifact> classpath(Path pomPath) throws IOException {
-        if (!Files.isRegularFile(pomPath)) {
-            throw new IOException("pom.xml not found: " + pomPath);
+        return resolveClasspath(pomPath, null).artifacts();
+    }
+
+    /**
+     * Resolves the artifact list of a POM with an explicit scope filter (cached).
+     *
+     * <p>
+     * <b>Unfiltered is the test classpath.</b> Measured on this project, {@code
+     * dependency:build-classpath} answers with 105 entries and {@code junit-jupiter} among them,
+     * while the POM declares JUnit as {@code <scope>test</scope>}. Earlier javadoc here and
+     * {@code m2.list}/{@code m2.classpath} in the JS module called that "the compile classpath";
+     * the misnomer mattered, because a caller who believes it gets a "main" classpath with the test
+     * libraries in it - the silent scope drift {@code docs/js/espresso.md} §2.2 names.
+     * </p>
+     * <p>
+     * The filter is passed to the dependency plugin as {@code -DincludeScope=...}. That spelling is
+     * measured, not assumed: {@code -DincludeScope=compile} returned 71 of the 105 entries on this
+     * project, while {@code -Dmdep.includeScope=compile} and {@code -Dscope=compile} returned all
+     * 105 - a silently ignored filter is the failure mode that would have made "main" mean "test"
+     * again. Nothing here interprets the POM: which scope an artifact ends up in is what Maven's
+     * own resolution says, and {@link Resolution#includeScope()} records only what was asked.
+     * </p>
+     *
+     * @param pomPath      path of the pom.xml (relative inputs anchor at the project directory)
+     * @param includeScope {@code "compile"}, {@code "runtime"}, {@code "test"} - or null for the
+     *                     unfiltered answer
+     * @return the resolution, never null
+     */
+    public static Resolution resolveClasspath(Path pomPath, String includeScope) throws IOException {
+        long t0 = System.currentTimeMillis();
+        // One path for the stat, the cache key, the guard and the process: a relative spelling is
+        // anchored at the watched project directory before anything else looks at it, so those four
+        // cannot end up talking about different files (docs/open-points.md §5).
+        Path pom = PomWatch.anchor(pomPath);
+        if (!Files.isRegularFile(pom)) {
+            throw new IOException("pom.xml not found: " + pom);
         }
-        long size = Files.size(pomPath);
-        long mtime = Files.getLastModifiedTime(pomPath).toMillis();
+        String filter = (includeScope == null || includeScope.isBlank())
+                ? null : includeScope.trim().toLowerCase(Locale.ROOT);
+        long size = Files.size(pom);
+        long mtime = Files.getLastModifiedTime(pom).toMillis();
         long now = System.currentTimeMillis();
-        CacheEntry cached = CACHE.get(pomPath);
+        CacheKey key = new CacheKey(pom, filter);
+        CacheEntry cached = CACHE.get(key);
         if (cached != null && cached.stillValid(size, mtime, now)) {
-            LOGGER.debug("m2: classpath cache hit for {}", pomPath);
-            return cached.artifacts();
+            LOGGER.debug("m2: classpath cache hit for {} ({})", pom, (filter == null ? "test" : filter));
+            return new Resolution(pom, filter, cached.artifacts(), cached.dropped(), true,
+                    System.currentTimeMillis() - t0);
         }
 
         Path tempDir = Files.createTempDirectory("mcp-m2-");
         Path cpFile = tempDir.resolve("cp.txt");
         List<Artifact> artifacts;
+        List<Path> dropped = new ArrayList<>();
         try {
-            runMaven(pomPath, "dependency:build-classpath",
-                    "-Dmdep.outputFile=" + cpFile, "-q");
+            List<String> rest = new ArrayList<>();
+            rest.add("-Dmdep.outputFile=" + cpFile);
+            if (filter != null) {
+                rest.add("-DincludeScope=" + filter);
+            }
+            rest.add("-q");
+            // -N: without it a multi-module POM runs the goal once per module and every module
+            // writes the same file - the last one wins, and the answer is one module's classpath
+            // presented as the project's (docs/maven-guard.md §5 Nr. 1).
+            rest.add("-N");
+            runMaven(pom, readArgs("build-classpath", rest.toArray(new String[0])));
             if (!Files.exists(cpFile)) {
                 throw new IOException("Maven did not write the classpath file");
             }
             String classpath = Files.readString(cpFile).trim();
-            artifacts = parseClasspath(classpath);
+            artifacts = parseClasspath(classpath, dropped);
+            if (filter != null && artifacts.isEmpty()) {
+                // An empty answer for a filtered read is almost never true and always reads as
+                // "the project has no dependencies": say what was asked instead of passing it on.
+                throw new IOException("the scope filter " + filter + " produced no classpath "
+                        + "entries for " + pom + " - the check would compile against nothing");
+            }
         } finally {
             Files.deleteIfExists(cpFile);
             Files.deleteIfExists(tempDir);
         }
 
-        CACHE.put(pomPath, new CacheEntry(size, mtime, System.currentTimeMillis(), artifacts));
-        LOGGER.info("m2: resolved {} artifacts for {}", artifacts.size(), pomPath);
-        return artifacts;
+        CACHE.put(key, new CacheEntry(size, mtime, System.currentTimeMillis(), artifacts,
+                List.copyOf(dropped)));
+        LOGGER.info("m2: resolved {} artifacts for {} (scope {}, {} entries not in repository "
+                + "layout)", artifacts.size(), pom, (filter == null ? "test" : filter),
+                dropped.size());
+        return new Resolution(pom, filter, artifacts, List.copyOf(dropped), false,
+                System.currentTimeMillis() - t0);
     }
 
-    /** Parses a path-separator separated classpath into artifacts. */
+    /**
+     * Parses a path-separator separated classpath into artifacts.
+     *
+     * <p>
+     * An entry that is not a repository artifact (a sibling module's {@code target/classes}, a
+     * system-scoped jar, anything outside {@code repository()}) is <b>not</b> an artifact and used
+     * to disappear into a debug line. For a classpath <em>listing</em> that is harmless; for
+     * compiling against it, it is the wrong-looking-right error this SDK writes whole documents
+     * about - measured on this project, 6 of the 105 entries Maven named were dropped this way.
+     * They are collected and reported now.
+     * </p>
+     *
+     * @param classpath the raw value of {@code mdep.outputFile}
+     * @return the artifacts, in Maven order
+     */
     private static List<Artifact> parseClasspath(String classpath) {
+        return parseClasspath(classpath, null);
+    }
+
+    /** As {@link #parseClasspath(String)}, collecting what was left out into {@code dropped}. */
+    private static List<Artifact> parseClasspath(String classpath, List<Path> dropped) {
         List<Artifact> out = new ArrayList<>();
         if (classpath.isEmpty()) {
             return out;
@@ -291,6 +386,9 @@ public final class M2Resolver {
                 out.add(a);
             } else {
                 LOGGER.debug("m2: classpath entry outside repository or unparsable: {}", jar);
+                if (dropped != null) {
+                    dropped.add(jar);
+                }
             }
         }
         return out;
@@ -332,12 +430,15 @@ public final class M2Resolver {
     /**
      * Runs {@code mvn dependency:tree} and returns its output with the {@code [INFO]} prefixes
      * stripped.
-     * @param pomPath absolute pom path
+     * @param pomPath path of the pom.xml (a relative one is anchored at
+     *        {@link PomWatch#projectDirectory()} before the run, as in {@link #classpath})
      * @param verbose include the conflict/omitted lines (requires maven-dependency-plugin 3.2+)
      */
     public static String tree(Path pomPath, boolean verbose) throws IOException {
-        List<String> args = new ArrayList<>();
-        args.add("dependency:tree");
+        // No -N here: on an aggregator POM the reactor view *is* the answer, unlike the classpath
+        // file, where recursion silently overwrites the result.
+        List<String> args = new ArrayList<>(MavenProcess.readFlags());
+        args.add(MavenProcess.dependencyGoal("tree"));
         if (verbose) {
             args.add("-Dverbose");
         }
@@ -621,15 +722,19 @@ public final class M2Resolver {
             Path workDir;
             boolean tempDir = false;
             if (pomDirHint != null && !pomDirHint.isBlank()) {
-                Path hint = Path.of(pomDirHint).toAbsolutePath().normalize();
+                Path hint = anchoredHint(pomDirHint);
                 Path parent = Files.isDirectory(hint) ? hint : hint.getParent();
-                workDir = parent != null ? parent : Path.of(".").toAbsolutePath();
+                // A hint without a directory part means the watched project, which MavenProcess
+                // anchors - not Path.of("."), the process directory of this server
+                // (docs/open-points.md §5).
+                workDir = parent;
             } else {
                 workDir = Files.createTempDirectory("mcp-m2-get-");
                 tempDir = true;
             }
+            Path hint = (pomDirHint == null || pomDirHint.isBlank()) ? null : anchoredHint(pomDirHint);
             try {
-                runMavenInDir(workDir, "dependency:get",
+                runMavenFetch(workDir, hint, MavenProcess.dependencyGoal("get"),
                         "-Dartifact=" + a.gav() + ":jar:sources", "-Dtransitive=false", "-q");
             } finally {
                 if (tempDir) {

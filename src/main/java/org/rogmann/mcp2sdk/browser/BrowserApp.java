@@ -32,9 +32,14 @@ import java.util.Set;
  * @param sensitivePaths    paths whose request bodies are never logged (login, token endpoint)
  * @param sensitiveKeys     field names considered secret, in addition to the predefined ones
  * @param irreversiblePaths paths whose requests only pass in write mode with a hard approval
+ * @param rewriteRules      response rewrite rules (docs/browser.md §3a) - today only
+ *                          {@code queryParamUrl}. A rule instance is data (proposable from the
+ *                          capture), its type is reviewed code; unknown types are dropped with a
+ *                          registry complaint, the entry stays valid.
  */
 public record BrowserApp(String id, String upstream, int port, String note, String auth,
-        List<String> sensitivePaths, List<String> sensitiveKeys, List<String> irreversiblePaths) {
+        List<String> sensitivePaths, List<String> sensitiveKeys, List<String> irreversiblePaths,
+        List<BrowserRewriteRule> rewriteRules) {
 
     private static final Logger LOG = LoggerFactory.getLogger(BrowserApp.class);
 
@@ -93,6 +98,15 @@ public record BrowserApp(String id, String upstream, int port, String note, Stri
         sensitivePaths = List.copyOf(sensitivePaths == null ? List.of() : sensitivePaths);
         sensitiveKeys = List.copyOf(sensitiveKeys == null ? List.of() : sensitiveKeys);
         irreversiblePaths = List.copyOf(irreversiblePaths == null ? List.of() : irreversiblePaths);
+        rewriteRules = List.copyOf(rewriteRules == null ? List.of() : rewriteRules);
+    }
+
+    /**
+     * Convenience for callers that do not deal with rewrite rules (most entries, tests).
+     */
+    public BrowserApp(String id, String upstream, int port, String note, String auth,
+            List<String> sensitivePaths, List<String> sensitiveKeys, List<String> irreversiblePaths) {
+        this(id, upstream, port, note, auth, sensitivePaths, sensitiveKeys, irreversiblePaths, List.of());
     }
 
     /**

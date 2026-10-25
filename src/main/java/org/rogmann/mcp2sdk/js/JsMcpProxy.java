@@ -8,7 +8,6 @@ import io.modelcontextprotocol.spec.McpSchema;
 import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
 import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
 import io.modelcontextprotocol.spec.McpSchema.Tool;
-import io.modelcontextprotocol.spec.McpSchema.JsonSchema;
 
 import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.Value;
@@ -228,12 +227,13 @@ public class JsMcpProxy implements AutoCloseable {
             helpText.append("Tool: ").append(tool.name()).append("\n");
             helpText.append("Description: ").append(tool.description()).append("\n\n");
 
-            JsonSchema schema = tool.inputSchema();
+            Map<String, Object> schema = tool.inputSchema();
             if (schema != null) {
                 helpText.append("Input Schema:\n");
-                helpText.append("  type: ").append(schema.type()).append("\n");
+                helpText.append("  type: ").append(schema.get("type")).append("\n");
 
-                Map<String, Object> properties = schema.properties();
+                @SuppressWarnings("unchecked")
+                Map<String, Object> properties = (Map<String, Object>) schema.get("properties");
                 if (properties != null && !properties.isEmpty()) {
                     helpText.append("  properties:\n");
                     for (Map.Entry<String, Object> entry : properties.entrySet()) {
@@ -251,7 +251,8 @@ public class JsMcpProxy implements AutoCloseable {
                     }
                 }
 
-                List<String> required = schema.required();
+                @SuppressWarnings("unchecked")
+                List<String> required = (List<String>) schema.get("required");
                 if (required != null && !required.isEmpty()) {
                     helpText.append("  required: ").append(String.join(", ", required)).append("\n");
                 }

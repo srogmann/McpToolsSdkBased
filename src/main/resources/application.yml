@@ -40,10 +40,38 @@ webui:
   # Only meaningful when backend is vllm; vLLM streaming omits prompt_tokens_details.
   #fetch-metrics: false
 
+
 # Tool Configuration
 tools:
   # Comma-separated list of tool names to activate on startup
   active: "glossary_tool,find_files_by_glob,get_file_text_by_path,edit_file_tool"
+
+  # Browser session (docs/browser.md): add the tool "browser" here to give it to the model,
+  # and approve the application in browser-apps.json. The port actually bound is read from
+  # local.server.port at startup; -Dbrowser.local.port is only the assumption for the case that a port
+  # is needed before that moment. Proxy behaviour via system property:
+  #   -Dbrowser.apps.path=browser-apps.json   registry
+  #   -Dbrowser.write.enabled=false           M0: reading instead of writing (decision L6)
+  #   -Dbrowser.apps.withoutReviews=          M1: development bypass of the four-eyes review (L9)
+  #   -Dbrowser.fields.mode=off               M2: off | observe | strict - where a field's value comes
+  #                                           from (value pass + field model). Off means: no value pass,
+  #                                           a session runs exactly as M1 built it (decision L11). The
+  #                                           model of an application lies in runs/browser/fields/.
+  #   -Dbrowser.bridge.inject=true            inject the bridge script
+  #   -Dbrowser.bridge.pollSeconds=8          long-poll horizon
+  #   -Dbrowser.rewrite.relaxCsp=true         remove script-src when it blocks the bridge
+  #   -Dbrowser.cookie.dropSecure=true        needed as long as the proxy runs on http://
+  #   -Dbrowser.capture.bytes=4000            body limit in the capture
+  #   -Dbrowser.proxy.maxBodyBytes=33554432   body limit when proxying
+  #   -Dbrowser.persist=true                  write JSONL to runs/browser/<session>/
+  #   -Dbrowser.fields.mode=off               M2: off | observe | strict - where a field's value comes
+  #                                           from (value pass + field model). Off is M1 unchanged.
+  #   -Dbrowser.host.suffix=                  one host name per application, e.g. ".localhost":
+  #                                           cookies belong to a host and never to a port, so without
+  #                                           this every proxied application on localhost shares one
+  #                                           cookie jar (and one HSTS entry). Needs resolving names:
+  #                                           Firefox/Chrome and Linux/macOS do *.localhost themselves,
+  #                                           Windows wants a hosts entry per name (docs/browser.md §2b)
   
   # Maven-related tool configuration
   maven:
@@ -55,3 +83,13 @@ tools:
     auto-download-sources: true
     # Timeout in seconds for Maven operations (default: 60)
     timeout-seconds: 60
+#                                                 their tool calls against (the transport
+
+# ACP (Agent Client Protocol) endpoint, see docs/acp.md: this project as the ACP agent,
+# the IDE as the client (reached through the stdio-to-HTTP bridge, scripts/acp-bridge.sh).
+acp:
+  # Mount StreamableHttpAcpServlet (acp-http-servlet) on the running Tomcat?
+  enabled: true
+  # Endpoint path, next to /chat, /mcp, /review, ...; Streamable HTTP and WebSocket
+  # upgrade on the same path. Loopback-only like the whole server.
+  endpoint-path: /acp

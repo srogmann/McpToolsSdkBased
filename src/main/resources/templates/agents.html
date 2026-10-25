@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <title>Sub-Agent Monitor</title>
+    <style>
+        body { font-family: sans-serif; padding: 12px; background: #fafafa; }
+        h1 { font-size: 20px; margin: 0 0 8px 0; }
+        .toolbar { margin-bottom: 12px; display: flex; gap: 16px; align-items: center; font-size: 13px; }
+        .batch { margin-bottom: 20px; }
+        .batch h2 { font-size: 15px; margin: 4px 0 8px 0; }
+        .cards { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; }
+        .card { background: #fff; border: 1px solid #ddd; border-radius: 6px; width: 460px; padding: 10px; font-size: 13px; }
+        .card h3 { margin: 0 0 6px 0; font-size: 14px; display: flex; justify-content: space-between; align-items: center; }
+        .badge { padding: 2px 8px; border-radius: 10px; font-size: 11px; color: #fff; }
+        .badge.running { background: #2563eb; }
+        .badge.done { background: #16a34a; }
+        .badge.partial { background: #d97706; }
+        .badge.timeout, .badge.error { background: #dc2626; }
+        .badge.refused { background: #6b7280; }
+        .meta { color: #555; margin: 4px 0; }
+        .turn { border-left: 2px solid #cbd5e1; margin: 6px 0 6px 2px; padding-left: 8px; }
+        .turnhead { font-weight: 600; color: #374151; font-size: 12px; margin: 2px 0; }
+        details { margin: 3px 0; }
+        summary { cursor: pointer; font-weight: 600; }
+        pre { white-space: pre-wrap; word-break: break-word; background: #f4f4f5; padding: 6px; border-radius: 4px; max-height: 300px; overflow: auto; margin: 4px 0 0 0; font-size: 12px; }
+        .call { border-top: 1px dashed #e5e7eb; padding: 4px 0; margin-top: 4px; }
+        .call .name { font-weight: 600; }
+        .call .err { color: #dc2626; }
+        .notes { color: #b45309; font-size: 12px; margin-top: 6px; }
+        .muted { color: #9ca3af; }
+    </style>
+</head>
+<body>
+<h1>Sub-Agent Monitor</h1>
+<div class="toolbar">
+    <label><input type="checkbox" id="paused"> Pausieren</label>
+    <label><input type="checkbox" id="runningOnly"> nur laufende</label>
+    <span id="updated" class="muted"></span>
+</div>
+<div id="root">
+    <p class="muted">Lade &#8230;</p>
+</div>
+<noscript>Die Ansicht ben&#246;tigt JavaScript (Polling auf /agents/api/agents).</noscript>
+<script>
+(function () {
+    'use strict';
+    var root = document.getElementById('root');
+    var updated = document.getElementById('updated');
+    var pausedBox = document.getElementById('paused');
+    var runningOnlyBox = document.getElementById('runningOnly');
+    var last = [];
+    /* Explicit open/closed state per <details>, keyed by a stable key. The polling rebuilds the
+       DOM every second; without this map every click would be undone within a second. */
+    var user = {};
+
+    function el(tag, cls, text) {
+        var e = document.createElement(tag);
+        if (cls) { e.className = cls; }
+        if (text !== undefined && text !== null) { e.textContent = String(text); }
+        return e;
+    }
+
+    /* A collapsible section: survives the rebuild via the user map, falls back to its default. */
+    function details(parent, key, title, text, defOpen) {
+        if (text === undefined || text === null || String(text).length === 0) { return; }
+        var d = document.createElement('details');
+        d.dataset.key = key;
+        d.open = (key in user) ? user[key] : defOpen;
+        d.appendChild(el('summary', null, title));
+        d.appendChild(el('pre', null, text));
+        d.addEventListener('toggle', function () { user[key] = d.open; });
+        parent.appendChild(d);
+        return d;
+    }
+
+    function badge(status) {
+        var s = status ? status : 'running';
+        return el('span', 'badge ' + s, s);
+    }
+
+    function fmtDuration(ms) {
+        if (ms > 90000) { return Math.round(ms / 60000) + ' min'; }
+        if (ms > 1000) { return (Math.round(ms / 100) / 10) + ' s'; }
+        return ms + ' ms';
+    }
+
+    function fmtTokens(a) {
+        var cached = 'unbekannt';
+        if (a.cachedTokensKnown && a.promptTokens > 0) {
+            cached = a.cachedTokens + ' (' + Math.round(a.cachedTokens * 100 / a.promptTokens) + '%)';
+        } else if (a.cachedTokensKnown) {
+            cached = String(a.cachedTokens);
+        }
+        var toolCount = 0;
+        (a.turns || []).forEach(function (t) { toolCount += (t.toolCalls || []).length; });
+        return 'Modell-Aufrufe: ' + a.modelCalls + ' \u00b7 Tool-Calls: ' + toolCount
+                + ' \u00b7 prompt ' + a.promptTokens + ' / gecached ' + cached
+                + ' / out ' + a.completionTokens;
+    }
+
+    function fmtProgress(a) {
+        var now = Date.now();
+        if (!a.status) {
+            var text = 'l\u00e4uft ' + fmtDuration(now - a.startedAt);
+            if (a.deadlineRemainingMs > 0) {
+                text += ' \u00b7 Deadline in ~' + fmtDuration(
+                        Math.max(0, a.deadlineRemainingMs - (now - a.startedAt)));
+            }
+            return text;
+        }
+        return 'beendet nach ' + fmtDuration(a.elapsedMs);
+    }
+
+    function toolCall(parent, agentKey, tc) {
+        var c = el('div', 'call');
+        c.appendChild(el('span', tc.error ? 'name err' : 'name', '#' + tc.index + ' ' + tc.name));
+        c.appendChild(el('span', 'muted',
+                tc.result === null ? ' l\u00e4uft \u2026' : ' \u00b7 ' + fmtDuration(tc.ms)));
+        details(c, agentKey + ':tool' + tc.index + ':args', 'Argumente', tc.arguments, false);
+        details(c, agentKey + ':tool' + tc.index + ':result', 'Ergebnis',
+                tc.result === null ? '(l\u00e4uft \u2026)' : tc.result, true);
+        parent.appendChild(c);
+    }
+
+    function turn(parent, agentKey, t, isLast) {
+        var box = el('div', 'turn');
+        var head = 'Turn ' + (t.index + 1);
+        if (t.finishReason) { head += ' \u00b7 ' + t.finishReason; }
+        if (t.ms > 0) { head += ' \u00b7 ' + fmtDuration(t.ms); }
+        var toks = t.promptTokens + ' p';
+        if (t.cachedTokensKnown) { toks += ' (' + t.cachedTokens + ' gec.)'; }
+        head += ' \u00b7 ' + toks + ' / ' + t.completionTokens + ' out';
+        box.appendChild(el('div', 'turnhead', head));
+        details(box, agentKey + ':turn' + t.index + ':req', 'Request', t.request, false);
+        /* Default-Zu (wie gew\u00fcnscht), offen nur beim letzten Turn, solange er noch keinen
+           Answer-Text hat - dann ist das Reasoning der einzige frische Inhalt. */
+        details(box, agentKey + ':turn' + t.index + ':reasoning', 'Reasoning', t.reasoning,
+                isLast && !t.content);
+        details(box, agentKey + ':turn' + t.index + ':content', 'Answer', t.content, true);
+        (t.toolCalls || []).forEach(function (tc) { toolCall(box, agentKey, tc); });
+        parent.appendChild(box);
+    }
+
+    function card(a) {
+        var card = el('div', 'card');
+        var agentKey = 'a:' + a.batchId + '/' + a.taskId;
+        var head = el('h3');
+        head.appendChild(el('span', null, a.taskId + ' (Child ' + a.childIndex + ')'));
+        head.appendChild(badge(a.status));
+        card.appendChild(head);
+        card.appendChild(el('div', 'meta', fmtTokens(a)));
+        card.appendChild(el('div', 'meta', fmtProgress(a)));
+        details(card, agentKey + ':task', 'Aufgabe', a.instruction, true);
+        (a.turns || []).forEach(function (t, i) {
+            turn(card, agentKey, t, i === a.turns.length - 1);
+        });
+        if (a.notes && a.notes.length > 0) {
+            card.appendChild(el('div', 'notes', a.notes.join('; ')));
+        }
+        return card;
+    }
+
+    function render() {
+        var onlyRunning = runningOnlyBox.checked;
+        var shown = onlyRunning ? last.filter(function (a) { return !a.status; }) : last;
+        root.textContent = '';
+        if (shown.length === 0) {
+            root.appendChild(el('p', 'muted', last.length === 0
+                    ? 'Noch keine Sub-Agents bekannt. Sobald ein prefix_fork-Aufruf l\u00e4uft, '
+                            + 'erscheinen hier die Karten der Threads.'
+                    : 'Keine laufenden Agents (Filter "nur laufende" aktiv).'));
+            return;
+        }
+        var batch = null;
+        var cards = null;
+        shown.forEach(function (a) {
+            if (a.batchId !== batch) {
+                batch = a.batchId;
+                var sectionEl = el('div', 'batch');
+                sectionEl.appendChild(el('h2', null, 'Batch ' + batch));
+                cards = el('div', 'cards');
+                sectionEl.appendChild(cards);
+                root.appendChild(sectionEl);
+            }
+            cards.appendChild(card(a));
+        });
+    }
+
+    function tick() {
+        if (pausedBox.checked) { return; }
+        fetch('/agents/api/agents', { cache: 'no-store' })
+                .then(function (res) { return res.ok ? res.json() : null; })
+                .then(function (agents) {
+                    if (agents) {
+                        last = agents;
+                        render();
+                        updated.textContent = 'Update: ' + new Date().toLocaleTimeString();
+                    }
+                })
+                .catch(function (e) { updated.textContent = 'Fehler: ' + e; });
+    }
+
+    setInterval(tick, 1000);
+    tick();
+})();
+</script>
+</body>
+</html>

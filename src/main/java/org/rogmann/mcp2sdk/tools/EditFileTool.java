@@ -9,6 +9,7 @@ import io.modelcontextprotocol.spec.McpSchema.JsonSchema;
 import org.rogmann.mcp2sdk.ToolSpecWithState;
 import org.rogmann.mcp2sdk.ToolState;
 import org.rogmann.mcp2sdk.WorkProject;
+import org.rogmann.mcp2sdk.watch.FileChangeWatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -176,36 +177,14 @@ public class EditFileTool {
 
             try {
                 String content = Files.readString(targetFile);
-                String newContent;
-                int replacements = 0;
-
-                if (replaceAll) {
-                    // Count occurrences
-                    int index = 0;
-                    while ((index = content.indexOf(oldString, index)) != -1) {
-                        replacements++;
-                        index += oldString.length();
-                    }
-
-                    if (replacements > 0) {
-                        newContent = content.replace(oldString, newString);
-                    } else {
-                        newContent = content;
-                    }
-                } else {
-                    // Replace first occurrence only
-                    int index = content.indexOf(oldString);
-                    if (index != -1) {
-                        replacements = 1;
-                        newContent = content.substring(0, index) + newString + content.substring(index + oldString.length());
-                    } else {
-                        newContent = content;
-                    }
-                }
+                EditOutcome outcome = computeNewContent(content, oldString, newString, replaceAll);
+                String newContent = outcome.newContent();
+                int replacements = outcome.replacements();
 
                 if (replacements > 0) {
                     state.callsOk().incrementAndGet();
 
+                    FileChangeWatch.beforeWrite(targetFile, FileChangeWatch.Kind.MODIFIED);
                     Files.writeString(targetFile, newContent);
                     String successMsg = "Successfully replaced " + replacements + " occurrence(s) in file: " + projectDir.relativize(targetFile);
                     LOGGER.info("Successfully edited file: " + targetFile + " (" + replacements + " replacements)");
@@ -271,6 +250,50 @@ public class EditFileTool {
      * @return message and diagnostic fields (longestPrefixLength, searchedChar,
      *     actualChar, oldStringContext, fileContext)
      */
+    /** The outcome of applying one search-replace pass to a file content. */
+    public record EditOutcome(String newContent, int replacements) {
+    }
+
+    /**
+     * Applies one search-replace pass to a file content. One source of truth for the
+     * replacement: the tool's call path and the ACP ide-diff route (docs/acp.md S5) share
+     * this logic — a second copy would be a second truth.
+     * @param content    the current file content
+     * @param oldString  the string to search for
+     * @param newString  the string to replace the old string with
+     * @param replaceAll whether to replace all occurrences or just the first
+     * @return the new content and the number of replacements (0 when nothing matched)
+     */
+    public static EditOutcome computeNewContent(String content, String oldString, String newString,
+            boolean replaceAll) {
+        int replacements = 0;
+        String newContent;
+        if (replaceAll) {
+            // Count occurrences
+            int index = 0;
+            while ((index = content.indexOf(oldString, index)) != -1) {
+                replacements++;
+                index += oldString.length();
+            }
+
+            if (replacements > 0) {
+                newContent = content.replace(oldString, newString);
+            } else {
+                newContent = content;
+            }
+        } else {
+            // Replace first occurrence only
+            int index = content.indexOf(oldString);
+            if (index != -1) {
+                replacements = 1;
+                newContent = content.substring(0, index) + newString + content.substring(index + oldString.length());
+            } else {
+                newContent = content;
+            }
+        }
+        return new EditOutcome(newContent, replacements);
+    }
+
     private static Map<String, Object> findLongestPrefix(Path projectDir, Path targetFile, String content, String oldString) {
         Map<String, Object> result = new HashMap<>();
         int maxPrefixLength = -1;

@@ -164,7 +164,15 @@ public class JsCryptoBridge implements JsModuleInterface {
                 default -> JsCrypto.sha256(path);
             };
         }
-        byte[] data = GraalProxies.toByteArray(v);
+        byte[] data;
+        try {
+            data = GraalProxies.toByteArray(v);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException(e.getMessage()
+                    + " (crypto: a String argument is treated as a file path and then hashed"
+                    + " streamed with constant memory - there is no need to build block lists,"
+                    + " see crypto.help())", e);
+        }
         return switch (name) {
             case "md5" -> JsCrypto.md5(data);
             case "sha1" -> JsCrypto.sha1(data);

@@ -48,10 +48,28 @@ public interface JsModuleInterface {
      * This allows modules to be enabled/disabled at runtime, e.g. depending on a
      * system property ({@code mcp}) or, later, per user.
      * </p>
+     * <p>
+     * Asked <em>per call</em> while wiring. A module whose availability depends on the caller -
+     * the {@code board} module exists only for a thread of a running fork - is therefore not
+     * advertised in the tool description by this method; see {@link #isAdvertised()}.
+     * </p>
      * @return true if the module is enabled (default), false otherwise
      */
     default boolean isEnabled() {
         return true;
+    }
+
+    /**
+     * Indicates whether the module's {@link #getSummary()} appears in the MCP tool-description of
+     * the JavaScript tool. The description is built once at startup and travels in every request,
+     * so advertising is a configuration question (a property) while {@link #isEnabled()} is a
+     * per-call question (is there something to bind <em>here</em>). For a module that does not
+     * depend on the caller the two are the same, which is why this defaults to it.
+     *
+     * @return true if the summary is advertised (default: whatever {@link #isEnabled()} says)
+     */
+    default boolean isAdvertised() {
+        return isEnabled();
     }
 
     /**

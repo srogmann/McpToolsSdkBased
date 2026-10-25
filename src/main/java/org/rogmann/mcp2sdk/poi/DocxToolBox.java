@@ -5,8 +5,14 @@ import org.apache.poi.ooxml.util.DocumentHelper;
 import org.apache.poi.xwpf.usermodel.IBodyElement;
 import org.apache.poi.xwpf.usermodel.LineSpacingRule;
 import org.apache.poi.xwpf.usermodel.ParagraphAlignment;
+import org.apache.poi.xwpf.usermodel.TableRowAlign;
+import org.apache.poi.xwpf.usermodel.TableRowHeightRule;
 import org.apache.poi.xwpf.usermodel.XWPFAbstractNum;
+import org.apache.poi.xwpf.usermodel.XWPFComment;
+import org.apache.poi.xwpf.usermodel.XWPFComments;
 import org.apache.poi.xwpf.usermodel.XWPFDocument;
+import org.apache.poi.xwpf.usermodel.XWPFFooter;
+import org.apache.poi.xwpf.usermodel.XWPFHeader;
 import org.apache.poi.xwpf.usermodel.XWPFHeaderFooter;
 import org.apache.poi.xwpf.usermodel.XWPFNumbering;
 import org.apache.poi.xwpf.usermodel.XWPFParagraph;
@@ -26,17 +32,29 @@ import org.openxmlformats.schemas.drawingml.x2006.main.CTNonVisualDrawingProps;
 import org.openxmlformats.schemas.drawingml.x2006.main.CTPositiveSize2D;
 import org.openxmlformats.schemas.drawingml.x2006.wordprocessingDrawing.CTInline;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTBorder;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTHeight;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTP;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTPPr;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTR;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTSectPr;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTStyle;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTTbl;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTTblBorders;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTTblGrid;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTTblPr;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTTblWidth;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTTc;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTTcBorders;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTTcPr;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTVMerge;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.STBorder;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.STMerge;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.STNumberFormat;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.STPageOrientation;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.STStyleType;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.STTblLayoutType;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.STTblWidth;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.STVerticalJc;
 
 import javax.imageio.ImageIO;
 import javax.xml.namespace.QName;
@@ -51,6 +69,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.text.Normalizer;
 import java.util.ArrayList;
+import java.util.Calendar;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -560,9 +579,9 @@ public class DocxToolBox {
             tm.put("colCount", table.getRows().isEmpty() ? 0
                     : table.getRows().get(0).getTableCells().size());
             tm.put("colCountMax", maxCells);
-            var ctTbl = table.getCTTbl();
-            var grid = ctTbl == null ? null : ctTbl.getTblGrid();   // CTTbl has no isSetTblGrid()
-            tm.put("gridCols", grid == null ? null : grid.sizeOfGridColArray());
+            // alignment, width, layout, borders, rowHeights, repeatHeaderRows, gridCols,
+            // gridColCm (§9.8) - the same keys every table setter answers with
+            tm.putAll(tableProps(table));
             tm.put("style", table.getStyleID());
             tm.put("rows", rowsList);
             tm.put("cellBorders", bordersList);
@@ -977,6 +996,8 @@ public class DocxToolBox {
         m.put("pageBreakBefore", pPr != null && pPr.isSetPageBreakBefore());
         m.put("keepNext", p.isKeepNext());
         m.put("sectionEnd", pPr != null && pPr.isSetSectPr());
+        // comment ids anchored here (range start/end, reference) - empty list when none
+        m.put("commentIds", commentIdsOf(ctp));
         m.put("runs", p.getRuns().size());
         m.put("hyperlinks", ctp.getHyperlinkList().size());
         List<String> breaks = breaksOf(ctp);
@@ -1307,6 +1328,7 @@ public class DocxToolBox {
         core.put("author", coreProps.getCreator());
         core.put("subject", coreProps.getSubject());
         core.put("keywords", coreProps.getKeywords());
+        core.put("comments", coreProps.getDescription());
         var styles = doc.getStyles();
         var numbering = doc.getNumbering();
         var settings = settingsIfPresent(doc);
@@ -1318,6 +1340,9 @@ public class DocxToolBox {
         result.put("tableCount", tables);
         result.put("sdtCount", sdts);
         result.put("sectionCount", sections.size());
+        XWPFComments commentsPart = commentsPartOf(doc);
+        result.put("commentCount", commentsPart == null ? 0 : commentsPart.getComments().size());
+        result.put("commentsPartPresent", commentsPart != null);
         result.put("sections", sections);
         result.put("stylesPresent", styles != null);
         result.put("styleCount", styles == null ? 0 : styles.getNumberOfStyles());
@@ -1748,6 +1773,563 @@ public class DocxToolBox {
         return s;
     }
 
+    // ========================================================================
+    // Document attachments: page setup and core properties (docs/js/docx.md §9.2/§9.3)
+    // ========================================================================
+
+    /** Option keys of {@link #setPageSetup(String, Map)} - all optional, only given keys are written. */
+    private static final String[] PAGE_SETUP_KEYS = {
+            "pageWidthCm", "pageHeightCm", "marginTopCm", "marginBottomCm",
+            "marginLeftCm", "marginRightCm", "headerCm", "footerCm", "gutterCm", "orientation"};
+
+    /** Option keys of {@link #setDocumentMeta(String, Map)} - all optional. */
+    private static final String[] DOCUMENT_META_KEYS = {"title", "author", "subject", "keywords", "comments"};
+
+    /** Smallest/largest page dimension {@link #setPageSetup(String, Map)} accepts (cm). */
+    private static final double MIN_PAGE_CM = 1.0;
+    private static final double MAX_PAGE_CM = 200.0;
+
+    /** Largest page margin {@link #setPageSetup(String, Map)} accepts (cm). */
+    private static final double MAX_MARGIN_CM = 25.0;
+
+    /**
+     * cm -> twips as {@code BigInteger}. {@code w:pgSz/@w} and the {@code w:pgMar} attributes
+     * are union attribute types, so XmlBeans exposes them as {@code setW(Object)} - the value
+     * type of the members is {@code BigInteger} (measured on poi-ooxml-lite 5.5.1).
+     */
+    private static BigInteger twipsOf(double cm) {
+        return BigInteger.valueOf(Math.round(cm * TWIPS_PER_CM));
+    }
+
+    private static STPageOrientation.Enum orientationEnum(String fn, String value) {
+        if ("landscape".equalsIgnoreCase(value)) {
+            return STPageOrientation.LANDSCAPE;
+        }
+        if ("portrait".equalsIgnoreCase(value)) {
+            return STPageOrientation.PORTRAIT;
+        }
+        throw new PoiUserRuntimeException(fn + ": option 'orientation' must be \"portrait\" or "
+                + "\"landscape\", but was: '" + value + "'");
+    }
+
+    /**
+     * Page size and page margins of the document's body section - created when the document
+     * has none, which is the case for <em>every</em> document built by
+     * {@link #createDocument(String)}: without a {@code w:sectPr} the paper format is not a
+     * property of the file at all, and Word/LibreOffice substitute their own defaults
+     * (measured 2026-10-17: the same A4 sketch printed as Letter on a US-default Word).
+     * <p>
+     * Partial update: only the keys that are given are written, everything else keeps its
+     * value. Lengths are in cm like everywhere else in this toolbox and land as twips.
+     * {@code orientation} writes {@code w:pgSz/@w:orient} explicitly; left out, the attribute
+     * stays away and the reader reports {@code orientationInferred} - the LibreOffice form.
+     * </p>
+     * @param docHandle document handle
+     * @param options   {@code pageWidthCm, pageHeightCm, marginTopCm, marginBottomCm,
+     *                  marginLeftCm, marginRightCm, headerCm, footerCm, gutterCm,
+     *                  orientation:"portrait"|"landscape"} - at least one of them
+     * @return the section in exactly the shape {@link #getDocumentInfo(String)} reports,
+     *         so the caller can verify the values without reopening the file
+     */
+    public Map<String, Object> setPageSetup(String docHandle, Map<String, Object> options) {
+        String fn = "setPageSetup";
+        XWPFDocument doc = requireDocument(docHandle);
+        requireKnownOptions(fn, options, PAGE_SETUP_KEYS);
+        if (options == null || options.isEmpty()) {
+            throw new PoiUserRuntimeException(fn + ": at least one option is needed (known: "
+                    + String.join(", ", PAGE_SETUP_KEYS) + "). See docx.help().");
+        }
+        var body = doc.getDocument().getBody();
+        if (body == null) {
+            throw new PoiUserRuntimeException(fn + ": document has no body element.");
+        }
+        CTSectPr sect = body.isSetSectPr() && body.getSectPr() != null
+                ? body.getSectPr() : body.addNewSectPr();
+
+        Double pageWidth = optNumber(fn, options, "pageWidthCm", MIN_PAGE_CM, MAX_PAGE_CM, null);
+        Double pageHeight = optNumber(fn, options, "pageHeightCm", MIN_PAGE_CM, MAX_PAGE_CM, null);
+        boolean orientGiven = options.containsKey("orientation");
+        if (pageWidth != null || pageHeight != null || orientGiven) {
+            var pgSz = sect.isSetPgSz() && sect.getPgSz() != null ? sect.getPgSz() : sect.addNewPgSz();
+            if (pageWidth != null) {
+                pgSz.setW(twipsOf(pageWidth));
+            }
+            if (pageHeight != null) {
+                pgSz.setH(twipsOf(pageHeight));
+            }
+            if (orientGiven) {
+                pgSz.setOrient(orientationEnum(fn, optString(fn, options, "orientation", "portrait")));
+            }
+        }
+
+        String[] marginKeys = {"marginTopCm", "marginBottomCm", "marginLeftCm", "marginRightCm",
+                "headerCm", "footerCm", "gutterCm"};
+        for (String key : marginKeys) {
+            if (!options.containsKey(key)) {
+                continue;
+            }
+            Double value = optNumber(fn, options, key, 0.0, MAX_MARGIN_CM, null);
+            var pgMar = sect.isSetPgMar() && sect.getPgMar() != null
+                    ? sect.getPgMar() : sect.addNewPgMar();
+            BigInteger twips = twipsOf(value);
+            switch (key) {
+                case "marginTopCm" -> pgMar.setTop(twips);
+                case "marginBottomCm" -> pgMar.setBottom(twips);
+                case "marginLeftCm" -> pgMar.setLeft(twips);
+                case "marginRightCm" -> pgMar.setRight(twips);
+                case "headerCm" -> pgMar.setHeader(twips);
+                case "footerCm" -> pgMar.setFooter(twips);
+                default -> pgMar.setGutter(twips);
+            }
+        }
+        return sectionInfo(sect);
+    }
+
+    /**
+     * Core properties of a document (title, author, subject, keywords, comments) - a document
+     * built by {@link #createDocument()} otherwise keeps the library defaults (author
+     * "Apache POI", everything else empty).
+     * <p>
+     * Partial update as in {@link #setPageSetup(String, Map)}. Note the spelling of the
+     * subject setter: POI's {@code CoreProperties} offers {@code getSubject()} but writes via
+     * {@code setSubjectProperty()} - there is no {@code setSubject()} (measured on
+     * poi-ooxml 5.5.1). {@code comments} is the {@code dc:description} field, which is what
+     * Word labels „Kommentar"; the German UI calls {@code dc:subject} „Zusammenfassung".
+     * </p>
+     * @return all five keys as they stand afterwards, in the shape of {@code getDocumentInfo().core}
+     */
+    public Map<String, Object> setDocumentMeta(String docHandle, Map<String, Object> options) {
+        String fn = "setDocumentMeta";
+        XWPFDocument doc = requireDocument(docHandle);
+        requireKnownOptions(fn, options, DOCUMENT_META_KEYS);
+        if (options == null || options.isEmpty()) {
+            throw new PoiUserRuntimeException(fn + ": at least one option is needed (known: "
+                    + String.join(", ", DOCUMENT_META_KEYS) + "). See docx.help().");
+        }
+        var core = doc.getProperties().getCoreProperties();
+        String title = optString(fn, options, "title", null);
+        if (title != null) {
+            core.setTitle(title);
+        }
+        String author = optString(fn, options, "author", null);
+        if (author != null) {
+            core.setCreator(author);
+        }
+        String subject = optString(fn, options, "subject", null);
+        if (subject != null) {
+            core.setSubjectProperty(subject);
+        }
+        String keywords = optString(fn, options, "keywords", null);
+        if (keywords != null) {
+            core.setKeywords(keywords);
+        }
+        String comments = optString(fn, options, "comments", null);
+        if (comments != null) {
+            core.setDescription(comments);
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("title", core.getTitle());
+        result.put("author", core.getCreator());
+        result.put("subject", core.getSubject());
+        result.put("keywords", core.getKeywords());
+        result.put("comments", core.getDescription());
+        return result;
+    }
+
+    // ========================================================================
+    // Word comments (w:comment): lesen und entfernen - neue anlegen ist offen,
+    // docs/js/docx.md §9.7
+    // ========================================================================
+
+    /** The {@code w:id} attribute of comment markup - qualified, unlike {@code wp:docPr/@id}. */
+    private static final QName QNAME_W_ID = new QName(
+            "http://schemas.openxmlformats.org/wordprocessingml/2006/main", "id");
+
+    /** The three markup elements that anchor a comment in the document. */
+    private static final List<String> COMMENT_MARKUP =
+            List.of("commentRangeStart", "commentRangeEnd", "commentReference");
+
+    /** Areas an anchor is found in - the values of {@code anchorScopes}. */
+    private static final String SCOPE_BODY = "body";
+    private static final String SCOPE_TABLE = "table";
+    private static final String SCOPE_HEADER_FOOTER = "headerFooter";
+
+    /**
+     * Places where Word may anchor a comment and this toolbox does not reach: the footnote and
+     * endnote parts, and text inside shapes ({@code wps:txbx}, which is not even readable -
+     * docs/js/docx.md §1.4). {@link #getComments(String)} reports them as {@code scopesNotScanned},
+     * so that "found no anchor" never quietly means "there is no anchor".
+     */
+    private static final List<String> SCOPES_NOT_SCANNED = List.of("footnotes", "endnotes", "shapeText");
+
+    /** One paragraph's XML, the area it belongs to, and its position in the body flow (or null). */
+    private record ScannedParagraph(CTP ctp, String scope, Integer bodyPos) { }
+
+    /** The anchors of a document: the areas each id appears in, and its first body position. */
+    private record CommentAnchors(Map<String, List<String>> scopesById,
+                                  Map<String, Integer> bodyPosById) {
+        List<String> scopesOf(String id) {
+            List<String> scopes = scopesById.get(id);
+            return scopes == null ? List.of() : scopes;
+        }
+
+        Integer bodyPosOf(String id) {
+            return bodyPosById.get(id);
+        }
+
+        Set<String> ids() {
+            return scopesById.keySet();
+        }
+    }
+
+    /**
+     * The comments part when the document has one - taken from the relations exactly like
+     * {@link #settingsIfPresent(XWPFDocument)}, because "this document has no comments" must
+     * answer with null and not with an exception on the way.
+     */
+    private static XWPFComments commentsPartOf(XWPFDocument doc) {
+        for (var part : doc.getRelations()) {
+            if (part instanceof XWPFComments comments) {
+                return comments;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The ids anchored in one paragraph - {@code w:commentRangeStart}, {@code w:commentRangeEnd}
+     * and the {@code w:commentReference} inside its runs, in document order, free of duplicates.
+     * POI models none of the three range elements (no {@code XWPFCommentRangeStart} in 5.5.1,
+     * measured), so this walks tokens the way {@link #drawingNodes(XmlObject)} walks shapes.
+     */
+    private static List<String> commentIdsOf(CTP ctp) {
+        List<String> ids = new ArrayList<>();
+        if (ctp == null) {
+            return ids;
+        }
+        XmlCursor cursor = ctp.newCursor();
+        try {
+            int depth = 0;
+            XmlCursor.TokenType token = cursor.toFirstContentToken();
+            while (token != null && !token.isNone()) {
+                if (token.isStart()) {
+                    depth++;
+                    QName name = cursor.getName();
+                    if (name != null && COMMENT_MARKUP.contains(name.getLocalPart())) {
+                        String id = trimOf(cursor.getAttributeText(QNAME_W_ID));
+                        if (id != null && !ids.contains(id)) {
+                            ids.add(id);
+                        }
+                    }
+                } else if (token.isEnd()) {
+                    if (depth == 0) {
+                        break;
+                    }
+                    depth--;
+                }
+                token = cursor.toNextToken();
+            }
+        } finally {
+            cursor.dispose();
+        }
+        return ids;
+    }
+
+    private static String trimOf(String value) {
+        return value == null ? null : value.trim();
+    }
+
+    /**
+     * Every paragraph the comment machinery can reach, in document order: body-level paragraphs
+     * (whose position counts all body elements, so it matches {@code getBodyElements()}'s "pos"),
+     * the paragraphs of table cells including tables nested in cells, and the paragraphs of every
+     * header and footer part. The parts are walked through {@code getBodyElements()} on purpose:
+     * POI's {@code XWPFHeaderFooter.getTables()} declares ArrayIndexOutOfBoundsException (measured
+     * on 5.5.1), the body-element list does not.
+     */
+    private static List<ScannedParagraph> commentScan(XWPFDocument doc) {
+        List<ScannedParagraph> scan = new ArrayList<>();
+        int pos = 0;
+        for (IBodyElement element : doc.getBodyElements()) {
+            if (element instanceof XWPFParagraph paragraph) {
+                scan.add(new ScannedParagraph(paragraph.getCTP(), SCOPE_BODY, pos));
+            } else if (element instanceof XWPFTable table) {
+                collectTable(table, SCOPE_TABLE, scan);
+            }
+            pos++;
+        }
+        for (XWPFHeader header : doc.getHeaderList()) {
+            collectBodyElements(header.getBodyElements(), scan);
+        }
+        for (XWPFFooter footer : doc.getFooterList()) {
+            collectBodyElements(footer.getBodyElements(), scan);
+        }
+        return scan;
+    }
+
+    /** Body elements of a header or footer part - a table there is still header/footer area. */
+    private static void collectBodyElements(List<IBodyElement> elements, List<ScannedParagraph> into) {
+        for (IBodyElement element : elements) {
+            if (element instanceof XWPFParagraph paragraph) {
+                into.add(new ScannedParagraph(paragraph.getCTP(), SCOPE_HEADER_FOOTER, null));
+            } else if (element instanceof XWPFTable table) {
+                collectTable(table, SCOPE_HEADER_FOOTER, into);
+            }
+        }
+    }
+
+    /** The cell paragraphs of a table, then the same for every table nested in those cells. */
+    private static void collectTable(XWPFTable table, String scope, List<ScannedParagraph> into) {
+        for (XWPFTableRow row : table.getRows()) {
+            for (XWPFTableCell cell : row.getTableCells()) {
+                for (XWPFParagraph paragraph : cell.getParagraphs()) {
+                    into.add(new ScannedParagraph(paragraph.getCTP(), scope, null));
+                }
+                for (XWPFTable nested : cell.getTables()) {
+                    collectTable(nested, scope, into);
+                }
+            }
+        }
+    }
+
+    /** Scans once and folds the paragraph ids into "id to areas" plus "id to first body position". */
+    private static CommentAnchors scanCommentAnchors(XWPFDocument doc) {
+        Map<String, List<String>> scopesById = new LinkedHashMap<>();
+        Map<String, Integer> bodyPosById = new LinkedHashMap<>();
+        for (ScannedParagraph sp : commentScan(doc)) {
+            for (String id : commentIdsOf(sp.ctp())) {
+                List<String> scopes = scopesById.get(id);
+                if (scopes == null) {
+                    scopes = new ArrayList<>();
+                    scopesById.put(id, scopes);
+                }
+                if (!scopes.contains(sp.scope())) {
+                    scopes.add(sp.scope());
+                }
+                if (sp.bodyPos() != null && !bodyPosById.containsKey(id)) {
+                    bodyPosById.put(id, sp.bodyPos());
+                }
+            }
+        }
+        return new CommentAnchors(scopesById, bodyPosById);
+    }
+
+    /**
+     * Every Word comment of the document: author, initials, date and text of the comment body,
+     * plus where it is anchored. Anchors are looked for in body paragraphs, table cells (nested
+     * tables included) and header/footer parts; {@code scopesNotScanned} names what stays out of
+     * reach, so an empty {@code anchorScopes} means "not in the scanned areas", never "none".
+     * Both half states are reported instead of dropped: a body without anchor and an anchor
+     * without body ({@code anchorsWithoutComment}) - the latter is what a partial deletion leaves.
+     *
+     * @param docHandle document handle
+     * @return JSON-compatible Map with "count", "comments", "anchorsWithoutComment",
+     *         "scopesNotScanned"
+     */
+    public Map<String, Object> getComments(String docHandle) {
+        XWPFDocument doc = requireDocument(docHandle);
+        XWPFComments part = commentsPartOf(doc);
+        CommentAnchors anchors = scanCommentAnchors(doc);
+        List<Map<String, Object>> items = new ArrayList<>();
+        List<String> withBody = new ArrayList<>();
+        if (part != null) {
+            for (XWPFComment comment : part.getComments()) {
+                Map<String, Object> cm = new LinkedHashMap<>();
+                String id = comment.getId();
+                Calendar date = comment.getDate();
+                cm.put("id", id);
+                cm.put("author", comment.getAuthor());
+                cm.put("initials", comment.getInitials());
+                cm.put("date", date == null ? null
+                        : java.time.format.DateTimeFormatter.ISO_INSTANT.format(date.toInstant()));
+                cm.put("text", comment.getText());
+                cm.put("paragraphPos", id == null ? null : anchors.bodyPosOf(id));
+                cm.put("anchorScopes", id == null ? List.of() : anchors.scopesOf(id));
+                items.add(cm);
+                if (id != null) {
+                    withBody.add(id);
+                }
+            }
+        }
+        List<String> orphanAnchors = new ArrayList<>();
+        for (String id : anchors.ids()) {
+            if (!withBody.contains(id)) {
+                orphanAnchors.add(id);
+            }
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("document", docHandle);
+        result.put("count", items.size());
+        result.put("comments", items);
+        result.put("anchorsWithoutComment", orphanAnchors);
+        result.put("scopesNotScanned", SCOPES_NOT_SCANNED);
+        return result;
+    }
+
+    /**
+     * Removes one comment and its markup - in every area the scan reaches, so a comment anchored
+     * in a table cell loses its {@code w:commentRangeStart}, its {@code w:commentRangeEnd} and its
+     * reference run just like one in the body. Leaving those behind is the failure mode this whole
+     * method is about: Word keeps showing the marker of a comment that no longer exists, and the
+     * scan would not have seen it. POI only manages the comment part itself and indexes by list
+     * position while this API speaks {@code w:id} - both translations happen here.
+     * <p>
+     * The emptied {@code word/comments.xml} stays in the package (a {@code w:comments} without
+     * children); dropping the part would mean rewriting the relationship graph for nothing gained.
+     * Markup in {@code scopesNotScanned} cannot be cleaned here - {@code getComments} reports it.
+     * </p>
+     * @param docHandle document handle
+     * @param commentId the {@code w:id} as a string - {@link #getComments(String)} lists them
+     * @return where the comment was anchored, what was removed, and what is left
+     */
+    public Map<String, Object> removeComment(String docHandle, String commentId) {
+        String fn = "removeComment";
+        XWPFDocument doc = requireDocument(docHandle);
+        String id = commentId == null ? "" : commentId.trim();
+        if (id.isEmpty()) {
+            throw new PoiUserRuntimeException(fn + ": argument 'commentId' must be the w:id of an "
+                    + "existing comment (getComments lists them), but was: '" + commentId + "'");
+        }
+        XWPFComments part = commentsPartOf(doc);
+        List<XWPFComment> all = part == null ? List.of() : part.getComments();
+        int index = -1;
+        for (int i = 0; i < all.size(); i++) {
+            if (id.equals(all.get(i).getId())) {
+                index = i;
+                break;
+            }
+        }
+        if (part == null) {
+            throw new PoiUserRuntimeException(fn + ": this document has no comments part at all, "
+                    + "so w:id '" + id + "' cannot be removed (getComments reports 0).");
+        }
+        if (index < 0) {
+            throw new PoiUserRuntimeException(fn + ": this document has no comment with w:id '" + id
+                    + "' - its comments part holds " + all.size() + " (getComments lists them).");
+        }
+        List<String> anchoredIn = scanCommentAnchors(doc).scopesOf(id);
+        boolean removedFromPart = part.removeComment(index);
+        List<String> scopesCleaned = new ArrayList<>();
+        int markupRemoved = removeCommentMarkup(doc, id, scopesCleaned);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("document", docHandle);
+        result.put("removedId", id);
+        result.put("removedFromPart", removedFromPart);
+        result.put("anchorScopes", anchoredIn);
+        result.put("markupElementsRemoved", markupRemoved);
+        result.put("scopesCleaned", scopesCleaned);
+        result.put("remaining", part.getComments().size());
+        result.put("anchorsWithoutComment", getComments(docHandle).get("anchorsWithoutComment"));
+        return result;
+    }
+
+    /**
+     * Removes every markup element carrying this id. The scan is rebuilt before each single
+     * removal, and one removal restarts the loop: a cursor that lives on across the deletion under
+     * it loses its footing (docs/js/docx.md §8, where exactly this broke drawingNodes()), and a
+     * comment has three elements - the restart is not a performance question here.
+     */
+    private static int removeCommentMarkup(XWPFDocument doc, String id, List<String> scopesCleaned) {
+        int removed = 0;
+        boolean again = true;
+        while (again) {
+            again = false;
+            for (ScannedParagraph sp : commentScan(doc)) {
+                if (removeMarkupIn(sp.ctp(), id) > 0) {
+                    removed++;
+                    if (!scopesCleaned.contains(sp.scope())) {
+                        scopesCleaned.add(sp.scope());
+                    }
+                    again = true;
+                    break;
+                }
+            }
+        }
+        return removed;
+    }
+
+    /** Removes the first markup element of this paragraph that carries the id (0 or 1). */
+    private static int removeMarkupIn(CTP ctp, String id) {
+        XmlCursor cursor = ctp.newCursor();
+        try {
+            int depth = 0;
+            XmlCursor.TokenType token = cursor.toFirstContentToken();
+            while (token != null && !token.isNone()) {
+                if (token.isStart()) {
+                    depth++;
+                    QName name = cursor.getName();
+                    if (name != null && COMMENT_MARKUP.contains(name.getLocalPart())
+                            && id.equals(trimOf(cursor.getAttributeText(QNAME_W_ID)))) {
+                        boolean reference = "commentReference".equals(name.getLocalPart());
+                        cursor.removeXml();
+                        if (reference) {
+                            dropRunWithoutContent(cursor);
+                        }
+                        return 1;
+                    }
+                } else if (token.isEnd()) {
+                    if (depth == 0) {
+                        break;
+                    }
+                    depth--;
+                }
+                token = cursor.toNextToken();
+            }
+        } finally {
+            cursor.dispose();
+        }
+        return 0;
+    }
+
+    /**
+     * A run whose only content was the reference would stay behind as an empty run and show up in
+     * {@code getRuns()} forever, so it goes with the reference. Formatting ({@code w:rPr}) is not
+     * content, and anything else (text, break, picture, field) keeps the run alive.
+     */
+    private static void dropRunWithoutContent(XmlCursor whereMarkupWas) {
+        try {
+            if (!whereMarkupWas.toParent()) {
+                return;
+            }
+            QName at = whereMarkupWas.getName();
+            if (at == null || !"r".equals(at.getLocalPart())) {
+                return;
+            }
+            XmlCursor probe = whereMarkupWas.newCursor();
+            boolean hasContent = false;
+            try {
+                int depth = 0;
+                XmlCursor.TokenType token = probe.toFirstContentToken();
+                while (token != null && !token.isNone()) {
+                    if (token.isStart()) {
+                        depth++;
+                        QName child = probe.getName();
+                        if (child != null && !"rPr".equals(child.getLocalPart())) {
+                            hasContent = true;
+                            break;
+                        }
+                    } else if (token.isEnd()) {
+                        if (depth == 0) {
+                            break;
+                        }
+                        depth--;
+                    } else if (token.isText() && !probe.getTextValue().trim().isEmpty()) {
+                        hasContent = true;
+                        break;
+                    }
+                    token = probe.toNextToken();
+                }
+            } finally {
+                probe.dispose();
+            }
+            if (!hasContent) {
+                whereMarkupWas.removeXml();
+            }
+        } catch (RuntimeException ignored) {
+            // the comment is gone already; a leftover empty run is cosmetic, not damage
+        }
+    }
+
     /** Header/footer parts of one kind, keyed by part name (/word/footer2.xml). */
     private static Map<String, XWPFHeaderFooter> partsByName(
             List<? extends XWPFHeaderFooter> parts, String kind) {
@@ -1939,13 +2521,26 @@ public class DocxToolBox {
                     + MAX_TABLE_COLS + ", but was: " + cols);
         }
         XWPFTable table = doc.createTable(rows, cols);
+        // POI's createEmptyTable writes a tblW and six single tblBorders, and the tblGrid it
+        // would add is commented out in its source (XWPFTable.java:191-216, measured in the
+        // file): a created table has no column grid at all. Every width and every gridSpan is
+        // measured on that grid, so a table of this toolbox always gets one.
+        ensureGrid(table, cols);
 
         String style = optString("createTable", options, "style", null);
         if (style != null) {
             table.setStyleID(resolveStyleId("createTable", doc, style));
         }
         String borders = optString("createTable", options, "borders", "single");
-        if (!"none".equalsIgnoreCase(borders)) {
+        if ("none".equalsIgnoreCase(borders)) {
+            // "none" has to silence the table-level grid POI wrote as well, or the option stays
+            // a lie and the file shows lines anyway (§1.2: "still wirkungslos")
+            Map<String, Object> silent = new LinkedHashMap<>();
+            for (String edge : TABLE_BORDER_EDGES) {
+                silent.put(edge, "none");
+            }
+            setTableBorders(table, silent);
+        } else {
             STBorder.Enum borderStyle;
             if ("single".equalsIgnoreCase(borders)) {
                 borderStyle = STBorder.SINGLE;
@@ -1957,7 +2552,7 @@ public class DocxToolBox {
             }
             for (int i = 0; i < table.getRows().size(); i++) {
                 for (XWPFTableCell cell : table.getRows().get(i).getTableCells()) {
-                    setCellBorders(cell, borderStyle);
+                    applyCellBorderStyle(cell, borderStyle);
                 }
             }
         }
@@ -2283,10 +2878,17 @@ public class DocxToolBox {
         if (cell.getColor() != null) {
             cm.put("shading", cell.getColor());
         }
-        // Bewusst keine Zellbreite gemeldet: POIs XWPFTableCell.getWidth() liest die Union
-        // ST_MeasurementOrPercent und läuft in eine NullPointerException, sobald das w:tcW aus
-        // XWPFTable.createRow() oder einer tcPr-Kopie stammt (in JsDocxTest beobachtet).
-        // Breite kommt ins Leseprofil, wenn Aufgabe 7 sie selbst schreibt und validiert.
+        // Width, vertical alignment and the four edges: the read side of the setters of §9.8.
+        // Read from w:tcPr directly - POI's getWidth() dereferences the w:tcW union and its
+        // getVerticalAlignment() the w:vAlign value, both of which can be absent (§1.3).
+        Measure cellWidth = measureOf(tcPr == null || !tcPr.isSetTcW() ? null : tcPr.getTcW());
+        cm.put("widthCm", cellWidth.cm());
+        cm.put("widthPct", cellWidth.pct());
+        cm.put("widthType", cellWidth.type());
+        cm.put("valign", tcPr == null || !tcPr.isSetVAlign() || tcPr.getVAlign() == null
+                || tcPr.getVAlign().getVal() == null
+                ? null : strOf(tcPr.getVAlign().getVal()));
+        cm.put("borders", cellBordersOf(tcPr));
         if (!cell.getParagraphs().isEmpty()) {
             var alignment = cell.getParagraphs().get(0).getAlignment();
             cm.put("align", alignment == null ? null : alignment.name().toLowerCase(Locale.ROOT));
@@ -2406,8 +3008,8 @@ public class DocxToolBox {
      * that to {@code forString()} yields null, which XmlBeans then stores as an empty string
      * (and rejects with XmlValueOutOfRange the moment the document is written).
      */
-    private static void setCellBorders(XWPFTableCell cell, STBorder.Enum style) {
-        CTTcPr tcPr = cell.getCTTc().isSetTcPr() ? cell.getCTTc().getTcPr() : cell.getCTTc().addNewTcPr();
+    private static void applyCellBorderStyle(XWPFTableCell cell, STBorder.Enum style) {
+        CTTcPr tcPr = tcPrOf(cell);
         CTTcBorders borders = tcPr.isSetTcBorders() ? tcPr.getTcBorders() : tcPr.addNewTcBorders();
         applyBorder(borders.isSetTop() ? borders.getTop() : borders.addNewTop(), style);
         applyBorder(borders.isSetBottom() ? borders.getBottom() : borders.addNewBottom(), style);
@@ -2421,13 +3023,12 @@ public class DocxToolBox {
         border.setSpace(BigInteger.valueOf(0));
     }
 
-    /** Sets the column grid and every cell width from entries like "4.5cm", "25%", "auto". */
-    private void applyWidths(XWPFTable table, List<String> widths) {
-        int cols = columnCount(table);
-        if (widths.size() != cols) {
-            throw new PoiUserRuntimeException("createTable: option 'widths' has " + widths.size()
-                    + " entries, the table has " + cols + " columns");
-        }
+    /**
+     * The column grid of a table, created with {@code cols} width-less columns when the table
+     * has none (POI writes none, see {@link #createTable}). Callers that only count columns go
+     * through {@link #columnCount(XWPFTable)} and never create anything.
+     */
+    private static CTTblGrid ensureGrid(XWPFTable table, int cols) {
         var ctTbl = table.getCTTbl();
         var grid = ctTbl.getTblGrid() != null ? ctTbl.getTblGrid() : ctTbl.addNewTblGrid();
         while (grid.sizeOfGridColArray() < cols) {
@@ -2436,6 +3037,17 @@ public class DocxToolBox {
         while (grid.sizeOfGridColArray() > cols) {
             grid.removeGridCol(grid.sizeOfGridColArray() - 1);
         }
+        return grid;
+    }
+
+    /** Sets the column grid and every cell width from entries like "4.5cm", "25%", "auto". */
+    private void applyWidths(XWPFTable table, List<String> widths) {
+        int cols = columnCount(table);
+        if (widths.size() != cols) {
+            throw new PoiUserRuntimeException("createTable: option 'widths' has " + widths.size()
+                    + " entries, the table has " + cols + " columns");
+        }
+        var grid = ensureGrid(table, cols);
         for (int c = 0; c < cols; c++) {
             String spec = widths.get(c);
             if (spec == null || "auto".equalsIgnoreCase(spec)) {
@@ -2479,6 +3091,1006 @@ public class DocxToolBox {
                     }
                 }
             }
+        }
+    }
+
+    // ========================================================================
+    // Writing: table fine-tuning (M2, Aufgabe 7 - docs/js/docx.md §9.8)
+    // ========================================================================
+    //
+    // Every write below goes through a typed XmlBeans accessor or a POI setter, never through
+    // an index insert. Where the schema is a sequence - w:tblPr (tblStyle, tblW, jc,
+    // tblCellSpacing, tblInd, tblBorders, shd, tblLayout, tblCellMar, tblLook) and w:tcPr (tcW,
+    // gridSpan, hMerge, vMerge, tcBorders, shd, vAlign) - XmlBeans puts the children in schema
+    // order by itself, whatever order the calls came in (measured: written tcW, gridSpan, vMerge,
+    // vAlign, shd - read back as tcW, gridSpan, vMerge, shd, vAlign). w:trPr is the exception:
+    // CT_TrPrBase is an xsd:choice with maxOccurs unbounded (that is why the generated interface
+    // has getTrHeightList() and insertNewTrHeight(int) at all), so there the call order decides
+    // the file order - valid OOXML either way, but no promise a reader may rely on (§10.7).
+    //
+    // Reading is the other way round. The measures and colours of this area are XmlBeans
+    // *unions* (w:tblW/@w, w:tcW/@w, w:trHeight/@val, w:tblHeader/@val, border/@color): their
+    // typed getter hands back an Object and POI's own readers meet the missing union member
+    // with a NullPointerException (measured, §1.3), so every one of them is read here as the
+    // literal attribute text through an XmlCursor - what the file actually says.
+
+    /** Border edges of a table ({@code w:tblBorders}); a cell knows only the four outer ones. */
+    private static final String[] TABLE_BORDER_EDGES = {"top", "left", "bottom", "right",
+            "insideH", "insideV"};
+
+    /** Border edges of one cell ({@code w:tcPr/w:tcBorders}). */
+    private static final String[] CELL_BORDER_EDGES = {"top", "left", "bottom", "right"};
+
+    /** Option keys of a single border. */
+    private static final String[] BORDER_KEYS = {"style", "widthPt", "spacePt", "color"};
+
+    /** Styles the border setters accept; each maps onto an {@code STBorder} constant (§1.3). */
+    private static final String[] BORDER_STYLES = {"none", "single", "thick", "double", "dotted",
+            "dashed", "dotDash", "dotDotDash", "triple", "wave", "inset", "outset"};
+
+    /** Values of {@code w:tblPr/w:jc}; "none" drops the own value and lets the style decide. */
+    private static final String[] TABLE_ALIGNMENTS = {"left", "start", "center", "right", "end",
+            "none"};
+
+    /** Option keys of {@link #setRowHeight(String, int, int, Map)}. */
+    private static final String[] ROW_HEIGHT_KEYS = {"heightCm", "rule"};
+
+    /** w:sz of a border counts eighth-points; Word accepts 1..158 of them (0.125..19.75 pt). */
+    private static final double MIN_BORDER_PT = 0.125;
+    private static final double MAX_BORDER_PT = 19.75;
+
+    /** Width the border setters write when the caller names none (the 0.5 pt grid line). */
+    private static final double DEFAULT_BORDER_PT = 0.5;
+
+    /** Largest gap a border asks for - w:space is measured in points, not eighth-points. */
+    private static final double MAX_BORDER_SPACE_PT = 31.0;
+
+    /** Widths and row heights the table setters accept, in cm. */
+    private static final double MIN_TABLE_CM = 0.01;
+    private static final double MAX_TABLE_CM = 60.0;
+
+    /** A width element as the file has it: centimetres for dxa, percent for pct, plus the type. */
+    private record Measure(Double cm, Double pct, String type) { }
+
+    /** The measure of a width element that is not there - no key may claim a number for it. */
+    private static final Measure MEASURE_NONE = new Measure(null, null, null);
+
+    /**
+     * Table-level properties in one map: the read partner of the setters of this section and
+     * the shape they answer with. Every key is present; something the file does not carry is
+     * null, never a number (§9.4).
+     */
+    private Map<String, Object> tableProps(XWPFTable table) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        var ctTbl = table.getCTTbl();
+        var tblPr = ctTbl == null ? null : ctTbl.getTblPr();
+        m.put("rowCount", table.getRows().size());
+        m.put("alignment", alignmentOf(tblPr));
+        Measure width = measureOf(tblPr == null || !tblPr.isSetTblW() ? null : tblPr.getTblW());
+        m.put("widthCm", width.cm());
+        m.put("widthPct", width.pct());
+        m.put("widthType", width.type());
+        m.put("layout", tblPr != null && tblPr.isSetTblLayout() && tblPr.getTblLayout() != null
+                ? strOf(tblPr.getTblLayout().getType()) : null);
+        m.put("borders", tableBordersOf(tblPr));
+        m.put("rowHeights", rowHeightsOf(table));
+        m.put("repeatHeaderRows", repeatHeaderRowsOf(table));
+        m.put("cantSplitRows", cantSplitRowsOf(table));
+        var grid = ctTbl == null ? null : ctTbl.getTblGrid();   // CTTbl has no isSetTblGrid()
+        m.put("gridCols", grid == null ? null : grid.sizeOfGridColArray());
+        m.put("gridColCm", gridColWidthsOf(ctTbl));
+        return m;
+    }
+
+    /**
+     * Describes one table the way {@link #getTables(String)} does, but without the cell text:
+     * alignment, width, layout, borders, row heights, repeated header rows and the grid.
+     * @param docHandle document handle
+     * @param tableIndex 0-based table index
+     * @return JSON-compatible Map
+     */
+    public Map<String, Object> getTableProps(String docHandle, int tableIndex) {
+        return tableProps(requireTable(docHandle, tableIndex));
+    }
+
+    /** Overload of {@link #getTableProps(String, int)} by table handle. */
+    public Map<String, Object> getTablePropsByHandle(String docHandle, String tableHandle) {
+        return tableProps(requireTableByHandle(tableHandle));
+    }
+
+    /**
+     * Horizontal alignment of a whole table ({@code w:tblPr/w:jc}) - written by POI's own
+     * setter, which maps the value onto {@code ST_JcTable} (the paragraph spelling
+     * {@code ST_Jc} is a different simpleType and would be rejected on save).
+     *
+     * @param docHandle document handle
+     * @param tableIndex 0-based table index
+     * @param alignment {@code "left"|"start"|"center"|"right"|"end"}; {@code "none"} removes
+     *                  the own value, so the table style decides again
+     * @return the table properties as they stand now
+     */
+    public Map<String, Object> setTableAlignment(String docHandle, int tableIndex,
+                                                 String alignment) {
+        return setTableAlignment(requireTable(docHandle, tableIndex), alignment);
+    }
+
+    /** Overload of {@link #setTableAlignment(String, int, String)} by table handle. */
+    public Map<String, Object> setTableAlignmentByHandle(String docHandle, String tableHandle,
+                                                         String alignment) {
+        return setTableAlignment(requireTableByHandle(tableHandle), alignment);
+    }
+
+    private Map<String, Object> setTableAlignment(XWPFTable table, String alignment) {
+        TableRowAlign value = tableAlign("setTableAlignment", alignment);
+        if (value == null) {
+            table.removeTableAlignment();
+        } else {
+            table.setTableAlignment(value);
+        }
+        return tableProps(table);
+    }
+
+    /**
+     * Alignment name -> POI's {@code TableRowAlign}, which carries the {@code ST_JcTable}
+     * numbers and not the paragraph ones (that mapping is POI's own, measured in its source).
+     * {@code "none"} becomes null: no own value, so the table style's alignment counts (D1).
+     */
+    private static TableRowAlign tableAlign(String fn, String value) {
+        if (value == null) {
+            throw new PoiUserRuntimeException(fn + ": argument 'alignment' must be one of "
+                    + String.join(", ", TABLE_ALIGNMENTS) + ", but was: null. See docx.help().");
+        }
+        return switch (value.toLowerCase(Locale.ROOT)) {
+            case "left" -> TableRowAlign.LEFT;
+            case "start" -> TableRowAlign.START;
+            case "center", "centre", "mitte" -> TableRowAlign.CENTER;
+            case "right" -> TableRowAlign.RIGHT;
+            case "end" -> TableRowAlign.END;
+            case "none", "auto" -> null;
+            default -> throw new PoiUserRuntimeException(fn + ": unknown alignment '" + value
+                    + "' (valid: " + String.join(", ", TABLE_ALIGNMENTS)
+                    + "). See docx.help().");
+        };
+    }
+
+    /**
+     * Width of the table itself ({@code w:tblPr/w:tblW}). A percentage is written the way Word
+     * stores it - fiftieths of a percent, {@code "100%"} becomes {@code w:w="5000"} with
+     * {@code w:type="pct"} (measured in Ribbeck) - a length becomes twips with
+     * {@code w:type="dxa"}.
+     * <p>
+     * Widths only take effect when the layout is fixed: LibreOffice writes
+     * {@code w:tblLayout w:type="fixed"} next to them, {@code "autofit"} lets the viewer
+     * recompute every column and ignore the values (docs/js/docx.md §9.8, use
+     * {@link #setTableLayout(String, int, String)}).
+     * </p>
+     * @param spec {@code "16cm"}, {@code "100%"} or {@code "auto"}
+     * @return the table properties as they stand now
+     */
+    public Map<String, Object> setTableWidth(String docHandle, int tableIndex, String spec) {
+        return setTableWidth(requireTable(docHandle, tableIndex), spec);
+    }
+
+    /** Overload of {@link #setTableWidth(String, int, String)} by table handle. */
+    public Map<String, Object> setTableWidthByHandle(String docHandle, String tableHandle,
+                                                     String spec) {
+        return setTableWidth(requireTableByHandle(tableHandle), spec);
+    }
+
+    private Map<String, Object> setTableWidth(XWPFTable table, String spec) {
+        String fn = "setTableWidth";
+        CTTblPr tblPr = tblPrOf(table);
+        CTTblWidth width = tblPr.isSetTblW() && tblPr.getTblW() != null
+                ? tblPr.getTblW() : tblPr.addNewTblW();
+        applyMeasure(fn, "spec", width, spec);
+        return tableProps(table);
+    }
+
+    /**
+     * Column algorithm of a table: {@code "fixed"} keeps the written widths (what a millimetre
+     * grid such as a note staff needs), {@code "autofit"} lets the viewer measure the content.
+     * @return the table properties as they stand now
+     */
+    public Map<String, Object> setTableLayout(String docHandle, int tableIndex, String layout) {
+        return setTableLayout(requireTable(docHandle, tableIndex), layout);
+    }
+
+    /** Overload of {@link #setTableLayout(String, int, String)} by table handle. */
+    public Map<String, Object> setTableLayoutByHandle(String docHandle, String tableHandle,
+                                                      String layout) {
+        return setTableLayout(requireTableByHandle(tableHandle), layout);
+    }
+
+    private Map<String, Object> setTableLayout(XWPFTable table, String layout) {
+        String fn = "setTableLayout";
+        CTTblPr tblPr = tblPrOf(table);
+        var ctLayout = tblPr.isSetTblLayout() && tblPr.getTblLayout() != null
+                ? tblPr.getTblLayout() : tblPr.addNewTblLayout();
+        ctLayout.setType(switch (layout == null ? "" : layout.toLowerCase(Locale.ROOT)) {
+            case "fixed" -> STTblLayoutType.FIXED;
+            case "autofit", "auto" -> STTblLayoutType.AUTOFIT;
+            default -> throw new PoiUserRuntimeException(fn + ": argument 'layout' must be "
+                    + "\"fixed\" or \"autofit\", but was: '" + layout + "'. See docx.help().");
+        });
+        return tableProps(table);
+    }
+
+    /**
+     * Border of the table itself ({@code w:tblPr/w:tblBorders}): one line per edge, and the
+     * edges are independent - which is what makes a horizontal rule set (top/insideH/bottom
+     * single, left/right/insideV none) buildable at all.
+     * <p>
+     * Each value is a style name or an object {@code {style, widthPt?, spacePt?, color?}}.
+     * A table-level border is only visible where the cells do not paint their own line -
+     * {@link #setCellBorders(String, int, int, int, Map)} wins over it, and
+     * {@code createTable(doc, r, c, {borders: "none"})} keeps the cells silent.
+     * </p>
+     * @param options any of {@code top, left, bottom, right, insideH, insideV}
+     * @return the table properties as they stand now
+     */
+    public Map<String, Object> setTableBorders(String docHandle, int tableIndex,
+                                               Map<String, Object> options) {
+        return setTableBorders(requireTable(docHandle, tableIndex), options);
+    }
+
+    /** Overload of {@link #setTableBorders(String, int, Map)} by table handle. */
+    public Map<String, Object> setTableBordersByHandle(String docHandle, String tableHandle,
+                                                       Map<String, Object> options) {
+        return setTableBorders(requireTableByHandle(tableHandle), options);
+    }
+
+    private Map<String, Object> setTableBorders(XWPFTable table, Map<String, Object> options) {
+        String fn = "setTableBorders";
+        requireKnownOptions(fn, options, TABLE_BORDER_EDGES);
+        requireSomeOptions(fn, options, TABLE_BORDER_EDGES);
+        CTTblPr tblPr = tblPrOf(table);
+        CTTblBorders borders = tblPr.isSetTblBorders() && tblPr.getTblBorders() != null
+                ? tblPr.getTblBorders() : tblPr.addNewTblBorders();
+        for (String edge : TABLE_BORDER_EDGES) {
+            if (!options.containsKey(edge)) {
+                continue;
+            }
+            applyBorderOptions(fn, edge, options.get(edge), newTableBorder(borders, edge));
+        }
+        return tableProps(table);
+    }
+
+    /**
+     * Border of one cell ({@code w:tcPr/w:tcBorders}), edges given one by one like in
+     * {@link #setTableBorders(String, int, Map)} but without the two inside edges - a cell
+     * only touches its neighbours.
+     * @return the cell as {@link #getCellProps(String, int, int, int)} reports it, without a
+     *         new cell handle
+     */
+    public Map<String, Object> setCellBorders(String docHandle, int tableIndex, int rowIndex,
+                                              int colIndex, Map<String, Object> options) {
+        return setCellBorders(requireTable(docHandle, tableIndex), rowIndex, colIndex, options);
+    }
+
+    /** Overload of {@link #setCellBorders(String, int, int, int, Map)} by table handle. */
+    public Map<String, Object> setCellBordersByHandle(String docHandle, String tableHandle,
+                                                      int rowIndex, int colIndex,
+                                                      Map<String, Object> options) {
+        return setCellBorders(requireTableByHandle(tableHandle), rowIndex, colIndex, options);
+    }
+
+    private Map<String, Object> setCellBorders(XWPFTable table, int rowIndex, int colIndex,
+                                               Map<String, Object> options) {
+        String fn = "setCellBorders";
+        requireKnownOptions(fn, options, CELL_BORDER_EDGES);
+        requireSomeOptions(fn, options, CELL_BORDER_EDGES);
+        XWPFTableCell cell = requireCell(table, rowIndex, colIndex);
+        CTTcPr tcPr = tcPrOf(cell);
+        CTTcBorders borders = tcPr.isSetTcBorders() && tcPr.getTcBorders() != null
+                ? tcPr.getTcBorders() : tcPr.addNewTcBorders();
+        for (String edge : CELL_BORDER_EDGES) {
+            if (!options.containsKey(edge)) {
+                continue;
+            }
+            applyBorderOptions(fn, edge, options.get(edge), newCellBorder(borders, edge));
+        }
+        return cellInfo(cell, null, false);
+    }
+
+    /**
+     * Height of one row ({@code w:trPr/w:trHeight}). The rule decides what the value means:
+     * {@code "exact"} clips the content to that height (a 0.3 cm row cuts a 12 pt line off),
+     * {@code "atLeast"} only guarantees it, {@code "auto"} lets the content decide and is
+     * written as {@code w:hRule="auto"} - the element stays in the file, because that is what
+     * the format means by auto.
+     * @param options {@code {heightCm: 0.3, rule: "exact"|"atLeast"|"auto"}}, rule defaults to
+     *                "atLeast"
+     * @return the table properties as they stand now
+     */
+    public Map<String, Object> setRowHeight(String docHandle, int tableIndex, int rowIndex,
+                                           Map<String, Object> options) {
+        return setRowHeight(requireTable(docHandle, tableIndex), rowIndex, options);
+    }
+
+    /** Overload of {@link #setRowHeight(String, int, int, Map)} by table handle. */
+    public Map<String, Object> setRowHeightByHandle(String docHandle, String tableHandle,
+                                                    int rowIndex, Map<String, Object> options) {
+        return setRowHeight(requireTableByHandle(tableHandle), rowIndex, options);
+    }
+
+    private Map<String, Object> setRowHeight(XWPFTable table, int rowIndex,
+                                             Map<String, Object> options) {
+        String fn = "setRowHeight";
+        requireKnownOptions(fn, options, ROW_HEIGHT_KEYS);
+        Double heightCm = optNumber(fn, options, "heightCm", MIN_TABLE_CM, MAX_TABLE_CM, null);
+        if (heightCm == null) {
+            throw new PoiUserRuntimeException(fn + ": option 'heightCm' is needed ("
+                    + MIN_TABLE_CM + ".." + MAX_TABLE_CM + " cm), e.g. "
+                    + "{heightCm: 0.3, rule: \"exact\"}. See docx.help().");
+        }
+        String rule = optString(fn, options, "rule", "atLeast");
+        XWPFTableRow row = requireRow(table, rowIndex);
+        row.setHeight(toTwips(heightCm));
+        row.setHeightRule(switch (rule.toLowerCase(Locale.ROOT)) {
+            case "exact" -> TableRowHeightRule.EXACT;
+            case "atleast", "at-least", "mindestens" -> TableRowHeightRule.AT_LEAST;
+            case "auto" -> TableRowHeightRule.AUTO;
+            default -> throw new PoiUserRuntimeException(fn + ": option 'rule' must be \"exact\", "
+                    + "\"atLeast\" or \"auto\", but was: '" + rule + "'. See docx.help().");
+        });
+        return tableProps(table);
+    }
+
+    /**
+     * Whether a row may be split across pages ({@code w:trPr/w:cantSplit}) - for a millimetre
+     * grid such as a note staff every row should stay whole.
+     * @return the table properties as they stand now
+     */
+    public Map<String, Object> setRowCantSplit(String docHandle, int tableIndex, int rowIndex,
+                                               boolean cantSplit) {
+        return setRowCantSplit(requireTable(docHandle, tableIndex), rowIndex, cantSplit);
+    }
+
+    /** Overload of {@link #setRowCantSplit(String, int, int, boolean)} by table handle. */
+    public Map<String, Object> setRowCantSplitByHandle(String docHandle, String tableHandle,
+                                                       int rowIndex, boolean cantSplit) {
+        return setRowCantSplit(requireTableByHandle(tableHandle), rowIndex, cantSplit);
+    }
+
+    private Map<String, Object> setRowCantSplit(XWPFTable table, int rowIndex, boolean cantSplit) {
+        XWPFTableRow row = requireRow(table, rowIndex);
+        row.setCantSplitRow(cantSplit);
+        return tableProps(table);
+    }
+
+    /**
+     * Repeats the first {@code rows} rows of a table on every page ({@code w:trPr/w:tblHeader}).
+     * The count is the whole story: Word repeats a row only when every row before it is
+     * repeated too, so a setter that took a row index alone could write a flag with no effect.
+     * @param rows 0 switches repeating off (rows that carry no flag are left alone, so the
+     *             file does not fill up with {@code w:tblHeader w:val="off"})
+     * @return the table properties as they stand now
+     */
+    public Map<String, Object> setRepeatHeaderRows(String docHandle, int tableIndex, int rows) {
+        return setRepeatHeaderRows(requireTable(docHandle, tableIndex), rows);
+    }
+
+    /** Overload of {@link #setRepeatHeaderRows(String, int, int)} by table handle. */
+    public Map<String, Object> setRepeatHeaderRowsByHandle(String docHandle, String tableHandle,
+                                                           int rows) {
+        return setRepeatHeaderRows(requireTableByHandle(tableHandle), rows);
+    }
+
+    private Map<String, Object> setRepeatHeaderRows(XWPFTable table, int rows) {
+        String fn = "setRepeatHeaderRows";
+        List<XWPFTableRow> tableRows = table.getRows();
+        if (rows > tableRows.size()) {
+            throw new PoiUserRuntimeException(fn + ": " + rows + " repeated rows for a table with "
+                    + tableRows.size() + " rows");
+        }
+        for (int i = 0; i < tableRows.size(); i++) {
+            XWPFTableRow row = tableRows.get(i);
+            boolean repeat = i < rows;
+            if (repeat) {
+                row.setRepeatHeader(true);
+            } else if (headerFlagOf(row) != null) {
+                row.setRepeatHeader(false);
+            }
+        }
+        return tableProps(table);
+    }
+
+    /**
+     * Width of one cell ({@code w:tcPr/w:tcW}). This does not touch the column grid
+     * ({@code w:tblGrid}) - {@code createTable}'s {@code widths} option writes both, this
+     * setter is for the one cell that has to differ.
+     * @param spec {@code "4.5cm"}, {@code "25%"} or {@code "auto"}
+     * @return the cell as {@link #getCellProps(String, int, int, int)} reports it, without a
+     *         new cell handle
+     */
+    public Map<String, Object> setCellWidth(String docHandle, int tableIndex, int rowIndex,
+                                            int colIndex, String spec) {
+        return setCellWidth(requireTable(docHandle, tableIndex), rowIndex, colIndex, spec);
+    }
+
+    /** Overload of {@link #setCellWidth(String, int, int, int, String)} by table handle. */
+    public Map<String, Object> setCellWidthByHandle(String docHandle, String tableHandle,
+                                                    int rowIndex, int colIndex, String spec) {
+        return setCellWidth(requireTableByHandle(tableHandle), rowIndex, colIndex, spec);
+    }
+
+    private Map<String, Object> setCellWidth(XWPFTable table, int rowIndex, int colIndex,
+                                             String spec) {
+        XWPFTableCell cell = requireCell(table, rowIndex, colIndex);
+        CTTcPr tcPr = tcPrOf(cell);
+        CTTblWidth width = tcPr.isSetTcW() && tcPr.getTcW() != null
+                ? tcPr.getTcW() : tcPr.addNewTcW();
+        applyMeasure("setCellWidth", "spec", width, spec);
+        return cellInfo(cell, null, false);
+    }
+
+    /**
+     * Background of one cell ({@code w:tcPr/w:shd}) without touching its text - the setter form
+     * of {@code setCellText}'s {@code shading} option.
+     * @param hex 6 hex digits, with or without a leading '#'
+     * @return the cell as {@link #getCellProps(String, int, int, int)} reports it, without a
+     *         new cell handle
+     */
+    public Map<String, Object> setCellShading(String docHandle, int tableIndex, int rowIndex,
+                                              int colIndex, String hex) {
+        return setCellShading(requireTable(docHandle, tableIndex), rowIndex, colIndex, hex);
+    }
+
+    /** Overload of {@link #setCellShading(String, int, int, int, String)} by table handle. */
+    public Map<String, Object> setCellShadingByHandle(String docHandle, String tableHandle,
+                                                      int rowIndex, int colIndex, String hex) {
+        return setCellShading(requireTableByHandle(tableHandle), rowIndex, colIndex, hex);
+    }
+
+    private Map<String, Object> setCellShading(XWPFTable table, int rowIndex, int colIndex,
+                                               String hex) {
+        XWPFTableCell cell = requireCell(table, rowIndex, colIndex);
+        cell.setColor(requireHex("setCellShading", "shading", hex));
+        return cellInfo(cell, null, false);
+    }
+
+    /**
+     * Vertical alignment inside one cell, the setter form of {@code setCellText}'s
+     * {@code valign} option. POI's own {@code setVerticalAlignment} appends a second
+     * {@code w:vAlign} on every call, so this writes the element itself (§9.8).
+     * @param valign {@code "top"|"center"|"bottom"|"both"}
+     * @return the cell as {@link #getCellProps(String, int, int, int)} reports it, without a
+     *         new cell handle
+     */
+    public Map<String, Object> setCellValign(String docHandle, int tableIndex, int rowIndex,
+                                             int colIndex, String valign) {
+        return setCellValign(requireTable(docHandle, tableIndex), rowIndex, colIndex, valign);
+    }
+
+    /** Overload of {@link #setCellValign(String, int, int, int, String)} by table handle. */
+    public Map<String, Object> setCellValignByHandle(String docHandle, String tableHandle,
+                                                     int rowIndex, int colIndex, String valign) {
+        return setCellValign(requireTableByHandle(tableHandle), rowIndex, colIndex, valign);
+    }
+
+    private Map<String, Object> setCellValign(XWPFTable table, int rowIndex, int colIndex,
+                                              String valign) {
+        XWPFTableCell cell = requireCell(table, rowIndex, colIndex);
+        CTTcPr tcPr = tcPrOf(cell);
+        var vAlign = tcPr.isSetVAlign() && tcPr.getVAlign() != null
+                ? tcPr.getVAlign() : tcPr.addNewVAlign();
+        vAlign.setVal(switch (valign == null ? "" : valign.toLowerCase(Locale.ROOT)) {
+            case "top" -> STVerticalJc.TOP;
+            case "center", "centre", "middle" -> STVerticalJc.CENTER;
+            case "bottom" -> STVerticalJc.BOTTOM;
+            case "both" -> STVerticalJc.BOTH;
+            default -> throw new PoiUserRuntimeException("setCellValign: argument 'valign' must be "
+                    + "\"top\", \"center\", \"bottom\" or \"both\", but was: '" + valign
+                    + "'. See docx.help().");
+        });
+        return cellInfo(cell, null, false);
+    }
+
+    /**
+     * Merges a rectangular area into one cell: {@code w:gridSpan} across the columns,
+     * {@code w:vMerge restart/continue} down the rows - the two spellings Word and LibreOffice
+     * write (the legacy {@code w:hMerge} is not touched, D1).
+     * <p>
+     * A cell that would be covered by the merge and still holds text is an error, in both
+     * directions: the horizontal merge deletes the cell, the vertical one only hides it, and
+     * in both cases the caller would lose sight of the text. Move it with
+     * {@link #setCellText(String, int, int, int, String, Map)} first.
+     * Merging into an area that is already merged is refused for the same reason - the column
+     * indices of a row with a merged cell no longer match the grid.
+     * </p>
+     * @return {@code {merged, from, to, colSpan, rowSpan, cellsRemoved, rowHeights}} - the
+     *         counts say what happened, {@code getTables()}/{@code getCellProps} read it back
+     */
+    public Map<String, Object> mergeCells(String docHandle, int tableIndex, int fromRow,
+                                         int fromCol, int toRow, int toCol) {
+        return mergeCells(requireTable(docHandle, tableIndex), fromRow, fromCol, toRow, toCol);
+    }
+
+    /** Overload of {@link #mergeCells(String, int, int, int, int, int)} by table handle. */
+    public Map<String, Object> mergeCellsByHandle(String docHandle, String tableHandle, int fromRow,
+                                                  int fromCol, int toRow, int toCol) {
+        return mergeCells(requireTableByHandle(tableHandle), fromRow, fromCol, toRow, toCol);
+    }
+
+    private Map<String, Object> mergeCells(XWPFTable table, int fromRow, int fromCol, int toRow,
+                                           int toCol) {
+        String fn = "mergeCells";
+        if (fromRow > toRow || fromCol > toCol) {
+            throw new PoiUserRuntimeException(fn + ": the area must run left-to-right and "
+                    + "top-to-bottom, but was (" + fromRow + "," + fromCol + ") to ("
+                    + toRow + "," + toCol + ")");
+        }
+        if (fromRow == toRow && fromCol == toCol) {
+            throw new PoiUserRuntimeException(fn + ": one cell is not a merge - 'toRow' or 'toCol'"
+                    + " must be greater than the start cell");
+        }
+        List<XWPFTableRow> rows = table.getRows();
+        for (int r = fromRow; r <= toRow; r++) {
+            XWPFTableRow row = requireRow(table, r);
+            if (hasMergedCell(row)) {
+                throw new PoiUserRuntimeException(fn + ": row " + r + " already contains a merged"
+                        + " cell - its column indices no longer match the grid");
+            }
+            int cells = row.getTableCells().size();
+            if (toCol >= cells) {
+                throw new PoiUserRuntimeException(fn + ": column index out of range: " + toCol
+                        + " (valid range: 0.." + (cells - 1) + " in row " + r + ")");
+            }
+            for (int c = (r == fromRow ? fromCol + 1 : fromCol); c <= toCol; c++) {
+                String text = nullToEmpty(row.getTableCells().get(c).getText()).trim();
+                if (!text.isEmpty()) {
+                    throw new PoiUserRuntimeException(fn + ": cell (" + r + "," + c + ") holds \""
+                            + text + "\" and the merge would hide it - move the text first");
+                }
+            }
+        }
+        int colSpan = toCol - fromCol + 1;
+        int removed = 0;
+        for (int r = fromRow; r <= toRow; r++) {
+            XWPFTableRow row = rows.get(r);
+            for (int c = toCol; c > fromCol; c--) {
+                row.removeCell(c);
+                removed++;
+            }
+            CTTcPr tcPr = tcPrOf(row.getCell(fromCol));
+            var gridSpan = tcPr.isSetGridSpan() && tcPr.getGridSpan() != null
+                    ? tcPr.getGridSpan() : tcPr.addNewGridSpan();
+            gridSpan.setVal(BigInteger.valueOf(colSpan));
+            if (r > fromRow) {
+                vMergeOf(tcPr).setVal(STMerge.CONTINUE);
+            } else if (toRow > fromRow) {
+                vMergeOf(tcPr).setVal(STMerge.RESTART);
+            }
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("merged", Boolean.TRUE);
+        result.put("from", Map.of("row", fromRow, "col", fromCol));
+        result.put("to", Map.of("row", toRow, "col", toCol));
+        result.put("colSpan", colSpan);
+        result.put("rowSpan", toRow - fromRow + 1);
+        result.put("cellsRemoved", removed);
+        LOG.info("Merged {}x{} at ({},{}) in a table of {}", toRow - fromRow + 1, colSpan,
+                fromRow, fromCol, table.getRows().size());
+        return result;
+    }
+
+    /** {@code w:vMerge} of a cell, created when the cell has none yet. */
+    private static CTVMerge vMergeOf(CTTcPr tcPr) {
+        return tcPr.isSetVMerge() && tcPr.getVMerge() != null
+                ? tcPr.getVMerge() : tcPr.addNewVMerge();
+    }
+
+    // ------------------------------------------------------------------------
+    // Table properties: reading and writing of the shared pieces
+    // ------------------------------------------------------------------------
+
+    /** {@code w:tblPr} of a table, created when the table has none (POI does the same). */
+    private static CTTblPr tblPrOf(XWPFTable table) {
+        var ctTbl = table.getCTTbl();
+        return ctTbl.getTblPr() != null ? ctTbl.getTblPr() : ctTbl.addNewTblPr();
+    }
+
+    /** {@code w:tcPr} of a cell, created when the cell has none. */
+    private static CTTcPr tcPrOf(XWPFTableCell cell) {
+        return cell.getCTTc().isSetTcPr() && cell.getCTTc().getTcPr() != null
+                ? cell.getCTTc().getTcPr() : cell.getCTTc().addNewTcPr();
+    }
+
+    private static XWPFTableRow requireRow(XWPFTable table, int rowIndex) {
+        List<XWPFTableRow> rows = table.getRows();
+        if (rowIndex < 0 || rowIndex >= rows.size()) {
+            throw new PoiUserRuntimeException("Row index out of range: " + rowIndex
+                    + " (valid range: 0.." + (rows.size() - 1) + ")");
+        }
+        return rows.get(rowIndex);
+    }
+
+    /** One more option-key check: an options object that names nothing is a mistake, not a no-op. */
+    private static void requireSomeOptions(String fn, Map<String, Object> options, String... known) {
+        if (options == null || options.isEmpty()) {
+            throw new PoiUserRuntimeException(fn + ": at least one of ("
+                    + String.join(", ", known) + ") is needed. See docx.help().");
+        }
+    }
+
+    /** Writes one {@code w:tblW}/{@code w:tcW} pair from "16cm", "100%" or "auto". */
+    private static void applyMeasure(String fn, String name, CTTblWidth target, String spec) {
+        String value = spec == null ? "" : spec.trim();
+        if (value.isEmpty()) {
+            throw new PoiUserRuntimeException(fn + ": argument '" + name + "' must be \"16cm\", "
+                    + "\"100%\" or \"auto\", but was: '" + spec + "'. See docx.help().");
+        }
+        if ("auto".equalsIgnoreCase(value)) {
+            target.setType(STTblWidth.AUTO);
+            target.setW(BigInteger.ZERO);
+            return;
+        }
+        if (value.endsWith("%")) {
+            int pct = parsePercent(fn, name, value);
+            // Word keeps a percentage as fiftieths of a percent: 5000 means 100 % (Ribbeck)
+            target.setType(STTblWidth.PCT);
+            target.setW(BigInteger.valueOf(Math.round(pct * 50.0)));
+            return;
+        }
+        double cm = parseCm(fn, name, value);
+        if (cm < MIN_TABLE_CM || cm > MAX_TABLE_CM) {
+            throw new PoiUserRuntimeException(fn + ": argument '" + name + "' must be between "
+                    + MIN_TABLE_CM + " and " + MAX_TABLE_CM + " cm, but was: '" + spec + "'");
+        }
+        target.setType(STTblWidth.DXA);
+        target.setW(twipsOf(cm));
+    }
+
+    /**
+     * Writes one border element. The style always lands (it is the whole point of the call),
+     * the width defaults to 0.5 pt - the line the {@code createTable} grid uses, and to 0 for
+     * {@code style: "none"}, which is how Word writes a border that asks for no line at all.
+     * The object describes the edge completely: a value the call does not name goes back to its
+     * default instead of quietly surviving from an earlier call.
+     */
+    private static void applyBorderOptions(String fn, String edge, Object value, CTBorder border) {
+        String named = fn + "." + edge;
+        Map<String, Object> options = borderOptions(named, value);
+        requireKnownOptions(named, options, BORDER_KEYS);
+        STBorder.Enum style = borderStyle(named, optString(named, options, "style", null));
+        border.setVal(style);
+        Double widthPt = optNumber(named, options, "widthPt", MIN_BORDER_PT, MAX_BORDER_PT, null);
+        double points = widthPt != null ? widthPt
+                : (STBorder.NONE.equals(style) ? 0.0 : DEFAULT_BORDER_PT);
+        border.setSz(BigInteger.valueOf(Math.round(points * 8.0)));
+        Double spacePt = optNumber(named, options, "spacePt", 0.0, MAX_BORDER_SPACE_PT, null);
+        border.setSpace(BigInteger.valueOf(Math.round(spacePt == null ? 0.0 : spacePt)));
+        String color = optString(named, options, "color", null);
+        if (color == null) {
+            removeAttr(border, "color");
+        } else {
+            border.setColor(requireHex(named, "color", color));
+        }
+    }
+
+    /** A border option is either the style name or an object; anything else is shown, not guessed. */
+    private static Map<String, Object> borderOptions(String named, Object value) {
+        if (value instanceof String style) {
+            return Map.of("style", style);
+        }
+        if (value instanceof Map<?, ?> map) {
+            Map<String, Object> options = new LinkedHashMap<>();
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                options.put(String.valueOf(entry.getKey()), entry.getValue());
+            }
+            return options;
+        }
+        throw new PoiUserRuntimeException(named + ": a border must be a style name (\"single\") or"
+                + " an object {style, widthPt, spacePt, color}, but was: '" + value
+                + "'. See docx.help().");
+    }
+
+    /** Style name -> {@code STBorder} constant; the constants are used directly (§1.3). */
+    private static STBorder.Enum borderStyle(String named, String value) {
+        if (value == null) {
+            throw new PoiUserRuntimeException(named + ": option 'style' is needed (known: "
+                    + String.join(", ", BORDER_STYLES) + "). See docx.help().");
+        }
+        for (String style : BORDER_STYLES) {
+            if (!style.equalsIgnoreCase(value)) {
+                continue;
+            }
+            return switch (style) {
+                case "none" -> STBorder.NONE;
+                case "single" -> STBorder.SINGLE;
+                case "thick" -> STBorder.THICK;
+                case "double" -> STBorder.DOUBLE;
+                case "dotted" -> STBorder.DOTTED;
+                case "dashed" -> STBorder.DASHED;
+                case "dotDash" -> STBorder.DOT_DASH;
+                case "dotDotDash" -> STBorder.DOT_DOT_DASH;
+                case "triple" -> STBorder.TRIPLE;
+                case "wave" -> STBorder.WAVE;
+                default -> value.equalsIgnoreCase("inset") ? STBorder.INSET : STBorder.OUTSET;
+            };
+        }
+        throw new PoiUserRuntimeException(named + ": unknown border style '" + value + "' (known: "
+                + String.join(", ", BORDER_STYLES) + "). See docx.help().");
+    }
+
+    /** The {@code CTBorder} of one table edge, created when it is missing. */
+    private static CTBorder newTableBorder(CTTblBorders borders, String edge) {
+        return switch (edge) {
+            case "top" -> borders.isSetTop() && borders.getTop() != null
+                    ? borders.getTop() : borders.addNewTop();
+            case "left" -> borders.isSetLeft() && borders.getLeft() != null
+                    ? borders.getLeft() : borders.addNewLeft();
+            case "bottom" -> borders.isSetBottom() && borders.getBottom() != null
+                    ? borders.getBottom() : borders.addNewBottom();
+            case "right" -> borders.isSetRight() && borders.getRight() != null
+                    ? borders.getRight() : borders.addNewRight();
+            case "insideH" -> borders.isSetInsideH() && borders.getInsideH() != null
+                    ? borders.getInsideH() : borders.addNewInsideH();
+            default -> borders.isSetInsideV() && borders.getInsideV() != null
+                    ? borders.getInsideV() : borders.addNewInsideV();
+        };
+    }
+
+    /** The {@code CTBorder} of one cell edge, created when it is missing. */
+    private static CTBorder newCellBorder(CTTcBorders borders, String edge) {
+        return switch (edge) {
+            case "top" -> borders.isSetTop() && borders.getTop() != null
+                    ? borders.getTop() : borders.addNewTop();
+            case "left" -> borders.isSetLeft() && borders.getLeft() != null
+                    ? borders.getLeft() : borders.addNewLeft();
+            case "bottom" -> borders.isSetBottom() && borders.getBottom() != null
+                    ? borders.getBottom() : borders.addNewBottom();
+            default -> borders.isSetRight() && borders.getRight() != null
+                    ? borders.getRight() : borders.addNewRight();
+        };
+    }
+
+    /** {@code w:tblPr/w:jc} as the file has it; null when the table carries no own alignment. */
+    private static String alignmentOf(CTTblPr tblPr) {
+        if (tblPr == null || !tblPr.isSetJc() || tblPr.getJc() == null) {
+            return null;
+        }
+        return strOf(tblPr.getJc().getVal());
+    }
+
+    /** All six table edges, each one an object or null - the key is never missing. */
+    private static Map<String, Object> tableBordersOf(CTTblPr tblPr) {
+        CTTblBorders borders = tblPr == null || !tblPr.isSetTblBorders() ? null
+                : tblPr.getTblBorders();
+        Map<String, Object> edges = new LinkedHashMap<>();
+        for (String edge : TABLE_BORDER_EDGES) {
+            edges.put(edge, borderEntry(borders == null ? null : tableBorderOf(borders, edge)));
+        }
+        return edges;
+    }
+
+    /** The four cell edges of one {@code w:tcPr}. */
+    private static Map<String, Object> cellBordersOf(CTTcPr tcPr) {
+        CTTcBorders borders = tcPr == null || !tcPr.isSetTcBorders() ? null : tcPr.getTcBorders();
+        Map<String, Object> edges = new LinkedHashMap<>();
+        for (String edge : CELL_BORDER_EDGES) {
+            edges.put(edge, borderEntry(borders == null ? null : cellBorderOf(borders, edge)));
+        }
+        return edges;
+    }
+
+    private static CTBorder tableBorderOf(CTTblBorders borders, String edge) {
+        return switch (edge) {
+            case "top" -> borders.isSetTop() ? borders.getTop() : null;
+            case "left" -> borders.isSetLeft() ? borders.getLeft() : null;
+            case "bottom" -> borders.isSetBottom() ? borders.getBottom() : null;
+            case "right" -> borders.isSetRight() ? borders.getRight() : null;
+            case "insideH" -> borders.isSetInsideH() ? borders.getInsideH() : null;
+            default -> borders.isSetInsideV() ? borders.getInsideV() : null;
+        };
+    }
+
+    private static CTBorder cellBorderOf(CTTcBorders borders, String edge) {
+        return switch (edge) {
+            case "top" -> borders.isSetTop() ? borders.getTop() : null;
+            case "left" -> borders.isSetLeft() ? borders.getLeft() : null;
+            case "bottom" -> borders.isSetBottom() ? borders.getBottom() : null;
+            default -> borders.isSetRight() ? borders.getRight() : null;
+        };
+    }
+
+    /**
+     * One border as {@code {style, widthPt, spacePt, color}}; a border element that is not in
+     * the file is null, so "no line of my own" and "no line at all" stay distinguishable
+     * ({@code style: "none"} against null).
+     */
+    private static Map<String, Object> borderEntry(CTBorder border) {
+        if (border == null) {
+            return null;
+        }
+        Map<String, Object> entry = new LinkedHashMap<>();
+        entry.put("style", border.getVal() == null ? null : strOf(border.getVal()));
+        entry.put("widthPt", border.isSetSz() ? eighthPointsToPt(border.getSz()) : null);
+        entry.put("spacePt", border.isSetSpace() && border.getSpace() != null
+                ? round(border.getSpace().doubleValue()) : null);
+        entry.put("color", attrText(border, "color"));
+        return entry;
+    }
+
+    /** w:sz of a border (eighth-points) -> pt; 4 becomes 0.5, 8 becomes 1. */
+    private static Double eighthPointsToPt(BigInteger sz) {
+        return sz == null ? null : round(sz.doubleValue() / 8.0);
+    }
+
+    /**
+     * Height of every row in the file's order: {@code {cm, rule}}, both null when the row
+     * carries no {@code w:trHeight}. POI's {@code getHeightRule()} is not used for reading:
+     * it dereferences the {@code w:hRule} enum and trips over a height written without it.
+     */
+    private static List<Map<String, Object>> rowHeightsOf(XWPFTable table) {
+        List<Map<String, Object>> heights = new ArrayList<>();
+        for (XWPFTableRow row : table.getRows()) {
+            var trPr = row.getCtRow().isSetTrPr() ? row.getCtRow().getTrPr() : null;
+            CTHeight height = trPr == null || trPr.sizeOfTrHeightArray() == 0
+                    ? null : trPr.getTrHeightArray(0);
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("cm", height == null ? null : cm(intOf(attrText(height, "val"))));
+            entry.put("rule", height == null || height.getHRule() == null
+                    ? null : strOf(height.getHRule()));
+            heights.add(entry);
+        }
+        return heights;
+    }
+
+    /**
+     * How many rows are actually repeated: the flag counts from the first row on, so a
+     * {@code w:tblHeader} on row 3 alone would do nothing (§17.4.84).
+     */
+    private static int repeatHeaderRowsOf(XWPFTable table) {
+        int repeated = 0;
+        for (XWPFTableRow row : table.getRows()) {
+            if (!Boolean.TRUE.equals(headerFlagOf(row))) {
+                break;
+            }
+            repeated++;
+        }
+        return repeated;
+    }
+
+    /** Raw {@code w:tblHeader} state of a row: null (no element), false (off) or true (on). */
+    private static Boolean headerFlagOf(XWPFTableRow row) {
+        var trPr = row.getCtRow().isSetTrPr() ? row.getCtRow().getTrPr() : null;
+        if (trPr == null || trPr.sizeOfTblHeaderArray() == 0) {
+            return null;
+        }
+        return truthy(attrText(trPr.getTblHeaderArray(0), "val"));
+    }
+
+    /** One {@code w:cantSplit} per row: null when the row carries no flag at all. */
+    private static List<Boolean> cantSplitRowsOf(XWPFTable table) {
+        List<Boolean> cantSplit = new ArrayList<>();
+        for (XWPFTableRow row : table.getRows()) {
+            var trPr = row.getCtRow().isSetTrPr() ? row.getCtRow().getTrPr() : null;
+            var flag = trPr == null || trPr.sizeOfCantSplitArray() == 0
+                    ? null : trPr.getCantSplitArray(0);
+            cantSplit.add(flag == null ? null : truthy(attrText(flag, "val")));
+        }
+        return cantSplit;
+    }
+
+    /**
+     * A boolean element's {@code w:val}: an absent value means "on" (that is what LibreOffice
+     * and Word both write), false/0/off mean off.
+     */
+    private static boolean truthy(String value) {
+        return value == null || !("false".equalsIgnoreCase(value) || "0".equals(value)
+                || "off".equalsIgnoreCase(value));
+    }
+
+    /** Width of every {@code w:gridCol} in cm - the raster the cell widths are measured on. */
+    private static List<Double> gridColWidthsOf(CTTbl ctTbl) {
+        List<Double> widths = new ArrayList<>();
+        var grid = ctTbl == null ? null : ctTbl.getTblGrid();
+        if (grid == null) {
+            return widths;
+        }
+        for (int i = 0; i < grid.sizeOfGridColArray(); i++) {
+            widths.add(cm(intOf(attrText(grid.getGridColArray(i), "w"))));
+        }
+        return widths;
+    }
+
+    /**
+     * Reads a width element. A percentage is never turned into centimetres and the other way
+     * round: {@code w:type="pct"} carries fiftieths of a percent ({@code w:w="5000"} is 100 %,
+     * measured in Ribbeck), {@code w:type="dxa"} carries twips, {@code auto}/{@code nil} carry
+     * no length at all.
+     */
+    private static Measure measureOf(CTTblWidth width) {
+        if (width == null) {
+            return MEASURE_NONE;
+        }
+        String type = attrText(width, "type");
+        String raw = attrText(width, "w");
+        if (raw == null) {
+            return new Measure(null, null, type);
+        }
+        if ("pct".equals(type)) {
+            return new Measure(null, percentValue(raw), type);
+        }
+        if ("dxa".equals(type)) {
+            return new Measure(cm(intOf(raw)), null, type);
+        }
+        return new Measure(null, null, type);
+    }
+
+    /** A percentage out of {@code w:w}: "5000" (fiftieths) and "50%" (text form) both give 100. */
+    private static Double percentValue(String raw) {
+        String text = raw.trim();
+        double factor;
+        if (text.endsWith("%")) {
+            text = text.substring(0, text.length() - 1).trim();
+            factor = 1.0;
+        } else {
+            factor = 1.0 / 50.0;
+        }
+        try {
+            return round(Double.parseDouble(text) * factor);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
+     * The literal text of one attribute, looked up by local name. This is the union-safe way to
+     * read a measure or a colour: {@code w:tblW/@w}, {@code w:trHeight/@val},
+     * {@code w:tblHeader/@val} and {@code w:color} are all attribute types XmlBeans hands back
+     * as {@code Object}, and their typed getters follow the union member that is not there
+     * (§1.3). The cursor has to sit on the element's start token first - attributes are tokens
+     * of their own and there is no index-based accessor for them (§1.3).
+     */
+    private static String attrText(XmlObject owner, String localName) {
+        if (owner == null) {
+            return null;
+        }
+        XmlCursor cursor = owner.newCursor();
+        try {
+            cursor.toFirstContentToken();
+            cursor.toParent();
+            if (cursor.toFirstAttribute()) {
+                do {
+                    QName name = cursor.getName();
+                    if (name != null && localName.equals(name.getLocalPart())) {
+                        return cursor.getTextValue();
+                    }
+                } while (cursor.toNextAttribute());
+            }
+            return null;
+        } finally {
+            cursor.dispose();
+        }
+    }
+
+    /**
+     * Removes one attribute, by local name. This is the safe sibling of {@link #attrText}:
+     * {@code CTBorder.unsetColor()} throws an {@code IndexOutOfBoundsException} as soon as the
+     * attribute is absent (measured live 2026-10-17 - XmlBeans' unset of a union attribute), and
+     * a border written without a colour is exactly that case.
+     */
+    private static void removeAttr(XmlObject owner, String localName) {
+        if (owner == null) {
+            return;
+        }
+        XmlCursor cursor = owner.newCursor();
+        try {
+            cursor.toFirstContentToken();
+            cursor.toParent();
+            if (cursor.toFirstAttribute()) {
+                do {
+                    QName name = cursor.getName();
+                    if (name != null && localName.equals(name.getLocalPart())) {
+                        cursor.removeAttribute(name);
+                        return;
+                    }
+                } while (cursor.toNextAttribute());
+            }
+        } finally {
+            cursor.dispose();
         }
     }
 
@@ -3113,13 +4725,60 @@ public class DocxToolBox {
                 changes. At the end of the JavaScript run all documents of this tool
                 call are automatically closed and unsaved changes are lost.
 
+                RETURN SHAPES: readers hand back ONE object; the list lives under a named key, so
+                a handle is result.paragraphs[i].runs[j].h. A missing key reads as undefined and
+                does NOT throw: if (result.length) therefore skips its body silently (measured:
+                a lost font size). Each reader spells its shape out under Reading / inspection.
+
                 --- Document operations ---
                 docx.openFile(path)          - Open .docx file, returns docHandle
                 docx.createDocument()        - Create a new empty document, returns docHandle
                 docx.save(docHandle, path)   - Save document to file
                 docx.close(docHandle)        - Close a document
+                docx.setPageSetup(doc, opts)    - page size and margins of the body section, CREATING
+                                                  it when absent: a document from createDocument()
+                                                  has no w:sectPr at all, so the paper format is
+                                                  whatever the opening program defaults to (Letter
+                                                  instead of A4 - docs/js/docx.md §9.1). cm lengths,
+                                                  partial update, opts: {pageWidthCm, pageHeightCm,
+                                                  marginTopCm, marginBottomCm, marginLeftCm,
+                                                  marginRightCm, headerCm, footerCm, gutterCm,
+                                                  orientation: portrait|landscape} -> the section in
+                                                  the getDocumentInfo().sections shape
+                docx.setDocumentMeta(doc, opts) - core properties {title, author, subject, keywords,
+                                                  comments} (German UI: Zusammenfassung /
+                                                  Kommentar), partial update -> the five keys as
+                                                  they stand now. Otherwise a new document ships
+                                                  author Apache POI and an empty title.
 
                 --- Reading / inspection ---
+                (-> is the top-level shape: every reader returns ONE object, never a bare array,
+                  and the list sits under a named key. These lines were generated from a real
+                  fixture run, not typed by hand - a key that is not there reads as undefined.
+                  getDocumentInfo   -> {document, bodyElementCount, paragraphCount, tableCount, sdtCount, sectionCount, commentCount, commentsPartPresent, sections, stylesPresent, styleCount, numberingPresent, evenAndOddHeaders, core}
+                                      sections:[{type, orientation, orientationInferred, page, margins, headerTypes, footerTypes, titlePg}]
+                  getBodyElements   -> {document, count, elements}
+                                      elements:[{pos, type, h, text, style}]
+                  getParagraphs     -> {document, paragraphs}
+                                      paragraphs:[{h, text, runs, props}]
+                  getRuns           -> {paragraph, runs}
+                                      runs:[{h, text}]
+                  getShapes         -> {document, count, placements, scope}
+                  getTables         -> {document, count, tables}
+                                      tables:[{index, h, rowCount, colCount, colCountMax, alignment,
+                                      widthCm, widthPct, widthType, layout, borders, rowHeights,
+                                      repeatHeaderRows, cantSplitRows, gridCols, gridColCm, style,
+                                      rows, cellBorders, cells}]
+                                      cells:[{text, colSpan, merged, widthCm, widthPct, widthType,
+                                      valign, borders, align, h?, runs?, shading?, vMerge?}]
+                  getTableProps     -> {rowCount, alignment, widthCm, widthPct, widthType, layout,
+                                      borders, rowHeights, repeatHeaderRows, cantSplitRows,
+                                      gridCols, gridColCm}
+                  getStylesInfo     -> {document, present, count, styles}
+                                      styles:[{styleId, name, type, basedOn, outlineLvl, fontSizePt}]
+                  getHeadersFooters -> {document, count, headersFooters, evenAndOddHeaders}
+                                      headersFooters:[{kind, type, part, text, fields, paragraphCount}]
+
                 docx.getDocumentInfo(doc)    - What is in here: counts, sections (page,
                                                margins in cm, header/footer refs), core props
                 docx.getBodyElements(doc)    - True body flow: [{pos, type:
@@ -3131,7 +4790,8 @@ public class DocxToolBox {
                                                pageBreak per paragraph
                 docx.getParagraphProps(par)  - One paragraph in detail (same keys, plus
                                                styleName, outlineLvl, numIdSource, breaks,
-                                               fields, hyperlinks, drawings, vmlShapes)
+                                               fields, hyperlinks, drawings, vmlShapes, commentIds)
+
                 docx.getRuns(par)            - Run handles of a paragraph (the run created
                                                by createParagraph is only reachable here)
                 docx.getRunProps(run)        - {text, bold, italic, fontSizePt, fontName,
@@ -3161,11 +4821,28 @@ public class DocxToolBox {
                                                LibreOffice's mc:AlternateContent are found too.
                                                One placement of createDrawing reads back as ONE
                                                group - the canvas - with the shapes inside it)
+                docx.getComments(doc)        - Word comments (w:comment): {count, comments:[{id, author,
+                                                 initials, date, text, paragraphPos, anchorScopes:[...]}],
+                                                 anchorsWithoutComment:[id], scopesNotScanned:[...]}. Anchors
+                                                 are looked for in body paragraphs, table cells (nested tables
+                                                 too) and header/footer parts; footnotes, endnotes and shape
+                                                 text are NOT scanned and say so in scopesNotScanned. Nothing
+                                                 is dropped quietly: a body without anchor and an anchor
+                                                 without body are both named.
+                docx.removeComment(doc, id)  - deletes the comment AND its markup in every scanned area
+                                                 (w:commentRangeStart / ...End / the commentReference run, and
+                                                 the run the reference left empty): {removedId, removedFromPart,
+                                                 anchorScopes, markupElementsRemoved, scopesCleaned, remaining,
+                                                 anchorsWithoutComment}. id is the w:id string. Writing new
+                                                 comments is still open (docs §9.7)
                 docx.getHyperlinks(doc)      - [{paragraphText, text, anchor?, url?}]
                 docx.getTables(doc)          - List tables [{index, h, rowCount, colCount,
-                                               colCountMax, gridCols, style, rows,
-                                               cellBorders, cells:[[text,colSpan,vMerge,
-                                               merged,shading,align]]}]
+                                               colCountMax, alignment, widthCm, widthPct,
+                                               widthType, layout, borders, rowHeights,
+                                               repeatHeaderRows, cantSplitRows, gridCols,
+                                               gridColCm, style, rows, cellBorders,
+                                               cells:[[text,colSpan,vMerge,merged,shading,
+                                               widthCm,widthPct,widthType,valign,borders,align]]}]
                                                (merged cells are reported, not silently short;
                                                cell handles come from getCellProps)
                 docx.getDocumentText(doc)    - Body paragraph text only: NO table cells, NO
@@ -3197,14 +4874,60 @@ public class DocxToolBox {
                               valign: "top"|"center"|"bottom", shading: "D9E2F3"}
                        Replaces the cell content with one paragraph.
                 docx.getCellProps(doc, tabRef, r, c) -> {h, text, colSpan, vMerge, merged,
-                       shading, align, runs:[{h,text,bold,fontSizePt,...}]}
-                       (cell width is not reported yet - see docs/js/docx.md §1.3)
+                       shading, widthCm, widthPct, widthType, valign, borders, align,
+                       runs:[{h,text,bold,fontSizePt,...}]}
+                       (widthCm/valign/borders are the read side of the setters below; a value
+                       the file does not carry is null, never 0)
                 docx.addRow(doc, tabRef, arr)   - Append a row. Formatting is cloned from the
                        first row WITHOUT merged cells; gridSpan/vMerge/hMerge/shd are never
                        copied and too many texts is an error (was: silent truncation).
                 docx.removeRow(doc, tabIdx, r)  - Remove a row from a table
                 docx.setRowFontColor(doc,ti,r,hex)- Set font color of all runs in a table row
                 docx.setCellFontColor(doc,ti,r,c,hex)- Set font color of a single cell
+
+                --- Writing (table fine-tuning: grid, rules, merges) ---
+                Every call of this block answers with the table properties (the getTableProps
+                shape), so the written value can be read back without reopening the file.
+                tabRef is the table index (0,1,...) or the "t-n" handle, everywhere here.
+                Lengths are cm, border widths pt (written as eighth-points), colours 6 hex digits.
+                docx.getTableProps(doc, tabRef)  - alignment, width, layout, borders, rowHeights,
+                       repeatHeaderRows, cantSplitRows, gridCols, gridColCm of one table
+                docx.setTableAlignment(doc, tabRef, a)  - "left"|"start"|"center"|"right"|"end";
+                       "none" removes the own value and lets the table style decide (w:tblPr/w:jc)
+                docx.setTableWidth(doc, tabRef, spec)   - "16cm" | "100%" | "auto" (w:tblW; a
+                       percentage is stored as fiftieths of a percent, 100% -> w:w="5000")
+                docx.setTableLayout(doc, tabRef, l)     - "fixed" keeps the written widths,
+                       "autofit" lets the viewer recompute them - widths are IGNORED with
+                       autofit, so a millimetre grid needs "fixed" next to its widths
+                docx.setTableBorders(doc, tabRef, {top|left|bottom|right|insideH|insideV:
+                       "single" | {style, widthPt?, spacePt?, color?}})
+                       One edge per key, unknown keys are an error. style: none|single|thick|
+                       double|dotted|dashed|dotDash|dotDotDash|triple|wave|inset|outset, widthPt
+                       0.125..19.75 (default 0.5, and 0 for "none"), spacePt 0..31 (default 0).
+                       The object describes THAT edge completely - values it does not name go back
+                       to their default, while edges it does not name keep their old border.
+                       Cell borders win over these, so use createTable's {borders:"none"} to keep
+                       cells silent.
+                docx.setCellBorders(doc, tabRef, r, c, {top|left|bottom|right: …})
+                       Same values, only the four outer edges (a cell has no inside edge)
+                docx.setRowHeight(doc, tabRef, r, {heightCm: 0.3, rule: "exact"|"atLeast"|"auto"})
+                       "exact" CLIPS the content to that height - text taller than the row is
+                       cut off, that is what makes a 3 mm note line a 3 mm note line
+                docx.setRowCantSplit(doc, tabRef, r, true) - keep the row together over pages
+                docx.setRepeatHeaderRows(doc, tabRef, n)   - repeat the first n rows on every
+                       page (w:tblHeader); 0 switches it off. A row is repeated only when every
+                       row before it is repeated, which is why this takes a count, not a row
+                docx.setCellWidth(doc, tabRef, r, c, "4.5cm"|"25%"|"auto")
+                       w:tcW only - the column grid (w:tblGrid) keeps its own values, that is
+                       what createTable's widths option writes as well
+                docx.setCellShading(doc, tabRef, r, c, "D9E2F3")
+                docx.setCellValign(doc, tabRef, r, c, "top"|"center"|"bottom"|"both")
+                docx.mergeCells(doc, tabRef, fromRow, fromCol, toRow, toCol)
+                       -> {merged, from, to, colSpan, rowSpan, cellsRemoved}
+                       w:gridSpan across, w:vMerge restart/continue down (Word's spelling, not
+                       the legacy w:hMerge). An error when a covered cell still holds text (the
+                       merge would hide it) or when the area touches an already merged row -
+                       move the text with setCellText first.
 
                 --- Writing (paragraph formatting) ---
                 docx.setParagraphStyle(par, style) - style id OR display name ("Heading1",
@@ -3248,6 +4971,11 @@ public class DocxToolBox {
                        plus, minus, leftArrow, rightArrow, upArrow, downArrow, leftRightArrow,
                        cloud) - note "ellipse", not the pptx name "OVAL".
                        All lengths in cm, line width in pt, rotation in degrees.
+                       widthCm/heightCm must be above 0 - the one exception is shape "line",
+                       where heightCm 0 draws the horizontal line (note staff, separator) and
+                       widthCm 0 the vertical one; both 0 would be a dot and stays an error.
+                       createDrawing and addShapeGroup keep requiring > 0: a canvas without an
+                       extent is not a thin sketch, it is nothing.
                 docx.addShapeGroup(target, {widthCm, heightCm, leftCm?, topCm?, name?}) -> "shp-n"
                        A nested coordinate system: add shapes to it in its own centimetres.
                 docx.createShapes(par, {widthCm, heightCm, name?}, [ {..}, {..} ]) -> "dwg-n"
@@ -3267,8 +4995,8 @@ public class DocxToolBox {
                 4. docx.addRun(ph, "Neu");                        // or edit an existing run
                 5. docx.save(doc, "out.docx");
 
-                Not yet available (planned, see docs/js/docx.md): headers/footers, section
-                breaks, cell merging as setters (gridSpan/vMerge are readable already),
+                Not yet available (planned, see docs/js/docx.md): headers/footers and their
+                margins (setPageSetup can already write pgMar), section breaks and page breaks,
                 insertParagraph/insertRow, pictures, shape text, floating drawings
                 (wp:anchor with wrap - only wp:inline is written so far), TOC, md2docx.
                 Note: setParagraphStyle creates the styles part on demand, so a brand-new
@@ -3563,8 +5291,18 @@ public class DocxToolBox {
         node.prst = parseGeometry(fn, optString(fn, opts, "shape", "rect"));
         node.leftCm = optNumber(fn, opts, "leftCm", -MAX_OFFSET_CM, MAX_OFFSET_CM, 0.0);
         node.topCm = optNumber(fn, opts, "topCm", -MAX_OFFSET_CM, MAX_OFFSET_CM, 0.0);
-        node.widthCm = requireNumber(fn, opts, "widthCm", 0.01, MAX_DRAWING_CM);
-        node.heightCm = requireNumber(fn, opts, "heightCm", 0.01, MAX_DRAWING_CM);
+        // A line is the one geometry whose box may collapse: prst="line" draws corner to
+        // corner, so heightCm 0 is the horizontal line (note staff, separator) and widthCm 0
+        // the vertical one - both valid OOXML (a:ext cx/cy 0), docs/js/docx.md §9.4. Areas keep
+        // needing a real box, and a line with both sides 0 would be a dot, so that stays an error.
+        boolean lineShape = "line".equalsIgnoreCase(node.prst);
+        double minSideCm = lineShape ? 0.0 : 0.01;
+        node.widthCm = requireNumber(fn, opts, "widthCm", minSideCm, MAX_DRAWING_CM);
+        node.heightCm = requireNumber(fn, opts, "heightCm", minSideCm, MAX_DRAWING_CM);
+        if (lineShape && node.widthCm <= 0.0 && node.heightCm <= 0.0) {
+            throw new PoiUserRuntimeException(fn + ": a \"line\" needs widthCm or heightCm above 0"
+                    + " - both were 0, and that is a dot, not a line. See docx.help().");
+        }
         node.rotationDeg = optNumber(fn, opts, "rotationDeg", -MAX_ROTATION_DEG, MAX_ROTATION_DEG,
                 null);
         node.flipH = optBoolean(fn, opts, "flipH", null);

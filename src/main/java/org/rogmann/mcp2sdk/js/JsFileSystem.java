@@ -39,6 +39,7 @@ import java.util.Map;
 import java.util.regex.Pattern;
 
 import org.rogmann.mcp2sdk.WorkProject;
+import org.rogmann.mcp2sdk.watch.FileChangeWatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -1575,6 +1576,7 @@ public class JsFileSystem {
             if (parent != null) {
                 Files.createDirectories(parent);
             }
+            FileChangeWatch.beforeWrite(path);   // the content is lost in a moment - announce it
             Files.write(path, data, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
                     StandardOpenOption.WRITE);
         } catch (IOException e) {
@@ -1628,6 +1630,7 @@ public class JsFileSystem {
             if (parent != null) {
                 Files.createDirectories(parent);
             }
+            FileChangeWatch.beforeWrite(path, FileChangeWatch.Kind.APPENDED);   // an append changes content too
             Files.write(path, data, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
         } catch (IOException e) {
             LOG.error("Failed to append to file: " + path, e);
@@ -1699,6 +1702,7 @@ public class JsFileSystem {
             if (parent != null) {
                 Files.createDirectories(parent);
             }
+            FileChangeWatch.beforeWrite(dst, FileChangeWatch.Kind.MOVED_OVER);   // the target is replaced
             Files.move(src, dst, StandardCopyOption.REPLACE_EXISTING);
         } catch (IOException e) {
             LOG.error("Failed to rename " + src + " to " + dst, e);
@@ -1725,6 +1729,7 @@ public class JsFileSystem {
             if (parent != null) {
                 Files.createDirectories(parent);
             }
+            FileChangeWatch.beforeWrite(dst, FileChangeWatch.Kind.COPIED_OVER);   // the target is replaced
             Files.copy(src, dst, StandardCopyOption.REPLACE_EXISTING);
         } catch (IOException e) {
             LOG.error("Failed to copy " + src + " to " + dst, e);
@@ -1864,6 +1869,7 @@ public class JsFileSystem {
             if (parent != null) {
                 Files.createDirectories(parent);
             }
+            FileChangeWatch.beforeWrite(path);
             Files.write(path, data, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
                     StandardOpenOption.WRITE);
         } catch (IOException e) {
@@ -1908,6 +1914,7 @@ public class JsFileSystem {
                     + " (fs.writeBytes(path, data, offset) patches an EXISTING file at an offset;"
                     + " to create a new file use fs.writeBytes(path, data) without an offset)");
         }
+        FileChangeWatch.beforeWrite(path, FileChangeWatch.Kind.MODIFIED);
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
             long fileSize = channel.size();
             if (offset > fileSize) {
@@ -2230,7 +2237,7 @@ public class JsFileSystem {
                     var line;
                     var n = 0;
                     while ((line = reader.next()) !== null) {
-                        if (n % 1000 === 0) console.log("Zeile " + reader.lineNumber() + ": " + line);
+                        if (n % 1000 === 0) console.log("line " + reader.lineNumber() + ": " + line);
                         n++;
                     }
                     reader.close();

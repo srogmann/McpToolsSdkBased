@@ -47,7 +47,7 @@ public final class BrowserReviewService implements ReviewService {
 
     @Override
     public String getToolTitle() {
-        return "Browser-Aktion";
+        return "Browser action";
     }
 
     @Override

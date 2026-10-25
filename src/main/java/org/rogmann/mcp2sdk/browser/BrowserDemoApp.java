@@ -1,5 +1,6 @@
 package org.rogmann.mcp2sdk.browser;
 
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -77,20 +78,25 @@ import java.util.concurrent.ConcurrentHashMap;
  *       the redaction (the capture holds the field name, never the value) and for the cookie rewriting
  *       of decision L3: the sign-in hands the user name back as a {@code Set-Cookie} whose path the
  *       proxy bends onto the session prefix;</li>
- *   <li><b>the SSO excursion to a second host</b> - the {@code 2FA} button of the sign-in runs to
- *       {@code http://idp.localhost:<port>/browserdemo/idp} (see {@link #IDP_HOST_PROPERTY}), the
+ *   <li><b>the SSO excursion to a foreign origin</b> - the {@code 2FA} button of the sign-in runs to
+ *       the IdP simulation on its own listener ({@code browser.idp.port}, default 9102 - see
+ *       {@link BrowserIdpServer}; {@link #IDP_ORIGIN_PROPERTY} names a real external IdP instead). The
  *       IdP's {@code submit} runs back to {@code /browserdemo/login} with a token this application
- *       minted for that round trip ({@link SecondFactor}). That is the case docs/browser.md §8 names as
- *       <em>not bent</em>: the URL keeps its foreign host, so the browser really leaves the origin of
- *       the session and comes back. Checked with it: whether the session survives the hop (port mode:
- *       the listener answers under every host name, the host has never routed anything - §2b), whether
- *       the bridge re-attaches on the other name, what the cookie jar of the second host sees (nothing
- *       of the tracker), and whether the token of the front channel reaches the capture. It is also the
- *       stand-in for the SPNEGO/Kerberos dance, which the same excursion would have to survive. In
- *       <b>port mode</b> the hop stays inside the session, because the listener answers under every
- *       host name; in <b>path mode</b> the same URL runs past the proxy into the direct route of this
- *       application - the page still works for the human and is blind for the model, which is the
- *       finding and not something to hide here (docs/browser.md §8, §10 step 10).</li>
+ *       minted for that round trip ({@link SecondFactor}) - to the address the application hands over
+ *       as {@code ru}, built from its request ({@code X-Forwarded-Host}, see
+ *       {@link #appOrigin(HttpServletRequest)}): the upstream authority, for a {@code self:}
+ *       application always {@code 127.0.0.1:<normalport>} and therefore outside the proxy origin. The
+ *       hop keeps its absolute URL - the proxy does not bend a host it does not know
+ *       ({@code BrowserRewriter.prefixForHost} is {@code null} in port mode, docs/browser.md §8) - so
+ *       the browser really leaves the session, in path mode as well. Without a rewrite rule the round
+ *       trip ends on the original server: the field case this fixture reproduces, the pages on the far
+ *       side work for the human and are blind for the model. With the rule ({@code queryParamUrl},
+ *       docs/browser.md §3a) the proxy swaps the {@code ru} for the session origin in its own response
+ *       - visibly in the capture - and the round trip comes back. Checked with it: what the cookie jar
+ *       of the foreign origin sees (nothing of the tracker), whether the token of the front channel
+ *       stays out of the capture, and what the answer of the excursion reports about where the browser
+ *       ended up. It is also the stand-in for the SPNEGO/Kerberos dance, which the same excursion
+ *       would have to survive.</li>
  *   <li><b>grids with row headers</b> - the report list keyed by its ID, the comment table by its
  *       number, with "add comment row". That is the case in which the column heading has to become
  *       {@code colHead} and the row's first cell {@code rowHead};</li>
@@ -156,25 +162,19 @@ public class BrowserDemoApp {
     static final String FACTOR_FIELD = "otp";
 
     /**
-     * Label of the built-in IdP host. The excursion runs to {@code idp} + the configured
-     * {@code browser.host.suffix}, which is {@code idp.localhost} by default - a second name of the
-     * same machine, not a second machine (the listener binds 127.0.0.1 and answers under every host
-     * name, because the host has never been a routing criterion, see {@link BrowserHost}).
+     * System property that names the IdP outright - a complete origin ({@code scheme://host[:port]}),
+     * e.g. {@code https://en01.idp.hier}: the case of a real, external IdP. Without it the IdP is the
+     * built-in simulation on its own listener ({@link BrowserIdpServer}, {@code browser.idp.port},
+     * default 9102). A listener port of its own in the registry would not do: that is exactly how a
+     * session of the port mode would keep hold of the hop.
      */
-    static final String IDP_HOST_LABEL = "idp";
-
-    /**
-     * System property that names the IdP host outright, e.g. when {@code *.localhost} does not resolve
-     * on the platform (Windows, {@link BrowserHost#needsHostsEntry}). Only the host, no scheme, no port
-     * - the port comes from {@link #browserPort()} either way.
-     */
-    static final String IDP_HOST_PROPERTY = "browser.demo.idp.host";
+    static final String IDP_ORIGIN_PROPERTY = "browser.demo.idp.origin";
 
     /** Prefix of a token the tracker accepts as "this one came back from our IdP". */
     private static final String TOKEN_PREFIX = "2FA-";
 
     /** How long an open round trip waits for its return, and how many may be open at once. */
-    private static final Duration ROUND_TRIP_TTL = Duration.ofMinutes(10);
+    static final Duration ROUND_TRIP_TTL = Duration.ofMinutes(10);
     private static final int ROUND_TRIPS_MAX = 64;
 
     /** The states of the workflow, in the order it walks through them. */
@@ -208,11 +208,13 @@ public class BrowserDemoApp {
      * The entry point: the sign-in. The list is reachable without it as well - a session that only ever
      * sees this page would prove too little, and the report list is what the model gets asked about.
      *
+     * @param request the request being answered (names the return address of the 2FA excursion,
+     *                docs/browser.md §3a); {@code null} is allowed (rendering without a caller)
      * @return HTML
      */
     @GetMapping(value = {"/", ""}, produces = MediaType.TEXT_HTML_VALUE + ";charset=UTF-8")
-    public String index() {
-        return page("Demo bug tracker - Sign in", signInBody(""), SIGNIN_SCRIPT);
+    public String index(HttpServletRequest request) {
+        return page("Demo bug tracker - Sign in", signInBody("", idpEntryUrl(request)), SIGNIN_SCRIPT);
     }
 
     /**
@@ -237,6 +239,8 @@ public class BrowserDemoApp {
      * @param state    the round trip the IdP is answering for
      * @param token    the token the IdP brought back
      * @param response for the cookie
+     * @param request  the request being answered (tells the answer of the excursion whether it came
+     *                 back through the proxy or directly); {@code null} is allowed
      * @return HTML: the list of reports
      */
     @PostMapping(value = "/login", produces = MediaType.TEXT_HTML_VALUE + ";charset=UTF-8")
@@ -245,15 +249,16 @@ public class BrowserDemoApp {
             @RequestParam(name = "tan", defaultValue = "") String tan,
             @RequestParam(name = "state", defaultValue = "") String state,
             @RequestParam(name = "token", defaultValue = "") String token,
-            HttpServletResponse response) {
+            HttpServletResponse response,
+            HttpServletRequest request) {
         if (!token.isBlank()) {
-            return afterSecondFactor(user, state, token, response);
+            return afterSecondFactor(user, state, token, response, request);
         }
         if (password.isBlank()) {
             return page("Demo bug tracker - Sign in", signInBody(
                     "No sign-in without a password. The value is not checked - it only may not be"
-                    + " empty. (Or take the <b>2FA</b> button below and come back with a token.)"),
-                    SIGNIN_SCRIPT);
+                    + " empty. (Or take the <b>2FA</b> button below and come back with a token.)",
+                    idpEntryUrl(request)), SIGNIN_SCRIPT);
         }
         String name = user.isBlank() ? "guest" : user.trim();
         response.addHeader("Set-Cookie", USER_COOKIE + "="
@@ -267,139 +272,146 @@ public class BrowserDemoApp {
      * The sign-in the <b>IdP excursion</b> ends with: the same path, the same cookie, the same list -
      * only that the credential that got here is a token and not a password.
      *
+     * <p>Where this page runs depends on the return address the IdP used - and that is the fixture's
+     * finding, so the answer says it: with the rewrite rule (docs/browser.md §3a) the POST comes back
+     * through the proxy (X-Forwarded-Host is set, the page is in the session); without it the browser
+     * stands on the original server and the session is blind from here.</p>
+     *
      * @param user     who the IdP says is standing in front of it (empty without the page's script)
      * @param state    the round trip the tracker opened on its sign-in page
      * @param token    the token the IdP minted for that round trip
      * @param response for the cookie
+     * @param request  the request being answered; {@code null} is allowed (rendering without a caller)
      * @return HTML: the list of reports, or the sign-in with the reason it was not believed
      */
     private String afterSecondFactor(String user, String state, String token,
-            HttpServletResponse response) {
+            HttpServletResponse response, HttpServletRequest request) {
         if (!SecondFactor.redeem(state, token)) {
             return page("Demo bug tracker - Sign in", signInBody(
                     "The token was <b>not accepted</b>: no open sign-in for state <code>"
                     + esc(tidyState(state)) + "</code>, or the token does not belong to it. A token this"
                     + " application did not hand out is worth nothing, and one it did is good exactly"
-                    + " once - sign in with the password, or start the second factor again."),
-                    SIGNIN_SCRIPT);
+                    + " once - sign in with the password, or start the second factor again.",
+                    idpEntryUrl(request)), SIGNIN_SCRIPT);
         }
         String name = user == null || user.isBlank() ? "guest" : user.trim();
         response.addHeader("Set-Cookie", USER_COOKIE + "="
                 + URLEncoder.encode(name, StandardCharsets.UTF_8) + "; SameSite=Lax");
+        String where = request != null && request.getHeader("X-Forwarded-Host") != null
+                ? "the round trip came back through the proxy - this page is in the session"
+                : "the browser is on the application's own origin here - the proxy session cannot see"
+                        + " this page (no rewrite rule for the return URL?)";
         return listPage(name, Filters.empty(), "Signed in as <b>" + esc(name) + "</b> after the second"
-                + " factor at <code>" + esc(idpHost()) + "</code> (" + LocalTime.now().format(CLOCK)
-                + ") - the round trip over the second host survived, the password never left this"
-                + " origin and the token came back in the body of a POST.");
-    }
-
-    /**
-     * The <b>other host of the excursion</b>: what the {@code 2FA} button of the sign-in opens, under
-     * {@code idp.localhost:<port>} (or {@link #IDP_HOST_PROPERTY}) on the very same listener. Reached
-     * by the browser as a normal navigation, so the proxy sees a request whose {@code Host} it was never
-     * offered under - and answers it anyway, because the host has never chosen an upstream
-     * ({@link BrowserHost}). That is what this page is for: to have something to hop to.
-     *
-     * <p>Nothing of the tracker arrives here but what stands in the URL: the cookie stays on its own
-     * host (a cookie belongs to a host, never to a port) and the session is the one the listener was
-     * opened with. The page therefore shows the state it was called with and mints the token for it -
-     * a token for a state that is not waiting is not minted at all, which is the answer to somebody
-     * typing this URL by hand.</p>
-     *
-     * @param state the round trip opened on the sign-in page
-     * @param user  who is signing in, carried over by the page's script (empty without it)
-     * @return HTML: the second-factor form, or the reason there is nothing to answer
-     */
-    @GetMapping(value = "/idp", produces = MediaType.TEXT_HTML_VALUE + ";charset=UTF-8")
-    public String idp(@RequestParam(name = "state", defaultValue = "") String state,
-            @RequestParam(name = "user", defaultValue = "") String user) {
-        String token = SecondFactor.issue(state);
-        if (token == null) {
-            String asked = tidyState(state);
-            return page("Demo IdP - No open sign-in", """
-                    <h1>Demo IdP <span class="hint">second factor for the bug tracker</span></h1>
-                    <p class="notice">Nothing is waiting for the state <code>%1$s</code>: it was never
-                    issued, was already used, or is older than %2$d minutes. An IdP mints a token for an
-                    open sign-in of its own and for nothing else.</p>
-                    <p><a href="%3$s%4$s/">back to the sign in of the tracker</a></p>
-                    """.formatted(asked.isEmpty() ? "(none was given)" : esc(asked),
-                            ROUND_TRIP_TTL.toMinutes(), esc(appOrigin()), PATH), null);
-        }
-        return page("Demo IdP - Second factor", idpBody(user, tidyState(state), token), null);
+                + " factor at <code>" + esc(idpOrigin()) + "</code> (" + LocalTime.now().format(CLOCK)
+                + ") - " + where + "; the password never left this origin and the token came back in"
+                + " the body of a POST.");
     }
 
     /**
      * Ends the sign-in by letting the browser drop the cookie.
      *
      * @param response for the expired cookie
+     * @param request  the request being answered (names the return address of the 2FA excursion);
+     *                 {@code null} is allowed
      * @return HTML: the sign-in page
      */
     @GetMapping(value = "/logout", produces = MediaType.TEXT_HTML_VALUE + ";charset=UTF-8")
-    public String logout(HttpServletResponse response) {
+    public String logout(HttpServletResponse response, HttpServletRequest request) {
         response.addHeader("Set-Cookie", USER_COOKIE + "=; Max-Age=0; SameSite=Lax");
-        return page("Demo bug tracker - Sign in", signInBody("Signed out - the list stays open."),
-                SIGNIN_SCRIPT);
+        return page("Demo bug tracker - Sign in", signInBody("Signed out - the list stays open.",
+                idpEntryUrl(request)), SIGNIN_SCRIPT);
     }
 
     // ------------------------------------------------------------------ the excursion (SSO test track)
 
     /**
-     * @return the port the browser reaches this application on: the listener the registry names for the
-     *         demo, else the normal port of the service (path mode)
-     */
-    static int browserPort() {
-        int port = BrowserSessions.get().apps().byId(BrowserApps.DEMO_ID)
-                .map(BrowserApp::port).orElse(0);
-        return port > 0 ? port : BrowserSessions.get().localPort();
-    }
-
-    /**
-     * @return host name of the built-in IdP: {@link #IDP_HOST_PROPERTY}, else {@code idp} plus the
-     *         configured {@code browser.host.suffix} ({@code idp.localhost} when the suffix is off)
-     */
-    static String idpHost() {
-        String configured = System.getProperty(IDP_HOST_PROPERTY);
-        if (configured != null && !configured.isBlank()) {
-            return configured.trim();
-        }
-        String suffix = BrowserSessions.get().settings().hostSuffix();
-        return IDP_HOST_LABEL + (suffix.isEmpty() ? BrowserHost.SUGGESTED_SUFFIX : suffix);
-    }
-
-    /**
-     * @return the origin the excursion leaves to, e.g. {@code http://idp.localhost:9101}
+     * The origin of the IdP - deliberately a <b>foreign</b> one: the excursion is only worth its name
+     * when the browser leaves the origin of the session. The default is the IdP simulation's own
+     * listener ({@code browser.idp.port}, default 9102 - {@link BrowserIdpServer}), which
+     * browser-apps.json does not register and to which no session of the port mode is ever bound. The
+     * old choice, a second name on the application's own listener, is exactly what must not happen any
+     * more: the listener answers under every host name (the Host header has never chosen an upstream,
+     * §2b), so the browser stayed inside the session and the case proved nothing.
+     *
+     * @return e.g. {@code http://idp.localhost:9102}, or what {@link #IDP_ORIGIN_PROPERTY} says
      */
     static String idpOrigin() {
-        return "http://" + idpHost() + ":" + browserPort();
+        return BrowserIdpServer.idpOrigin();
     }
 
     /**
-     * The origin of the tracker itself, as it is <em>offered</em> - which is not what the application
-     * can read from its own request: {@link BrowserProxyClient} drops the browser's {@code Host} and
-     * sets {@code X-Forwarded-Host} to the <b>upstream</b> authority, so a page that has to name itself
-     * absolutely can only take this from the administration. It is the reason an IdP hop of a real
-     * application is a problem of its own (docs/browser.md §8).
+     * The origin the application names for itself - built from what its <b>request</b> carries, never
+     * from the administration: {@link BrowserProxyClient} drops the browser's {@code Host} and sets
+     * {@code X-Forwarded-Host} to the <b>upstream</b> authority (for a {@code self:} application
+     * {@code 127.0.0.1:<normalport>}, see {@code BrowserProxyCore.upstreamBaseOf}). A page that has to
+     * name itself absolutely therefore says where the browser will really land - and that is outside
+     * the proxy origin in port mode, which is what turns the way back from the IdP into a hop of its
+     * own (docs/browser.md §8). Without the header (direct call, no proxy in between) the
+     * application's own listener is all it sees, and its {@code Host} is the truth.
      *
-     * @return e.g. {@code http://browserdemo.localhost:9101}
+     * @param request the request being answered; {@code null} is allowed (rendering without a caller,
+     *                tests) and means the authority the proxy of this service names for a
+     *                {@code self:} application
+     * @return e.g. {@code http://127.0.0.1:9091}
      */
+    static String appOrigin(HttpServletRequest request) {
+        if (request == null) {
+            return "http://127.0.0.1:" + BrowserSessions.get().localPort();
+        }
+        String authority = request.getHeader("X-Forwarded-Host");
+        String proto = request.getHeader("X-Forwarded-Proto");
+        if (authority == null || authority.isBlank()) {
+            authority = request.getServerName() + ":" + request.getServerPort();
+            proto = request.getScheme();
+        }
+        String scheme = proto == null || proto.isBlank() ? "http" : proto.trim();
+        return scheme + "://" + authority.trim();
+    }
+
+    /** @return {@link #appOrigin(HttpServletRequest)} without a request in hand (tests) */
     static String appOrigin() {
-        return "http://" + BrowserHost.of(BrowserApps.DEMO_ID) + ":" + browserPort();
+        return appOrigin(null);
     }
 
     /**
-     * @return the absolute URL of the IdP page - absolute on purpose, the excursion is the case where
-     *         the browser is <em>meant</em> to leave this origin. The state of the round trip is not in
-     *         it: the 2FA form carries the state as its own field, so the browser builds one query
-     *         instead of adding a second one to ours.
+     * The absolute URL of the IdP - absolute on purpose, the excursion is the case where the browser
+     * is <em>meant</em> to leave this origin. The return address travels as the {@code ru} parameter:
+     * built from the request (see {@link #loginCallbackUrl(HttpServletRequest)}), so the IdP sends the
+     * browser to the address the application named - through the rewrite rule (docs/browser.md §3a)
+     * that is the session origin, without the rule the original server. The state of the round trip is
+     * not in the URL: the 2FA form carries it as its own field, so the browser builds one query
+     * instead of adding a second one to ours.
+     *
+     * @param request the request being answered; {@code null} is allowed and falls back like
+     *                {@link #appOrigin(HttpServletRequest)}
+     * @return e.g. {@code http://idp.localhost:9102/?ru=http%3A%2F%2F127.0.0.1%3A9091%2Fbrowserdemo%2Flogin}
      */
+    static String idpEntryUrl(HttpServletRequest request) {
+        return idpOrigin() + "/?ru=" + URLEncoder.encode(loginCallbackUrl(request), StandardCharsets.UTF_8);
+    }
+
+    /** @return {@link #idpEntryUrl(HttpServletRequest)} without a request in hand (tests) */
     static String idpEntryUrl() {
-        return idpOrigin() + PATH + "/idp";
+        return idpEntryUrl(null);
     }
 
     /**
-     * @return the absolute URL the IdP posts its answer back to (the sign-in of the tracker)
+     * The URL the IdP posts its answer back to - built from the request (see
+     * {@link #appOrigin(HttpServletRequest)}), so a browser that reaches the IdP through the session is
+     * sent to an address outside the proxy origin: the way back does not stay in the session, and that
+     * is the constellation being reproduced here.
+     *
+     * @param request the request being answered; {@code null} is allowed and falls back like
+     *                {@link #appOrigin(HttpServletRequest)}
+     * @return e.g. {@code http://127.0.0.1:9091/browserdemo/login}
      */
+    static String loginCallbackUrl(HttpServletRequest request) {
+        return appOrigin(request) + PATH + "/login";
+    }
+
+    /** @return {@link #loginCallbackUrl(HttpServletRequest)} without a request in hand (tests) */
     static String loginCallbackUrl() {
-        return appOrigin() + PATH + "/login";
+        return loginCallbackUrl(null);
     }
 
     /**
@@ -761,9 +773,12 @@ public class BrowserDemoApp {
 
     /**
      * @param notice inner HTML of the message above the form, may be empty
+     * @param twofaAction the absolute URL of the IdP with the return address in it
+     *                    ({@link #idpEntryUrl(HttpServletRequest)}) - the one URL of this page that
+     *                    needs the request, handed in ready-made so that a test can render the page
      * @return the body of the sign-in page
      */
-    String signInBody(String notice) {
+    String signInBody(String notice, String twofaAction) {
         String state = SecondFactor.newState();
         return """
                 <h1>Demo bug tracker <span class="hint">demo target for docs/browser.md</span></h1>
@@ -783,63 +798,24 @@ public class BrowserDemoApp {
                     <input type="hidden" name="state" value="%4$s">
                     <input type="hidden" id="twofaUser" name="user" value="">
                     <div><button type="submit" id="twofaButton" name="action" value="2fa">2FA</button>
-                         <span class="hint">this one leaves the origin: <code>%3$s</code> is a second
-                         host name on the same listener</span></div>
+                         <span class="hint">this one leaves the origin: the form runs to the IdP on
+                         its own listener, and the return address travels in it as <code>ru</code></span></div>
                   </fieldset>
                 </form>
                 <p class="muted">Signing in shows the list of bug reports. The sign-in is the sensitive
                 path of this target: the capture holds the field <code>password</code>, not its value.
                 The answer also sets a cookie, whose path the proxy bends onto the session prefix.</p>
                 <p class="muted"><b>2FA</b> is the excursion: the button hands the browser to the IdP
-                under its own host name and the IdP hands it back with a token. The URL of the hop is
-                <em>absolute and stays absolute</em> - the proxy does not bend a host it does not know
-                (docs/browser.md §8), so what has to be watched here is whether the session survives the
-                move, whether the bridge comes back on the other name and whether anything secret comes
-                along for the ride. The state of this page is <code>%4$s</code>; nothing else of the
-                sign-in travels but what the page's own script puts into the form.</p>
+                on a foreign origin, carrying the return address (<code>ru</code>) this application
+                built from its request (X-Forwarded-Host). Without a rewrite rule that is the original
+                server - outside the proxy session; with the rule (queryParamUrl, docs/browser.md §3a)
+                the proxy swaps it for the session origin, and the round trip comes back. The URL of
+                the hop is <em>absolute and stays absolute</em> - the proxy does not bend a host it
+                does not know (docs/browser.md §8); the rule works in the proxy's own response and is
+                visible in the capture. The state of this page is <code>%4$s</code>; nothing else of
+                the sign-in travels but what the page's own script puts into the form.</p>
                 """.formatted(notice == null || notice.isBlank() ? "" : notice(notice), DEFAULT_USER,
-                idpEntryUrl(), esc(state));
-    }
-
-    /**
-     * The IdP's own page: one field for the second factor and the button that answers the round trip.
-     * Built like the rest of the pages without a request, so that a test can render it.
-     *
-     * @param user  who is asking, as the tracker's page carried it over
-     * @param state the open round trip
-     * @param token the token the IdP mints for it (a hidden field, like a SAML response or an
-     *              OpenID Connect front-channel id token - the browser is the transport)
-     * @return the body of the IdP page
-     */
-    String idpBody(String user, String state, String token) {
-        String name = user == null || user.isBlank() ? "guest" : user.trim();
-        return """
-                <h1>Demo IdP <span class="hint">second factor for the bug tracker</span></h1>
-                <p class="muted">The browser is on <code>%1$s</code> now - another host name, the same
-                listener, the same session of the proxy. The cookie of the tracker does not follow it
-                here, because a cookie belongs to a host and never to a port, so the state of the round
-                trip is what travels: <code>%4$s</code>%2$s</p>
-                <form id="factor" method="post" action="%3$s">
-                  <fieldset><legend>Second factor for %5$s</legend>
-                    <input type="hidden" name="state" value="%4$s">
-                    <input type="hidden" name="user" value="%5$s">
-                    <input type="hidden" name="token" value="%6$s">
-                    <div><label for="factorCode">2nd factor</label>
-                         <input id="factorCode" name="otp" type="text" autocomplete="off"
-                                placeholder="any digits, the value is not checked"></div>
-                    <div><button type="submit" id="submitFactor" name="action" value="submit">submit</button>
-                         <span class="hint">the token of this form is a hidden field - the snapshot does
-                         not show hidden fields, and the answer of the tracker is a list</span></div>
-                  </fieldset>
-                </form>
-                <p class="muted"><b>submit</b> posts to <code>%3$s</code>: back to the sign-in of the
-                tracker with the token this IdP minted for that state. The token goes in the <em>body</em>
-                of a POST to a sensitive path and never in a query, because the query of an exchange is
-                captured as it comes. This page is a sensitive path of its own as well, so the token
-                stands in neither the request nor the response of the capture.</p>
-                """.formatted(idpOrigin(),
-                name.equals("guest") ? "" : ", asked for by <b>" + esc(name) + "</b>",
-                loginCallbackUrl(), esc(state), esc(name), esc(token));
+                twofaAction, esc(state));
     }
 
     /**

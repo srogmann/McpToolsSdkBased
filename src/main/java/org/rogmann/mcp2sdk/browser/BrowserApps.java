@@ -109,21 +109,28 @@ public final class BrowserApps {
      * {@code open -> in progress -> fixed} - exactly the cases M0 can be checked on, without having to
      * involve a real line-of-business application.
      *
-     * <p>Both halves of the sign-in are sensitive paths: {@code /login} because the password is posted
-     * to it, {@code /idp} because the page of the second factor carries the token in its body (a front
-     * channel is a token endpoint in everything but the name - see
-     * {@link BrowserDemoApp#idp(String, String)}).</p>
+     * <p>The sign-in is a sensitive path ({@code /login} - the password is posted to it). The second
+     * factor lives on the IdP simulation's own listener (docs/browser.md §3a) and is therefore never
+     * proxied - no sensitive path of its own, the capture cannot see it anyway. What the entry
+     * <em>does</em> carry is the rewrite rule of the 2FA excursion: the application names its return
+     * URL ({@code ru}) from what it sees, and without the rule the IdP sends the browser back to the
+     * original server instead of the session - the case from the field that the fixture reproduces
+     * deliberately, rule off.</p>
      *
      * @return registry entry with a {@code self:} target
      */
     public static BrowserApp defaultDemo() {
         return new BrowserApp(DEMO_ID, "self:" + BrowserDemoApp.PATH + "/", 0,
                 "Built-in target application (bug tracker): sign-in, report list, search, editor,"
-                        + " comments, workflow, and the 2FA excursion to a second host name",
-                "form", List.of(BrowserDemoApp.PATH + "/login", BrowserDemoApp.PATH + "/idp"),
+                        + " comments, workflow, and the 2FA excursion to the IdP simulation on its own"
+                        + " listener",
+                "form", List.of(BrowserDemoApp.PATH + "/login"),
                 List.of(),
                 List.of(BrowserDemoApp.PATH + "/save", BrowserDemoApp.PATH + "/comment",
-                        BrowserDemoApp.PATH + "/state"));
+                        BrowserDemoApp.PATH + "/state"),
+                List.of(new BrowserRewriteRule(BrowserRewriteRule.TYPE_QUERY_PARAM_URL, "ru",
+                        BrowserRewriteRule.FROM_UPSTREAM, BrowserRewriteRule.TO_SESSION,
+                        BrowserDemoApp.PATH + "(/login)?/?")));
     }
 
     private void addEntry(JsonNode node, Path file) {
@@ -140,11 +147,45 @@ public final class BrowserApps {
                     node.path("auth").asString("unknown"),
                     stringList(node.path("sensitivePaths")),
                     stringList(node.path("sensitiveKeys")),
-                    stringList(node.path("irreversiblePaths"))));
+                    stringList(node.path("irreversiblePaths")),
+                    rewriteRules(node.path("rewriteRules"), id)));
         } catch (IllegalArgumentException e) {
             loadErrors.add("entry '" + id + "' dropped: " + e.getMessage());
             LOG.warn("browser: {}", loadErrors.get(loadErrors.size() - 1));
         }
+    }
+
+    /**
+     * Parses the rewrite rules of an entry (docs/browser.md §3a). A broken rule is dropped with a
+     * complaint - the entry stays valid, because one wrong rule must not make the whole application
+     * unreachable. An unknown type is the normal case of a registry written for a newer proxy: it is
+     * named, not guessed at.
+     *
+     * @param node the {@code rewriteRules} array of the entry
+     * @param id   the application id (for the complaint text)
+     * @return the usable rules, in file order
+     */
+    private List<BrowserRewriteRule> rewriteRules(JsonNode node, String id) {
+        if (!node.isArray() || node.isEmpty()) {
+            return List.of();
+        }
+        List<BrowserRewriteRule> out = new ArrayList<>();
+        for (JsonNode item : node) {
+            BrowserRewriteRule rule = new BrowserRewriteRule(
+                    item.path("type").asString(""),
+                    item.path("param").asString(""),
+                    item.path("from").asString(""),
+                    item.path("to").asString(""),
+                    item.path("pageFilter").asString(""));
+            String problem = rule.validationError();
+            if (problem != null) {
+                loadErrors.add("rewrite rule of '" + id + "' dropped: " + problem);
+                LOG.warn("browser: {}", loadErrors.get(loadErrors.size() - 1));
+                continue;
+            }
+            out.add(rule);
+        }
+        return List.copyOf(out);
     }
 
     private void add(BrowserApp app) {
@@ -187,7 +228,8 @@ public final class BrowserApps {
     /**
      * What {@code replacing} left open, {@code replaced} already knew: only lists the new entry does
      * not carry on its own are taken over, never the other way round - a registry entry that names its
-     * own paths stays the decision it is.
+     * own paths stays the decision it is. The rewrite rules follow the same direction: an entry
+     * without rules of its own keeps the demo's rule, an entry with rules decides them.
      *
      * @param replacing the entry from the registry file
      * @param replaced  the entry it replaces (the built-in self-test)
@@ -198,11 +240,14 @@ public final class BrowserApps {
                 ? replaced.sensitivePaths() : replacing.sensitivePaths();
         List<String> irreversiblePaths = replacing.irreversiblePaths().isEmpty()
                 ? replaced.irreversiblePaths() : replacing.irreversiblePaths();
+        List<BrowserRewriteRule> rewriteRules = replacing.rewriteRules().isEmpty()
+                ? replaced.rewriteRules() : replacing.rewriteRules();
         List<String> sensitiveKeys = new ArrayList<>(replaced.sensitiveKeys());
         replacing.sensitiveKeys().stream().filter(key -> !sensitiveKeys.contains(key))
                 .forEach(sensitiveKeys::add);
         return new BrowserApp(replacing.id(), replacing.upstream(), replacing.port(),
-                replacing.note(), replacing.auth(), sensitivePaths, sensitiveKeys, irreversiblePaths);
+                replacing.note(), replacing.auth(), sensitivePaths, sensitiveKeys, irreversiblePaths,
+                rewriteRules);
     }
 
     private static List<String> stringList(JsonNode node) {

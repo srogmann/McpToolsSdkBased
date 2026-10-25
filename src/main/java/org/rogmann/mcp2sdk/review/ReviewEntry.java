@@ -184,7 +184,7 @@ public final class ReviewEntry {
     }
 
     /**
-     * @return the readable tool name ({@code "Python-Ausführung"}), for headings and grouping
+     * @return the readable tool name, e.g. ({@code "Python execution"}), for headings and grouping
      */
     public String toolTitle() {
         return toolTitle;

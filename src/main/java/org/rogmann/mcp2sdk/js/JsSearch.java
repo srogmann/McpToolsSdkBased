@@ -625,7 +625,7 @@ public final class JsSearch {
             MODE_FILES_WITH_MATCHES, "a mode of search.grep() and search.files()",
             MODE_STRUCTURED, "the default mode of search.find()",
             MODE_OFFSETS, "a mode of search.grep() and search.find()",
-            MODE_COUNTS, "a string mode of search.grep()");
+            MODE_COUNTS, "a mode of search.grep() and search.find()");
 
     /** Value of the {@code binary} option: skip binary files (default, unchanged behaviour). */
     public static final String BINARY_SKIP = "skip";
@@ -907,18 +907,14 @@ public final class JsSearch {
             throw new IllegalArgumentException("recursiveArchives requires archives: true");
         }
         parseMode(raw.get("mode"), modeContext, o);
-        if (!o.binaryBytes() && (MODE_OFFSETS.equals(o.mode) || MODE_COUNTS.equals(o.mode))) {
-            // Spec 19.4/19.5: both modes are byte search only. Accepting them for a text search
-            // would silently answer with content lines instead - the same kind of untruthful
-            // answer that finding G-042 complains about, only quieter.
+        if (!o.binaryBytes() && MODE_OFFSETS.equals(o.mode)) {
+            // Spec 19.4: offsets describe byte positions, a text search reports line numbers.
+            // counts (19.5) counts what the text search would find, so it works in both modes.
             throw new IllegalArgumentException("mode '" + o.mode + "' is a byte-search mode and needs"
-                    + " binary: \"" + BINARY_BYTES + "\" ("
-                    + (MODE_COUNTS.equals(o.mode)
-                        ? "a text search counts per file in the structured result of search.find()"
-                        : "a text search reports line numbers, not byte offsets")
-                    + ", see search.help())");
+                    + " binary: \"" + BINARY_BYTES + "\" (a text search reports line numbers, not"
+                    + " byte offsets, see search.help())");
         }
-        if (MODE_COUNTS.equals(o.mode) && !o.filename) {
+        if (MODE_COUNTS.equals(o.mode) && !o.filename && !isFindContext(modeContext)) {
             throw new IllegalArgumentException("Option 'filename' cannot be false with mode '"
                     + MODE_COUNTS + "': a line of bare numbers could not be traced back to a file");
         }
@@ -929,7 +925,7 @@ public final class JsSearch {
      * Mode validation per entry point (spec section 19.3, modes of the byte search 19.4/19.5).
      * <ul>
      *   <li>{@code search.grep}: content, filesWithMatches, offsets, counts</li>
-     *   <li>{@code search.find}: structured, offsets (counts is string-only)</li>
+     *   <li>{@code search.find}: structured, offsets, counts</li>
      *   <li>{@code search.files}: filesWithMatches (that is all it returns)</li>
      * </ul>
      * A value that is not accepted is described by {@link #unsupportedMode(String, String, List)}:
@@ -968,7 +964,7 @@ public final class JsSearch {
     /** The modes of one entry point, in the order they are listed in messages. */
     private static List<String> allowedModes(String context) {
         if (isFindContext(context)) {
-            return List.of(MODE_STRUCTURED, MODE_OFFSETS);
+            return List.of(MODE_STRUCTURED, MODE_OFFSETS, MODE_COUNTS);
         }
         if ("search.files".equals(context)) {
             return List.of(MODE_FILES_WITH_MATCHES);
@@ -1820,6 +1816,8 @@ public final class JsSearch {
         private final Options opts;
         /** Matches per display path, sorted by display path. */
         private final Map<String, List<MatchRecord>> byPath = new TreeMap<>(DISPLAY_PATH_ORDER);
+        /** Match totals per display path in mode:"counts" (sorted like the other results). */
+        private final Map<String, Long> countsByPath = new TreeMap<>(DISPLAY_PATH_ORDER);
         private final Counts counts = new Counts();
         private final List<String> warnings = new ArrayList<>();
         /**
@@ -2303,6 +2301,7 @@ public final class JsSearch {
                 }
                 FileScan asFileScan = new FileScan();
                 asFileScan.matches.addAll(scan.matches);
+                asFileScan.matchCount = scan.matches.size();
                 commit(src, asFileScan);
                 if (scan.perFileLimitCut && !truncated) {
                     // maxMatchesPerFile dropped at least one match: the result is cut, and
@@ -2430,7 +2429,9 @@ public final class JsSearch {
                                       long prevWindowEnd, SpanMatcher matcher, int preview,
                                       boolean lastWindow, String display, BinaryScan out) {
             int from = 0;
-            Integer perFile = opts.maxMatchesPerFile;
+            // Counts mode counts the total (spec 19.5): maxMatchesPerFile must not cut the
+            // scan short, the count would come out wrong.
+            Integer perFile = MODE_COUNTS.equals(opts.mode) ? null : opts.maxMatchesPerFile;
             while (from <= window.length()) {
                 MatchSpan span = matcher.find(window, from);
                 if (span == null) {
@@ -2539,15 +2540,24 @@ public final class JsSearch {
             int limit = (int) Math.min(Math.max(1L, maxBytes), Integer.MAX_VALUE);
             LineSplitter lines = new LineSplitter(in, limit);
             boolean filesOnly = MODE_FILES_WITH_MATCHES.equals(opts.mode);
+            boolean countsOnly = MODE_COUNTS.equals(opts.mode);
             // Context is collected for content and structured output; in files-with-matches
             // mode the context options are ignored (spec section 9) and scanning stops at the
-            // first match per file.
-            int beforeN = filesOnly ? 0 : opts.before;
-            int afterN = filesOnly ? 0 : opts.after;
+            // first match per file. Counts mode ignores the context as well: it counts what
+            // the search would find, must not stop at maxMatches (a total is never cut,
+            // spec 19.5) and collects no match objects at all.
+            int beforeN = filesOnly || countsOnly ? 0 : opts.before;
+            int afterN = filesOnly || countsOnly ? 0 : opts.after;
             Deque<LineRef> ring = new ArrayDeque<>();
             List<MatchRecord> pendingAfter = new ArrayList<>();
             String line;
             while ((line = lines.next()) != null) {
+                if (countsOnly) {
+                    if (matcher.test(line)) {
+                        result.matchCount++;
+                    }
+                    continue;
+                }
                 int lineNo = lines.lineNumber();
                 for (Iterator<MatchRecord> it = pendingAfter.iterator(); it.hasNext(); ) {
                     MatchRecord pending = it.next();
@@ -2583,6 +2593,7 @@ public final class JsSearch {
                 // matches that were found before the limit are discarded.
                 result.oversized = true;
                 result.matches.clear();
+                result.matchCount = 0;
             }
             return result;
         }
@@ -2592,6 +2603,18 @@ public final class JsSearch {
             counts.filesScanned++;
             if (src.depth > 0) {
                 counts.archiveEntriesScanned++;
+            }
+            if (MODE_COUNTS.equals(opts.mode)) {
+                // Counts mode reports the total per source (spec 19.5): maxMatches and
+                // maxMatchesPerFile do not apply, nothing is collected into byPath and the
+                // result is never truncated by maxMatches.
+                if (scan.matchCount > 0) {
+                    counts.matches = (int) Math.min((long) counts.matches + scan.matchCount,
+                            Integer.MAX_VALUE);
+                    counts.filesMatched++;
+                    countsByPath.put(src.displayPath, scan.matchCount);
+                }
+                return;
             }
             List<MatchRecord> matches = scan.matches;
             if (matches.isEmpty()) {
@@ -2664,10 +2687,13 @@ public final class JsSearch {
 
         Map<String, Object> toStructured() {
             boolean reduced = MODE_OFFSETS.equals(opts.mode);
+            boolean countsOnly = MODE_COUNTS.equals(opts.mode);
             List<Object> matches = new ArrayList<>();
-            for (List<MatchRecord> list : byPath.values()) {
-                for (MatchRecord m : list) {
-                    matches.add(m.byteOffset >= 0 ? byteMatchMap(m, reduced) : lineMatchMap(m));
+            if (!countsOnly) {
+                for (List<MatchRecord> list : byPath.values()) {
+                    for (MatchRecord m : list) {
+                        matches.add(m.byteOffset >= 0 ? byteMatchMap(m, reduced) : lineMatchMap(m));
+                    }
                 }
             }
             Map<String, Object> countsMap = new LinkedHashMap<>();
@@ -2683,7 +2709,7 @@ public final class JsSearch {
 
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("matches", matches);
-            result.put("files", matchedPaths());
+            result.put("files", countsOnly ? new ArrayList<>(countsByPath.keySet()) : matchedPaths());
             result.put("counts", countsMap);
             result.put("truncated", truncated);
             result.put("truncatedReason", truncatedReason);
@@ -2744,6 +2770,17 @@ public final class JsSearch {
         String toText(Options options) {
             StringBuilder sb = new StringBuilder();
             OutputLimiter limiter = new OutputLimiter(options.maxOutputBytes);
+            if (MODE_COUNTS.equals(opts.mode)) {
+                // 'path:count' for a text and a byte search alike (spec 19.5); countsByPath
+                // holds the uncapped totals, so maxMatches cannot shorten this output. Only
+                // a maxOutputBytes cut of the string output can still truncate it.
+                for (Map.Entry<String, Long> count : countsByPath.entrySet()) {
+                    if (!limiter.append(sb, pathPrefix(count.getKey()) + count.getValue())) {
+                        break;
+                    }
+                }
+                return finish(sb, limiter);
+            }
             if (MODE_FILES_WITH_MATCHES.equals(opts.mode)) {
                 for (String path : byPath.keySet()) {
                     if (!limiter.append(sb, path)) {
@@ -2753,8 +2790,8 @@ public final class JsSearch {
                 return finish(sb, limiter);
             }
             if (opts.binaryBytes()) {
-                // Byte search has no lines: content, offsets and counts all come from the byte
-                // formatter (spec 19.4, 19.5 and 19.6).
+                // Byte search has no lines: content and offsets come from the byte formatter
+                // (spec 19.4 and 19.6); counts is answered above from the per-source totals.
                 return byteModeText(sb, limiter, options);
             }
             // Separator lines only make sense with context (GNU grep behaviour): without
@@ -2798,22 +2835,16 @@ public final class JsSearch {
         }
 
         /**
-         * Output of every byte-search mode: {@code path:count} (spec 19.5),
+         * Output of the byte-search modes that emit one line per match:
          * {@code path:0xoffset+length[  hex  |ascii|]} (spec 19.4) and the same line plus the
-         * text column for content mode (spec 19.6).
+         * text column for content mode (spec 19.6). Counts mode (19.5) is answered by
+         * {@link #toText(Options)} from the per-source totals before this method is reached.
          */
         private String byteModeText(StringBuilder sb, OutputLimiter limiter, Options options) {
-            boolean countsOnly = MODE_COUNTS.equals(opts.mode);
             boolean offsetsOnly = MODE_OFFSETS.equals(opts.mode);
             for (Map.Entry<String, List<MatchRecord>> pathEntry : byPath.entrySet()) {
                 List<MatchRecord> records = pathEntry.getValue();
                 if (records.isEmpty()) {
-                    continue;
-                }
-                if (countsOnly) {
-                    if (!limiter.append(sb, pathPrefix(pathEntry.getKey()) + records.size())) {
-                        return finish(sb, limiter);
-                    }
                     continue;
                 }
                 for (MatchRecord m : records) {
@@ -3284,6 +3315,8 @@ public final class JsSearch {
     /** Matches of one scanned source. */
     private static final class FileScan {
         final List<MatchRecord> matches = new ArrayList<>(4);
+        /** Match total of counts mode (spec 19.5); {@code matches} stays empty there. */
+        long matchCount;
         boolean oversized;
     }
 
@@ -3638,9 +3671,9 @@ public final class JsSearch {
             "--- Options (strict: unknown options are rejected) ---",
             "Scope:      recursive=false",
             "Output:     mode=\"content\"|\"filesWithMatches\"|\"offsets\"|\"counts\" (grep);",
-            "            \"structured\"|\"offsets\" (find); \"filesWithMatches\" (files);",
-            "            offsets/counts are byte-search modes and need binary=\"bytes\";",
-            "            filename=true, lineNumbers=true",
+            "            \"structured\"|\"offsets\"|\"counts\" (find); \"filesWithMatches\" (files);",
+            "            offsets needs binary=\"bytes\"; counts works in both modes and reports",
+            "            totals that maxMatches does not cap; filename=true, lineNumbers=true",
             "Context:    before=0, after=0, context=0 (aliases B, A, C; conflicts are errors)",
             "Pattern:    flags=\"\" (any of " + VALID_REGEX_FLAGS + "), caseInsensitive=false",
             "Text:       encoding=\"UTF-8\" (only), binary=\"skip\"|\"bytes\"",

@@ -9,6 +9,7 @@ import io.modelcontextprotocol.spec.McpSchema.JsonSchema;
 import org.rogmann.mcp2sdk.ToolSpecWithState;
 import org.rogmann.mcp2sdk.ToolState;
 import org.rogmann.mcp2sdk.WorkProject;
+import org.rogmann.mcp2sdk.m2.MavenProcess;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.env.Environment;
@@ -81,7 +82,7 @@ public class ReadDependencyClassSourceTool {
 
         Map<String, Object> pathPomProp = new HashMap<>();
         pathPomProp.put("type", "string");
-        pathPomProp.put("description", "Path to the pom.xml whose classpath should be determined. Can be relative or absolute. If relative and projectName is provided, the path is resolved relative to the project directory.");
+        pathPomProp.put("description", "Path to the pom.xml whose classpath should be determined. An absolute path is used as it stands; a relative one is always resolved against the project directory (the projectName project, or the configured project when no name is given) - never against the directory the server was started in.");
         properties.put("path_pom", pathPomProp);
 
         // Offer the project name if several projects are possible (a filter is set) or
@@ -123,7 +124,8 @@ public class ReadDependencyClassSourceTool {
                 .name(NAME)
                 .title("Read Dependency Class Source")
                 .description("This tool reads the source of Java classes in Maven dependencies (i.e., in the local M2) from the current classpath. " +
-                        "If source JARs are missing, they can be automatically downloaded via Maven (controlled by system property tools.maven.autoDownloadSources, default: true).")
+                        "If source JARs are missing, they can be automatically downloaded via Maven (controlled by system property tools.maven.autoDownloadSources, default: true). " +
+                        "Both run Maven, so both go through the POM guard: an unchanged pom.xml resolves without asking, a pom.xml that changed since the server started needs an approval (the answer names the request id), and a source download is asked about even when nothing changed because it writes into the local repository.")
                 .inputSchema(inputSchema)
                 .build();
 
@@ -189,11 +191,15 @@ public class ReadDependencyClassSourceTool {
         LOGGER.info("Configuration: m2Path={}, mavenCommand={}, autoDownloadSources={}, timeoutSeconds={}", 
                 m2Path, mavenCommand, autoDownloadSources, timeoutSeconds);
 
-        // Resolve pomPath: try direct path first, then resolve relative paths via the project
-        // directory. If no project name is supplied, fall back to the configured project
-        // (single-project setup); a name is only required when several projects are possible.
+        // Resolve pomPath: an absolute path that exists is taken as it stands; a relative one is
+        // resolved via the project directory. If no project name is supplied, fall back to the
+        // configured project (single-project setup); a name is only required when several projects
+        // are possible.
+        // A relative spelling never means "the directory this server was started in" - that would
+        // read a POM outside the watched project, and outside the comparison the guard makes about
+        // it (docs/open-points.md §5).
         Path pomPath = Path.of(pathPom);
-        if (!Files.exists(pomPath)) {
+        if (!pomPath.isAbsolute() || !Files.exists(pomPath)) {
             Map<String, Object> lookupResult = new HashMap<>();
             WorkProject workProject = (projectName == null || projectName.isBlank())
                     ? WorkProject.lookupProject(lookupResult)
@@ -233,7 +239,8 @@ public class ReadDependencyClassSourceTool {
 
         try {
             // Resolve classpath using Maven
-            Map<String, Path> classpathMap = resolveClasspath(pomPath, mavenCommand, m2Path);
+            Map<String, Path> classpathMap = resolveClasspath(pomPath, mavenCommand, m2Path,
+                    timeoutSeconds);
 
             // Process each requested class
             List<Map<String, Object>> results = new ArrayList<>();
@@ -308,9 +315,18 @@ public class ReadDependencyClassSourceTool {
     }
 
     /**
-     * Resolves the Maven classpath by executing mvn dependency:build-classpath
+     * Resolves the Maven classpath by running mvn dependency:build-classpath.
+     * <p>
+     * The run goes through {@link MavenProcess}, which is also what puts it behind the POM guard:
+     * taking the classpath of a POM the model has just edited is a Maven run whose inputs changed,
+     * and that is decided by a human (docs/maven-guard.md). A denial reaches the caller as an
+     * IOException naming the request, so the open question is findable on /review.
+     * </p>
+     *
+     * @param timeoutSeconds wall-clock budget of the Maven process (it used to be a hardcoded 60)
      */
-    private Map<String, Path> resolveClasspath(Path pomPath, String mavenCommand, String m2Path) throws IOException {
+    private Map<String, Path> resolveClasspath(Path pomPath, String mavenCommand, String m2Path,
+                                               int timeoutSeconds) throws IOException {
         Map<String, Path> classpathMap = new HashMap<>();
 
         // Create temp file in system temp directory
@@ -318,37 +334,22 @@ public class ReadDependencyClassSourceTool {
         Path cpFile = tempDir.resolve("cp.txt");
 
         try {
-            ProcessBuilder pb = new ProcessBuilder(
-                    mavenCommand,
-                    "dependency:build-classpath",
-                    "-Dmdep.outputFile=" + cpFile,
-                    "-q",
-                    "-f", pomPath.toString()
-            );
-            // Handle case where getParent() returns null (pomPath is at root level)
+            // -N: a multi-module POM would run the goal once per module and every module writes
+            // the same file - the last one wins, and the answer is one module's classpath.
+            List<String> args = new ArrayList<>(MavenProcess.readFlags());
+            args.add(MavenProcess.dependencyGoal("build-classpath"));
+            args.add("-Dmdep.outputFile=" + cpFile);
+            args.add("-q");
+            args.add("-N");
+            args.add("-f");
+            args.add(pomPath.toString());
+            // A POM with no directory part is anchored by MavenProcess at the watched project
+            // directory, never at Path.of(".") - the process directory of this server
+            // (docs/open-points.md §5).
             Path pomDir = pomPath.getParent();
-            pb.directory(pomDir != null ? pomDir.toFile() : new File("."));
-            pb.redirectErrorStream(true);
-
-            Process process = pb.start();
-            int maxSeconds = 60;
-            boolean isOk;
-            try {
-                isOk = process.waitFor(maxSeconds, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IOException("Couldn't read class-path of pom (%s) in %d seconds".formatted(pomPath, maxSeconds), e);
-            }
-
-            if (!isOk) {
-                String errorOutput = new BufferedReader(new InputStreamReader(process.getInputStream()))
-                        .lines().collect(Collectors.joining("\n"));
-                throw new IOException("Maven command failed: " + errorOutput);
-            } else if (process.exitValue() != 0) {
-                String errorOutput = new BufferedReader(new InputStreamReader(process.getInputStream()))
-                        .lines().collect(Collectors.joining("\n"));
-                throw new IOException("Maven command failed with " + process.exitValue() + ": " + errorOutput);
-            }
+            MavenProcess.run(new MavenProcess.Options(pomPath,
+                    pomDir, mavenCommand, args,
+                    timeoutSeconds, lockWaitSeconds(), false));
 
             // Read classpath file
             if (Files.exists(cpFile)) {
@@ -620,51 +621,41 @@ public class ReadDependencyClassSourceTool {
      */
     private boolean downloadSourceJar(ArtifactInfo artifactInfo, String mavenCommand, Path pomPath, int timeoutSeconds) {
         LOGGER.info("Downloading source JAR for {}:{}", artifactInfo.groupId(), artifactInfo.artifactId());
-        
+
         // Use mvn dependency:get to download specific source JAR
-        String artifactCoord = String.format("%s:%s:%s:jar:sources", 
+        String artifactCoord = String.format("%s:%s:%s:jar:sources",
                 artifactInfo.groupId(), artifactInfo.artifactId(), artifactInfo.version());
-        
-        ProcessBuilder pb = new ProcessBuilder(
-                mavenCommand,
-                "dependency:get",
-                "-Dartifact=" + artifactCoord,
-                "-q"
-        );
-        
-        // Use pom directory as working directory
+        List<String> args = new ArrayList<>();
+        args.add(MavenProcess.dependencyGoal("get"));
+        args.add("-Dartifact=" + artifactCoord);
+        args.add("-Dtransitive=false");
+        args.add("-q");
+
+        // Use pom directory as working directory; when it has none, MavenProcess anchors the run at
+        // the watched project directory instead of this server's process directory
+        // (docs/open-points.md §5).
         Path pomDir = pomPath.getParent();
-        pb.directory(pomDir != null ? pomDir.toFile() : new File("."));
-        pb.redirectErrorStream(true);
-        
         try {
-            Process process = pb.start();
-            boolean isOk = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
-            
-            if (!isOk) {
-                LOGGER.warn("Maven download timed out after {} seconds", timeoutSeconds);
-                process.destroyForcibly();
-                return false;
-            }
-            
-            if (process.exitValue() != 0) {
-                String errorOutput = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))
-                        .lines().collect(Collectors.joining("\n"));
-                LOGGER.warn("Maven download failed with exit code {}: {}", process.exitValue(), errorOutput);
-                return false;
-            }
-            
+            // networkRun: this is the one command here that leaves the machine and writes into
+            // the repository, so the guard asks about it even when no project input changed
+            // (docs/maven-guard.md §5 Nr. 3). No readFlags(): offline would defeat the purpose.
+            MavenProcess.run(new MavenProcess.Options(pomPath,
+                    pomDir, mavenCommand, args,
+                    timeoutSeconds, lockWaitSeconds(), true));
             LOGGER.info("Successfully downloaded source JAR for {}:{}", artifactInfo.groupId(), artifactInfo.artifactId());
             return true;
-            
-        } catch (IOException | InterruptedException e) {
-            LOGGER.warn("Failed to download source JAR for {}:{}: {}", 
+        } catch (IOException e) {
+            // A denial is a decision, not a glitch: the message says which request is open.
+            LOGGER.warn("Source JAR not downloaded for {}:{}: {}",
                     artifactInfo.groupId(), artifactInfo.artifactId(), e.getMessage());
-            if (e instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-            }
             return false;
         }
+    }
+
+    /** How long a caller waits for the one Maven gate of this server. */
+    private static long lockWaitSeconds() {
+        return Long.parseLong(getProperty("tools.maven.lock-wait-seconds",
+                "tools.maven.lockWaitSeconds", "120"));
     }
 
     /**

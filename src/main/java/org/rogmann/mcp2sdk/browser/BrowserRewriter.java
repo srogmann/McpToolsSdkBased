@@ -3,6 +3,9 @@ package org.rogmann.mcp2sdk.browser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.URLDecoder;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -68,6 +71,14 @@ public final class BrowserRewriter {
     private final boolean relaxCsp;
     private final boolean injectBridge;
     private final String cspNonce;
+    /**
+     * The origin the <b>browser</b> used to reach the proxy ({@code scheme://authority}), or {@code null}
+     * without a rewrite-rule context. The pair with {@link #upstreamAuthority} is what a
+     * {@code queryParamUrl} rule swaps (docs/browser.md §3a) - both addresses a return URL can name.
+     */
+    private final String proxyOrigin;
+    /** The authority the proxy addresses the application at - what {@code X-Forwarded-Host} carries. */
+    private final String upstreamAuthority;
 
     /**
      * @param app          the application being called
@@ -81,6 +92,21 @@ public final class BrowserRewriter {
      */
     public BrowserRewriter(BrowserApp app, BrowserApps registry, String sessionId,
             BrowserOrigin origin, boolean relaxCsp, boolean injectBridge, String cspNonce) {
+        this(app, registry, sessionId, origin, relaxCsp, injectBridge, cspNonce, null, null);
+    }
+
+    /**
+     * Full constructor with the rewrite-rule context (docs/browser.md §3a): the origin the
+     * <b>browser</b> used and the authority the proxy addresses the application at. Without the context
+     * (tests, callers before the pass-through ran) the rules of the registry stay inert.
+     *
+     * @param proxyOrigin        the browser's origin for this session, e.g.
+     *                           {@code http://browserdemo.localhost:9101}
+     * @param upstreamAuthority  the authority of the upstream base, e.g. {@code 127.0.0.1:9091}
+     */
+    public BrowserRewriter(BrowserApp app, BrowserApps registry, String sessionId,
+            BrowserOrigin origin, boolean relaxCsp, boolean injectBridge, String cspNonce,
+            String proxyOrigin, String upstreamAuthority) {
         this.app = app;
         this.registry = registry;
         this.sessionId = sessionId;
@@ -89,6 +115,11 @@ public final class BrowserRewriter {
         this.relaxCsp = relaxCsp;
         this.injectBridge = injectBridge;
         this.cspNonce = cspNonce;
+        this.proxyOrigin = proxyOrigin == null || proxyOrigin.isBlank() ? null
+                : (proxyOrigin.endsWith("/") ? proxyOrigin.substring(0, proxyOrigin.length() - 1)
+                        : proxyOrigin);
+        this.upstreamAuthority = upstreamAuthority == null || upstreamAuthority.isBlank()
+                ? null : upstreamAuthority;
     }
 
     /**
@@ -235,11 +266,33 @@ public final class BrowserRewriter {
     /**
      * A single URL value - also from {@code Location}, {@code <meta refresh>} or an attribute.
      *
+     * <p>Two layers, deliberately separate: first the <b>rewrite rules of the registry</b>
+     * (docs/browser.md §3a - they may change the URL, e.g. the return URL inside the query of a hop),
+     * then the <b>standard mapping</b>, which decides about bending into the session as always. A rule
+     * does not switch the provenance logic off - it feeds it: the result of a rule is mapped exactly
+     * like the original would have been.</p>
+     *
      * @param raw      the original value
      * @param pagePath the upstream path of the document holding the entry
-     * @return the rewritten value, or {@code raw} when we keep our hands off it
+     * @return the rewritten value, or the (possibly rule-changed) input when we keep our hands off it
      */
     public String toProxy(String raw, String pagePath) {
+        if (raw == null) {
+            return null;
+        }
+        return mapProxy(applyRules(raw, pagePath), pagePath);
+    }
+
+    /**
+     * The standard mapping - the body this class shipped before the rewrite rules existed. "Keep our
+     * hands off" here means: hands off <em>apart from the rules</em>, which have already run and whose
+     * result arrives as {@code raw}.
+     *
+     * @param raw      the value after the rules
+     * @param pagePath the upstream path of the document holding the entry
+     * @return the mapped value, or the input when unmapped
+     */
+    private String mapProxy(String raw, String pagePath) {
         if (raw == null || raw.isBlank()) {
             return raw;
         }
@@ -329,6 +382,122 @@ public final class BrowserRewriter {
             return null;
         }
         return registry.byHost(host).map(other -> prefixFor(other.id(), sessionId)).orElse(null);
+    }
+
+    // ------------------------------------------------------------------ rewrite rules (docs/browser.md §3a)
+
+    /**
+     * The per-application rewrite rules of the registry, before the standard mapping. Without a context
+     * (proxy origin, upstream authority - both come from the pass-through; tests can work without) the
+     * rules stay inert - a rule that silently did nothing would be the audit's problem, which is why
+     * the index page and {@code action=apps} name the active rules.
+     */
+    private String applyRules(String url, String pagePath) {
+        if (url == null || app.rewriteRules().isEmpty() || proxyOrigin == null) {
+            return url;
+        }
+        String result = url;
+        for (BrowserRewriteRule rule : app.rewriteRules()) {
+            result = applyRule(rule, result, pagePath);
+        }
+        return result;
+    }
+
+    /**
+     * One rule of type {@code queryParamUrl}: walks the query of the URL and replaces the value of the
+     * named parameter when it decodes to an absolute http(s) URL that names the expected authority.
+     * Everything else of the URL - the other parameters, their order, their encoding - stays byte for
+     * byte: a proxy may only change what it has to change.
+     */
+    private String applyRule(BrowserRewriteRule rule, String url, String pagePath) {
+        if (!rule.appliesToPage(pagePath)) {
+            return url;
+        }
+        int queryAt = url.indexOf('?');
+        if (queryAt < 0) {
+            return url;
+        }
+        String from = resolveFrom(rule.from());
+        String[] pairs = url.substring(queryAt + 1).split("&", -1);
+        StringBuilder out = new StringBuilder(url.substring(0, queryAt + 1));
+        boolean changed = false;
+        for (int i = 0; i < pairs.length; i++) {
+            if (i > 0) {
+                out.append('&');
+            }
+            String pair = pairs[i];
+            int eq = pair.indexOf('=');
+            String name = eq < 0 ? pair : pair.substring(0, eq);
+            String rewritten = name.equals(rule.param())
+                    ? rewriteParamValue(eq < 0 ? "" : pair.substring(eq + 1), from, rule.to())
+                    : null;
+            if (rewritten == null) {
+                out.append(pair);
+                continue;
+            }
+            out.append(name).append('=').append(rewritten);
+            changed = true;
+        }
+        return changed ? out.toString() : url;
+    }
+
+    /**
+     * The value of the return-URL parameter: decoded, checked, retargeted, encoded again - or
+     * {@code null} when the rule does not apply to this value (not absolute, not the expected
+     * authority, no usable target).
+     */
+    private String rewriteParamValue(String rawValue, String from, String to) {
+        if (from == null || from.isBlank()) {
+            return null;
+        }
+        String value;
+        try {
+            value = URLDecoder.decode(rawValue, StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
+            return null;                        // malformed escape: not ours to fix
+        }
+        String lower = value.toLowerCase(Locale.ROOT);
+        if (!lower.startsWith("http://") && !lower.startsWith("https://")) {
+            return null;                        // the rule speaks only of absolute URLs
+        }
+        int schemeEnd = lower.indexOf("://") + 3;
+        String rest = value.substring(schemeEnd);
+        String authority = hostOf(rest);        // up to the first '/', '?' or '#'
+        if (!authority.equalsIgnoreCase(from)) {
+            return null;
+        }
+        int cut = indexOfFirst(rest, '/', '?', '#');
+        String tail = cut < 0 ? "" : rest.substring(cut);   // path + query + fragment, '/'-led
+        String target = resolveTo(to);
+        if (target == null) {
+            return null;
+        }
+        String path = tail.isEmpty() || tail.startsWith("?") || tail.startsWith("#")
+                ? "/" + tail : tail;            // "host?x" and "host#f" mean the root path
+        return URLEncoder.encode(target + path, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * {@code "upstream"} stands for the authority the proxy addresses the application at - exactly the
+     * one {@code X-Forwarded-Host} carries, and therefore the one the application's return URL names.
+     */
+    private String resolveFrom(String from) {
+        if (BrowserRewriteRule.FROM_UPSTREAM.equalsIgnoreCase(from)) {
+            return upstreamAuthority;
+        }
+        return from;
+    }
+
+    /**
+     * {@code "session"} stands for the origin the browser used to reach us - in port mode the
+     * listener's origin, in path mode additionally bent into the session prefix, exactly like a
+     * self-reference of the application. A literal value is taken as it stands, one trailing slash off.
+     */
+    private String resolveTo(String to) {
+        if (BrowserRewriteRule.TO_SESSION.equalsIgnoreCase(to)) {
+            return proxyOrigin + prefix;
+        }
+        return to.endsWith("/") ? to.substring(0, to.length() - 1) : to;
     }
 
     /**

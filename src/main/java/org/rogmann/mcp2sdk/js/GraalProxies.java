@@ -4,10 +4,16 @@ import org.graalvm.polyglot.Value;
 import org.graalvm.polyglot.proxy.ProxyArray;
 import org.graalvm.polyglot.proxy.ProxyObject;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Utility methods for converting between GraalVM Polyglot values and
@@ -138,11 +144,35 @@ public class GraalProxies {
         for (int i = 0; i < data.length; i++) {
             Value el = value.getArrayElement(i);
             if (el == null || !el.isNumber()) {
-                throw new IllegalArgumentException("element " + i + " of data is not a number");
+                throw new IllegalArgumentException("element " + i + " of data is not a number ("
+                        + describeElement(el) + ") - data must be a Uint8Array or an array of"
+                        + " numbers 0-255; a nested array (a block list) is not accepted");
             }
             data[i] = (byte) (el.asInt() & 0xFF);
         }
         return data;
+    }
+
+    /**
+     * Names what arrived where a number was expected, so the type hint says what the caller
+     * actually passed instead of only blaming "element 0". Especially the nested-array case
+     * (a block list) gets its own wording, because that is what callers pass when they try to
+     * stream data into an API that takes one byte array.
+     */
+    private static String describeElement(Value el) {
+        if (el == null || el.isNull()) {
+            return "null element";
+        }
+        if (el.isString()) {
+            return "a string";
+        }
+        if (el.hasArrayElements()) {
+            return "a nested array";
+        }
+        if (el.isBoolean()) {
+            return "a boolean";
+        }
+        return "a non-numeric value";
     }
 
     // ---------------------------------------------------------------
@@ -293,5 +323,113 @@ public class GraalProxies {
         public void set(long index, Value value) {
             throw new UnsupportedOperationException("Read-only proxy");
         }
+    }
+
+    // ---------------------------------------------------------------
+    // "Unknown identifier" hints (did you mean)
+    // ---------------------------------------------------------------
+
+    /** Matches the "Unknown identifier: x" part of a polyglot member-access failure. */
+    private static final Pattern UNKNOWN_IDENTIFIER =
+            Pattern.compile("Unknown identifier: ([A-Za-z_$][\\w$]*)");
+
+    /** Closer hints for members that are near misses of a different, real member. */
+    private static final Map<String, String> MEMBER_HINTS = Map.of(
+            "fs.readBytes", "a single read is capped at 1 MiB - pass offset and length or use"
+                    + " fs.createBlockReader for a whole stream");
+
+    /**
+     * Builds a "Did you mean ...?" hint for an {@code Unknown identifier: x} failure, searched
+     * over the member names of the wired sandbox modules (module name -> member names).
+     * <p>
+     * The polyglot layer answers a failed member access on a module proxy with a bare
+     * "Unknown identifier: read" - it names neither the module nor the close matches. The hint
+     * adds both, with qualified candidates ("fs.readFile"), because the exception does not say
+     * which object the failed access belonged to. A candidate matches when its edit distance to
+     * the unknown name is at most 2 or when one is a prefix of the other (at least 3 characters),
+     * so {@code read} finds {@code readFile}/{@code readLines}/{@code readBytes}.
+     * </p>
+     * @param message the (polyglot) exception message to inspect, may be null
+     * @param moduleMembers member names of the wired modules, module name -> member names
+     * @return the hint, or "" if the message does not name an unknown identifier or no module
+     *         member is close enough
+     */
+    public static String unknownIdentifierHint(String message,
+                                               Map<String, List<String>> moduleMembers) {
+        if (message == null || moduleMembers == null) {
+            return "";
+        }
+        Matcher m = UNKNOWN_IDENTIFIER.matcher(message);
+        if (!m.find()) {
+            return "";
+        }
+        String name = m.group(1);
+        List<String> qualified = new ArrayList<>();
+        List<Integer> distances = new ArrayList<>();
+        List<String> modules = new ArrayList<>();
+        for (Map.Entry<String, List<String>> module : moduleMembers.entrySet()) {
+            for (String member : module.getValue()) {
+                int distance = editDistance(name, member);
+                boolean near = distance <= 2
+                        || (member.startsWith(name) && name.length() >= 3)
+                        || (name.startsWith(member) && member.length() >= 3);
+                if (near) {
+                    qualified.add(module.getKey() + "." + member);
+                    distances.add(distance);
+                    modules.add(module.getKey());
+                }
+            }
+        }
+        if (qualified.isEmpty()) {
+            return "";
+        }
+        List<Integer> order = new ArrayList<>();
+        for (int i = 0; i < qualified.size(); i++) {
+            order.add(i);
+        }
+        order.sort(Comparator.<Integer>comparingInt(distances::get).thenComparing(qualified::get));
+
+        StringBuilder sb = new StringBuilder("Did you mean ");
+        Set<String> helpModules = new TreeSet<>();
+        for (int i = 0; i < order.size() && i < 4; i++) {
+            int idx = order.get(i);
+            if (i > 0) {
+                sb.append(i == Math.min(4, order.size()) - 1 ? " or " : ", ");
+            }
+            String candidate = qualified.get(idx);
+            sb.append('\'').append(candidate).append('\'');
+            String hint = MEMBER_HINTS.get(candidate);
+            if (hint != null) {
+                sb.append(" (").append(hint).append(')');
+            }
+            if (moduleMembers.getOrDefault(modules.get(idx), List.of()).contains("help")) {
+                helpModules.add(modules.get(idx));
+            }
+        }
+        sb.append('?');
+        for (String helpModule : helpModules) {
+            sb.append(" See ").append(helpModule).append(".help().");
+        }
+        return sb.toString();
+    }
+
+    /** Levenshtein edit distance of two names, for the did-you-mean suggestions. */
+    static int editDistance(String a, String b) {
+        int[] prev = new int[b.length() + 1];
+        int[] curr = new int[b.length() + 1];
+        for (int j = 0; j <= b.length(); j++) {
+            prev[j] = j;
+        }
+        for (int i = 1; i <= a.length(); i++) {
+            curr[0] = i;
+            for (int j = 1; j <= b.length(); j++) {
+                int substitution = prev[j - 1] + (a.charAt(i - 1) == b.charAt(j - 1) ? 0 : 1);
+                curr[j] = Math.min(substitution, Math.min(prev[j] + 1, curr[j - 1] + 1));
+            }
+            int[] swap = prev;
+            prev = curr;
+            curr = swap;
+        }
+        return prev[b.length()];
     }
 }

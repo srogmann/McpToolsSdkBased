@@ -16,7 +16,22 @@ import org.graalvm.polyglot.proxy.ProxyExecutable;
 import org.graalvm.polyglot.proxy.ProxyObject;
 import org.rogmann.mcp2sdk.ToolSpecWithState;
 import org.rogmann.mcp2sdk.ToolState;
-import org.rogmann.mcp2sdk.js.*;
+import org.rogmann.mcp2sdk.agent.ForkCallers;
+import org.rogmann.mcp2sdk.js.GraalProxies;
+import org.rogmann.mcp2sdk.js.JsAgentBoardBridge;
+import org.rogmann.mcp2sdk.js.JsArchiveBridge;
+import org.rogmann.mcp2sdk.js.JsCryptoBridge;
+import org.rogmann.mcp2sdk.js.JsCrypto;
+import org.rogmann.mcp2sdk.js.JsCryptoBridge;
+import org.rogmann.mcp2sdk.js.JsFileSystem;
+import org.rogmann.mcp2sdk.js.JsFileSystemBridge;
+import org.rogmann.mcp2sdk.js.JsJavapBridge;
+import org.rogmann.mcp2sdk.js.JsM2Bridge;
+import org.rogmann.mcp2sdk.js.JsMcpProxyBridge;
+import org.rogmann.mcp2sdk.js.JsModuleInterface;
+import org.rogmann.mcp2sdk.js.JsPdfBridge;
+import org.rogmann.mcp2sdk.js.JsSearchBridge;
+import org.rogmann.mcp2sdk.js.JsSQLiteBridge;
 import org.rogmann.mcp2sdk.xml.JsXmlBridge;
 import org.rogmann.mcp2sdk.poi.DocxToolBoxJsBridge;
 import org.rogmann.mcp2sdk.poi.PoiToolBoxJsBridge;
@@ -42,12 +57,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -154,6 +164,7 @@ public class JavaScriptTool {
         modules.put("fs", new JsFileSystemBridge());
         modules.put("crypto", new JsCryptoBridge());
         modules.put("archive", new JsArchiveBridge());
+        modules.put("pdf", new JsPdfBridge());
         // Read-only access to SQLite database files (tables/rows/forEachRow) with a small
         // built-in parser - no sqlite-jdbc dependency.
         modules.put("sqlite", new JsSQLiteBridge());
@@ -167,11 +178,20 @@ public class JavaScriptTool {
         // download is the single, switchable exception). Disable with
         // -Dmcp2sdk.module.m2.enabled=false.
         modules.put("m2", new JsM2Bridge());
+        // Controlled XML reading: structure discovery and streaming via StAX (constant memory,
+        // any size), XPath 1.0 queries over a per-call DOM cache, archive paths
+        // ("release.tar#dir/doc.xml"). Nothing is fetched from the network: a DOCTYPE resolves
+        // as a local file if one exists and is reported otherwise, so DTD-heavy documents stay
+        // analysable. Zero-hit queries explain themselves (docs/js/xml.md).
         modules.put("xml", new JsXmlBridge());
-        modules.put("pdf", new JsPdfBridge());
         modules.put("poi", new PoiToolBoxJsBridge());
         modules.put("docx", new DocxToolBoxJsBridge());
         modules.put("pptx", new PptxToolBoxJsBridge());
+        // The message board of a running prefix_fork batch (docs/subagent.md §14). Two switches,
+        // on purpose: the property names it in the tool description at all (off by default), and
+        // the caller decides whether anything is bound - a script outside a fork thread has no
+        // board, and require('board') says so with the list of what does exist.
+        modules.put("board", new JsAgentBoardBridge());
         modules.put("mcp", new JsMcpProxyBridge());
         return modules;
     }
@@ -186,7 +206,10 @@ public class JavaScriptTool {
                 "Use this tool to write and execute small scripts in JavaScript to do calculations.");
         boolean first = true;
         for (JsModuleInterface m : modules.values()) {
-            if (!m.isEnabled()) {
+            // Advertised, not merely enabled: a module that depends on who is calling (board) is
+            // switched on by a property here and bound per call - the description is one text and
+            // travels in every request.
+            if (!m.isAdvertised()) {
                 continue;
             }
             sb.append(first ? " " : ", ");
@@ -291,6 +314,7 @@ public class JavaScriptTool {
      * @return the tool call result
      */
     McpSchema.CallToolResult call(McpSyncServerExchange exchange, CallToolRequest request) {
+
         // Increment call count
         state.callCount().incrementAndGet();
 
@@ -343,8 +367,14 @@ public class JavaScriptTool {
                 sourceName = "inline+" + path;
             }
         }
+        // P0.3: who is speaking, decided by the session this call arrives on (docs/subagent.md §14)
+        // and handed down to the worker thread - the module wiring and the script both run there,
+        // where a ThreadLocal of the request thread would be invisible. Null is the normal case:
+        // an ordinary conversation is nobody's fork thread.
+        ForkCallers.Caller forkCaller = ForkCallers.callerOf(exchange,
+                System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds));
         return runScript(script, sourceName, timeoutSeconds,
-                (oPath != null) ? oPath.toString() : null);
+                (oPath != null) ? oPath.toString() : null, forkCaller);
     }
 
     /**
@@ -419,10 +449,11 @@ public class JavaScriptTool {
      * @param timeoutSeconds maximum execution time in seconds
      * @param basePath display path of the file executed via the 'path' parameter (null for
      *        inline-only); the base for resolving relative paths in require()/load()
+     * @param forkCaller the fork thread behind this call, or {@code null} (the usual case)
      * @return the tool call result
      */
     private CallToolResult runScript(String script, String sourceName, long timeoutSeconds,
-            String basePath) {
+            String basePath, ForkCallers.Caller forkCaller) {
         LOGGER.info("Executing JavaScript ({}, timeout {} s): {}", sourceName, timeoutSeconds, script);
 
         // The stdout capture buffer is created here (not in the worker) so that the output written
@@ -440,7 +471,7 @@ public class JavaScriptTool {
         Future<CallToolResult> future = JS_EXECUTOR.submit(() -> {
             workerRef.set(Thread.currentThread());
             return executeInSandbox(script, sourceName, timeoutSeconds, baosOut, cancelRequested,
-                    contextRef, basePath);
+                    contextRef, basePath, forkCaller);
         });
 
         try {
@@ -598,11 +629,13 @@ public class JavaScriptTool {
      * @param contextRef reference to publish the created context
      * @param basePath display path of the file executed via the 'path' parameter (null for
      *        inline-only); the base for resolving relative paths in require()/load()
+     * @param forkCaller who is speaking, when the call comes from a thread of a running fork
+     *        (resolved from the MCP session, see {@link ForkCallers}); {@code null} otherwise
      * @return the tool call result
      */
     private CallToolResult executeInSandbox(String script, String sourceName, long timeoutSeconds,
             ByteArrayOutputStream baosOut, AtomicBoolean cancelRequested, AtomicReference<Context> contextRef,
-            String basePath) {
+            String basePath, ForkCallers.Caller forkCaller) {
 
         // Capture console.log output (stdout)
         PrintStream outCapture = new PrintStream(baosOut, true, StandardCharsets.UTF_8);
@@ -614,6 +647,11 @@ public class JavaScriptTool {
         // Per-call resources returned by module wiring (e.g. an MCP client connection),
         // closed after the JavaScript call.
         List<AutoCloseable> callResources = new ArrayList<>();
+
+        // The identity of this call, open from the wiring to the last line of the script and closed
+        // in the finally below - a pooled worker thread must never meet a leftover of an earlier
+        // call, which is the whole reason the scope is a value and not a set-and-forget.
+        ForkCallers.Scope forkScope = null;
 
         Context context = null;
         try {
@@ -651,6 +689,11 @@ public class JavaScriptTool {
 
             Value jsBindings = context.getBindings("js");
 
+            // --- Identity of this call, for the modules that ask (docs/subagent.md §14, P0.3) ---
+            // Opened before isEnabled()/wireApi() are asked and left open while the script runs:
+            // a board call happens from inside the script, not from here.
+            forkScope = ForkCallers.open(forkCaller);
+
             // --- Wire the configured JS-modules generically ---
             // Build the CommonJS require-targets on the fly from the modules that are
             // enabled and require()-aliasable.
@@ -671,6 +714,7 @@ public class JavaScriptTool {
                     Value nsValue = jsBindings.getMember(m.getNamespace());
                     requireTargets.put(m.getNamespace(), nsValue);
                     requireTargets.put("node:" + m.getNamespace(), nsValue);
+                    registerModuleMembers(m.getNamespace(), nsValue);
                 }
             }
 
@@ -794,6 +838,10 @@ public class JavaScriptTool {
             }
             StringBuilder sbMsg = new StringBuilder("Error during JavaScript execution: ");
             sbMsg.append(shortenMessage(e.getMessage()));
+            String identifierHint = GraalProxies.unknownIdentifierHint(e.getMessage(), MODULE_MEMBERS);
+            if (!identifierHint.isEmpty()) {
+                sbMsg.append('\n').append(identifierHint);
+            }
             if (e instanceof PolyglotException pe) {
                 if (pe.isSyntaxError()) {
                     sbMsg.append("\nThe script contains a JavaScript syntax error.");
@@ -818,6 +866,11 @@ public class JavaScriptTool {
                 .addTextContent(errorMessage)
                 .build();
         } finally {
+            // The identity goes first: whatever is still running, this worker thread must not keep
+            // an identity into the next call it serves.
+            if (forkScope != null) {
+                forkScope.close();
+            }
             closeContextQuietly(context);
             // Close per-call module resources (e.g. the MCP client connection). This is done by
             // the worker thread itself; if it is stuck and cannot be cancelled, the resources are
@@ -845,6 +898,30 @@ public class JavaScriptTool {
                     + msgText.substring(msgText.length() - MAX_EXCEPTION_MESSAGE_TAIL);
         }
         return msgText;
+    }
+
+    /** Member names of the wired sandbox modules, the search space of the did-you-mean hint. */
+    private static final ConcurrentHashMap<String, List<String>> MODULE_MEMBERS =
+            new ConcurrentHashMap<>();
+
+    /**
+     * Remembers the member names of one wired module namespace, so an "Unknown identifier" error
+     * can be answered with a did-you-mean hint (see {@link GraalProxies#unknownIdentifierHint}).
+     * The member sets are constant per build; the first wiring wins and later calls keep it.
+     */
+    private static void registerModuleMembers(String namespace, Value nsValue) {
+        List<String> keys = new ArrayList<>();
+        try {
+            if (nsValue != null && nsValue.hasMembers()) {
+                for (Object key : nsValue.getMemberKeys()) {
+                    keys.add(String.valueOf(key));
+                }
+            }
+        } catch (RuntimeException e) {
+            LOGGER.warn("Cannot collect the member names of module '{}' for error hints: {}",
+                    namespace, e.getMessage());
+        }
+        MODULE_MEMBERS.putIfAbsent(namespace, List.copyOf(keys));
     }
 
     /**

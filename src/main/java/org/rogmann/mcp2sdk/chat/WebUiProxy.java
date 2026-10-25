@@ -1,5 +1,6 @@
 package org.rogmann.mcp2sdk.chat;
 
+import org.rogmann.mcp2sdk.agent.ChatContextStore;
 import org.rogmann.mcp2sdk.utils.LlmUsage;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.node.ArrayNode;
@@ -33,8 +34,6 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.zip.GZIPInputStream;
@@ -205,90 +204,29 @@ public class WebUiProxy {
     @Value("${" + PROP_MAX_TOKENS + ":}")
     private Integer maxTokens;
 
-    /** Cached chat template for the configured model (loaded once from the classpath) */
-    private String chatTemplateCache;
-
-    /** Whether the chat template lookup already ran (distinguishes "not found" from "not loaded") */
-    private boolean chatTemplateLoaded = false;
-
-    /** Minimal chat template that signals thinking/reasoning support (used when reasoning=on and no model template is found) */
-    private static final String DEFAULT_THINKING_TEMPLATE =
-            "{%- if enable_thinking -%}{{- ' thinking' -}}{{- ' response' -}}{%- endif -%}{{ content }}";
-
-    /** Minimal chat template without thinking support (used to force reasoning off) */
-    private static final String DEFAULT_NON_THINKING_TEMPLATE = "{{ content }}";
-
-    /** Marker substrings that indicate a chat template supports thinking/reasoning */
-    private static final String[] THINKING_MARKERS = {
-            "enable_thinking", "reasoning_effort", "thinking_budget",
-            " thinking", " response", "<|think|>"
-    };
-
-    /**
-     * The reasoning-effort labels the chat template of the configured model accepts, as parsed by
-     * {@link ReasoningEfforts#parseTemplateEfforts(String)}; {@code null} until the first lookup. An
-     * empty list records "the template declares none", which is not the same as "not looked up yet" -
-     * it avoids re-parsing a template of several hundred kB on every request. Guarded by
-     * {@link #templateEfforts()}, mirroring {@link #chatTemplateCache}.
-     */
-    private List<String> templateEffortsCache = null;
-
     /** Counter of served static resources (first N logged on INFO, rest on DEBUG) */
     private final AtomicLong staticResourceCount = new AtomicLong();
 
     /** JsonMapper for JSON processing (Jackson 3) */
     private final JsonMapper jsonMapper;
 
-    /** Map from model-name to reasoning-mode */
-    private final ConcurrentMap<String, String> mapReasoning = new ConcurrentHashMap<>();
+    /**
+     * Shortens the request and response bodies of the DEBUG log lines
+     * (docs/webui.md R1, same limits as before the move).
+     */
+    private final ResponseLogFormat responseLogFormat;
 
-    /** Max. length of a string value that is logged unshortened. */
-    private static final int LOG_MAX_STRING_LENGTH = 100;
-    /** Number of leading characters kept for a shortened string value. */
-    private static final int LOG_STRING_PREFIX = 80;
-    /** Number of trailing characters kept for a shortened string value. */
-    private static final int LOG_STRING_SUFFIX = 20;
-    /** Max. length of the whole body when it cannot be parsed as JSON. */
-    private static final int LOG_FALLBACK_MAX_LENGTH = 600;
-    /** Number of leading characters kept for a fallback-shortened body. */
-    private static final int LOG_FALLBACK_PREFIX = 500;
-    /** Number of trailing characters kept for a fallback-shortened body. */
-    private static final int LOG_FALLBACK_SUFFIX = 100;
+    /**
+     * Chat template of the configured model and the reasoning translations built on it
+     * (docs/webui.md R2). Stateless apart from its caches, so one instance per proxy is enough;
+     * {@code ChatRequestPreparer} is handed the same one.
+     */
+    private final ChatTemplateInfo chatTemplateInfo = new ChatTemplateInfo();
 
-    /** Overall max. length of the logged request body, even if it contains many (individually
-     * short) values such as tool calls. Applied after per-value shortening. */
-    private static final int LOG_BODY_MAX_LENGTH = 2000;
-    /** Number of leading characters kept in the overall request-body log line. */
-    private static final int LOG_BODY_PREFIX = 1800;
-    /** Number of trailing characters kept in the overall request-body log line. */
-    private static final int LOG_BODY_SUFFIX = 200;
-
-    /** Max. length of a single string value of a logged response before shortening. Larger than
-     * the request limit on purpose: the answer/reasoning text is what the switch is enabled for. */
-    private static final int LOG_RESPONSE_MAX_STRING_LENGTH = 1200;
-    /** Number of leading characters kept for a shortened response string value. */
-    private static final int LOG_RESPONSE_STRING_PREFIX = 1000;
-    /** Number of trailing characters kept for a shortened response string value. */
-    private static final int LOG_RESPONSE_STRING_SUFFIX = 100;
-    /** Overall max. length of the logged response line, applied after per-value shortening. */
-    private static final int LOG_RESPONSE_BODY_MAX_LENGTH = 5000;
-    /** Number of leading characters kept in the overall response log line. */
-    private static final int LOG_RESPONSE_BODY_PREFIX = 4500;
-    /** Number of trailing characters kept in the overall response log line. */
-    private static final int LOG_RESPONSE_BODY_SUFFIX = 300;
-
-    /** Max. characters captured per response part (chain-of-thought / answer) for the response
-     * DEBUG log. Beyond that the remaining characters are only counted, so a long answer is not
-     * held in memory just for a debug line. */
-    private static final int RESPONSE_LOG_MAX_CHARS_PER_PART = 4000;
-
-    /** Placeholder {@code arguments} used to replace an invalid assistant tool-call in the
-     * forwarded request. The client-side history keeps its local copy; only the outgoing request
-     * is repaired so backends that validate tool-call arguments (e.g. vLLM) accept it. */
-    private static final String WRONG_INPUT_PLACEHOLDER = "{\"error\":\"[wrong input removed by WebUI.\"}";
-
-    /** Max. length of invalid tool-call arguments written to the error log by {@link #sanitizeToolCalls}. */
-    private static final int SANITIZE_LOG_ARGUMENTS_MAX = 1000;
+    /**
+     * Lazily created preparation seam, see {@link #requestPreparer()}.
+     */
+    private ChatRequestPreparer requestPreparer;
 
     /**
      * Cache-Control value for responses that must not be stored anywhere
@@ -352,6 +290,7 @@ public class WebUiProxy {
     public WebUiProxy() {
         // Jackson 3: ObjectMapper is immutable, must be created via Builder
         this.jsonMapper = JsonMapper.builder().build();
+        this.responseLogFormat = new ResponseLogFormat(this.jsonMapper);
     }
 
     /**
@@ -619,70 +558,29 @@ public class WebUiProxy {
     }
 
     /**
-     * Prepares the request body for logging so that long log lines are avoided.
-     * <p>String values longer than {@value #LOG_MAX_STRING_LENGTH} characters are shortened
-     * to the first {@value #LOG_STRING_PREFIX} and the last {@value #LOG_STRING_SUFFIX}
-     * characters, separated by {@code [...]}. This keeps the JSON structure readable while
-     * trimming long contents (e.g. pasted files, tool descriptions or script sources).</p>
-     * <p>If the body cannot be parsed as JSON it is truncated to the first
-     * {@value #LOG_FALLBACK_PREFIX} and the last {@value #LOG_FALLBACK_SUFFIX} characters.</p>
-     * <p>Finally the result is capped to an overall {@value #LOG_BODY_MAX_LENGTH} characters
-     * ({@value #LOG_BODY_PREFIX} leading + {@value #LOG_BODY_SUFFIX} trailing) so bodies with
-     * many short values (e.g. many tool calls) never produce oversized log lines.</p>
+     * Prepares a request body for logging, see {@link ResponseLogFormat#shortenRequestBody}.
+     *
+     * <p>The formatting itself moved to {@link ResponseLogFormat} (docs/webui.md R1); this
+     * delegate stays because the log call sites of both forwarding paths - and the unit test -
+     * address the request log line by this name.</p>
      *
      * @param requestBody raw request body
      * @return shortened representation suitable for logging
      */
     private String shortenRequestBody(String requestBody) {
-        return shortenBody(requestBody, LOG_MAX_STRING_LENGTH, LOG_STRING_PREFIX, LOG_STRING_SUFFIX,
-                LOG_BODY_MAX_LENGTH, LOG_BODY_PREFIX, LOG_BODY_SUFFIX);
+        return responseLogFormat.shortenRequestBody(requestBody);
     }
 
     /**
-     * Prepares a response body for logging, mirroring {@link #shortenRequestBody} but with the
-     * larger limits of the {@code webui.logResponses} DEBUG log: the answer (and its chain of
-     * thought) is the reason the switch gets enabled, so single values are cut later than in the
-     * request log.
+     * Prepares a response body for logging, see {@link ResponseLogFormat#shortenResponseBody}.
      *
      * @param responseBody raw response body or the response summary built from the SSE chunks
      * @return shortened representation suitable for logging
      */
     private String shortenResponseBody(String responseBody) {
-        return shortenBody(responseBody, LOG_RESPONSE_MAX_STRING_LENGTH, LOG_RESPONSE_STRING_PREFIX,
-                LOG_RESPONSE_STRING_SUFFIX, LOG_RESPONSE_BODY_MAX_LENGTH,
-                LOG_RESPONSE_BODY_PREFIX, LOG_RESPONSE_BODY_SUFFIX);
+        return responseLogFormat.shortenResponseBody(responseBody);
     }
 
-    /**
-     * Shortens a JSON body for logging with the given per-value and overall limits:
-     * long string values are trimmed first (keeping the JSON structure readable), then the whole
-     * line is capped. A body that cannot be parsed as JSON is truncated as plain text.
-     *
-     * @param body             raw body
-     * @param maxStringLength  length above which a single string value is shortened
-     * @param stringPrefix     leading characters kept for a shortened string value
-     * @param stringSuffix     trailing characters kept for a shortened string value
-     * @param bodyMaxLength    overall length above which the whole line is truncated
-     * @param bodyPrefix       leading characters kept for the overall line
-     * @param bodySuffix       trailing characters kept for the overall line
-     * @return shortened representation suitable for logging
-     */
-    private String shortenBody(String body, int maxStringLength, int stringPrefix, int stringSuffix,
-                               int bodyMaxLength, int bodyPrefix, int bodySuffix) {
-        String shortened;
-        try {
-            JsonNode node = jsonMapper.readTree(body);
-            shortened = jsonMapper.writeValueAsString(
-                    shortenLongStrings(node, maxStringLength, stringPrefix, stringSuffix));
-        } catch (RuntimeException e) {
-            LOG.debug("Cannot parse body as JSON, fall back to plain truncation: {}", e.getMessage());
-            shortened = shortenText(body, LOG_FALLBACK_MAX_LENGTH,
-                    LOG_FALLBACK_PREFIX, LOG_FALLBACK_SUFFIX);
-        }
-        // Per-value shortening keeps the JSON readable, but a body with many short values
-        // (e.g. many tool calls) can still grow large - cap the overall log line.
-        return truncateLogText(shortened, bodyMaxLength, bodyPrefix, bodySuffix);
-    }
 
     /**
      * Whether the LLM response has to be collected for the DEBUG response log, i.e. the property
@@ -696,222 +594,6 @@ public class WebUiProxy {
         return logResponses && LOG.isDebugEnabled();
     }
 
-    /**
-     * Caps a text to an overall maximum length for logging: the first {@code prefix} and the
-     * last {@code suffix} characters are kept, separated by a marker naming how many leading
-     * characters and the total length, e.g. {@code "[... 1800 of 314159 ...]"}. Applied when
-     * the text still exceeds {@code maxLength} after per-value shortening.
-     *
-     * @param text      text to truncate
-     * @param maxLength overall length above which the text is truncated
-     * @param prefix    number of leading characters to keep
-     * @param suffix    number of trailing characters to keep
-     * @return the original text or a truncated variant
-     */
-    private static String truncateLogText(String text, int maxLength, int prefix, int suffix) {
-        if (text == null || text.length() <= maxLength) {
-            return text;
-        }
-        String marker = "[... " + prefix + " of " + text.length() + " ...]";
-        // Keep the marker within the requested budget by trimming the leading part if needed.
-        int safePrefix = Math.max(0, Math.min(prefix, maxLength - marker.length() - suffix));
-        return text.substring(0, safePrefix) + marker
-                + text.substring(text.length() - suffix);
-    }
-
-    /**
-     * Recursively shortens long string values in a JSON tree.
-     *
-     * @param node            node to process
-     * @param maxStringLength length above which a string value is shortened
-     * @param prefix          number of leading characters kept for a shortened value
-     * @param suffix          number of trailing characters kept for a shortened value
-     * @return a new node with the long string values shortened
-     */
-    private JsonNode shortenLongStrings(JsonNode node, int maxStringLength, int prefix, int suffix) {
-        if (node == null) {
-            return null;
-        }
-        if (node.isObject()) {
-            ObjectNode src = (ObjectNode) node;
-            ObjectNode dst = jsonMapper.createObjectNode();
-            for (Map.Entry<String, JsonNode> entry : src.properties()) {
-                dst.set(entry.getKey(), shortenLongStrings(entry.getValue(),
-                        maxStringLength, prefix, suffix));
-            }
-            return dst;
-        } else if (node.isArray()) {
-            ArrayNode dst = jsonMapper.createArrayNode();
-            for (JsonNode child : node) {
-                dst.add(shortenLongStrings(child, maxStringLength, prefix, suffix));
-            }
-            return dst;
-        } else if (node.isString()) {
-            String text = node.asString();
-            if (text.length() > maxStringLength) {
-                String shortened = text.substring(0, prefix)
-                        + "[...]"
-                        + text.substring(text.length() - suffix);
-                return jsonMapper.stringNode(shortened);
-            }
-        }
-        return node;
-    }
-
-    /**
-     * Shortens a text to the first {@code prefix} and the last {@code suffix} characters
-     * if its length exceeds {@code maxLength}.
-     *
-     * @param text      text to shorten
-     * @param maxLength length above which the text is shortened
-     * @param prefix    number of leading characters to keep
-     * @param suffix    number of trailing characters to keep
-     * @return the original text or a shortened variant
-     */
-    private static String shortenText(String text, int maxLength, int prefix, int suffix) {
-        if (text == null || text.length() <= maxLength) {
-            return text;
-        }
-        return text.substring(0, prefix) + "[...]" + text.substring(text.length() - suffix);
-    }
-
-    /**
-     * Validates the {@code function.arguments} JSON of every assistant tool-call in the outgoing
-     * request and repairs entries that became invalid (typically a tool-call whose arguments were
-     * truncated mid-string when the backend hit its output-token limit).
-     *
-     * <p>A broken tool-call triggers two repairs so the forwarded request stays consistent for
-     * backends that validate tool-call arguments (e.g. vLLM):</p>
-     * <ul>
-     *   <li>the invalid {@code arguments} are replaced by a safe placeholder
-     *       ({@value #WRONG_INPUT_PLACEHOLDER}),</li>
-     *   <li>the matching {@code role:"tool"} message (same {@code tool_call_id}) gets a dummy
-     *       error answer that names the JSON parse cause.</li>
-     * </ul>
-     * <p>The faulty arguments are written to the error log (escaped, capped at
-     * {@value #SANITIZE_LOG_ARGUMENTS_MAX} characters) so the original content stays traceable
-     * even though it is no longer forwarded.</p>
-     *
-     * @param llmRequest the deep-copied request to forward to the LLM (mutated in place)
-     * @return the number of repaired tool-calls
-     */
-    private int sanitizeToolCalls(ObjectNode llmRequest) {
-        JsonNode messages = llmRequest.get("messages");
-        if (messages == null || !messages.isArray()) {
-            return 0;
-        }
-        int repaired = 0;
-        // tool_call_id -> JSON parse error message, used to repair the matching tool results.
-        Map<String, String> repairedToolCallIds = new HashMap<>();
-        for (JsonNode message : messages) {
-            if (message == null || !message.isObject()) {
-                continue;
-            }
-            if (!"assistant".equals(message.path("role").asString(""))) {
-                continue;
-            }
-            JsonNode toolCalls = message.get("tool_calls");
-            if (toolCalls == null || !toolCalls.isArray()) {
-                continue;
-            }
-            for (JsonNode toolCall : toolCalls) {
-                if (toolCall == null || !toolCall.isObject()) {
-                    continue;
-                }
-                JsonNode functionNode = toolCall.get("function");
-                if (functionNode == null || !functionNode.isObject()) {
-                    continue;
-                }
-                String id = toolCall.path("id").asString("<unknown-id>");
-                String toolName = functionNode.path("name").asString("<unknown-tool>");
-                JsonNode argumentsNode = functionNode.get("arguments");
-                String arguments = (argumentsNode != null && argumentsNode.isString())
-                        ? argumentsNode.asString() : "";
-                String jsonError = firstJsonError(arguments);
-                if (jsonError == null) {
-                    continue;
-                }
-                ((ObjectNode) functionNode).put("arguments", WRONG_INPUT_PLACEHOLDER);
-                repairedToolCallIds.put(id, jsonError);
-                repaired++;
-                String logArguments = arguments.length() <= SANITIZE_LOG_ARGUMENTS_MAX
-                        ? arguments
-                        : arguments.substring(0, SANITIZE_LOG_ARGUMENTS_MAX) + "...";
-                LOG.error("Invalid tool-call arguments in chat history; replaced with placeholder "
-                                + "(tool='{}', id='{}', jsonError={}): {}",
-                        toolName, id, jsonError, escapeJsonString(logArguments));
-            }
-        }
-        // Repair the matching tool-result messages so the assistant answer stays consistent.
-        if (!repairedToolCallIds.isEmpty()) {
-            for (JsonNode message : messages) {
-                if (message == null || !message.isObject()) {
-                    continue;
-                }
-                if (!"tool".equals(message.path("role").asString(""))) {
-                    continue;
-                }
-                String jsonError = repairedToolCallIds.get(message.path("tool_call_id").asString(""));
-                if (jsonError == null) {
-                    continue;
-                }
-                ((ObjectNode) message).put("content", buildRefusedToolResult(jsonError));
-            }
-        }
-        return repaired;
-    }
-
-    /**
-     * Returns the JSON parse error message for the given text, or {@code null} if it is valid JSON.
-     * Blank or missing text is treated as a parse error ("empty or missing arguments").
-     *
-     * @param json text to check
-     * @return the parse error message, or {@code null} if the text is valid JSON
-     */
-    private String firstJsonError(String json) {
-        if (json == null || json.isBlank()) {
-            return "empty or missing arguments";
-        }
-        try {
-            jsonMapper.readTree(json);
-            return null;
-        } catch (RuntimeException e) {
-            String msg = e.getMessage();
-            return (msg == null || msg.isBlank()) ? e.getClass().getSimpleName() : msg;
-        }
-    }
-
-    /**
-     * Escapes a text so it can be embedded safely into a single-line log message.
-     * Quotes, backslashes and control characters become JSON escapes.
-     *
-     * @param text text to escape
-     * @return the escaped text
-     */
-    private String escapeJsonString(String text) {
-        try {
-            String literal = jsonMapper.writeValueAsString(text);
-            return literal.substring(1, literal.length() - 1);
-        } catch (RuntimeException e) {
-            return text.replace("\\", "\\\\")
-                    .replace("\"", "\\\"")
-                    .replace("\n", "\\n")
-                    .replace("\r", "\\r")
-                    .replace("\t", "\\t");
-        }
-    }
-
-    /**
-     * Builds the dummy tool-result JSON used to answer a repaired tool-call.
-     *
-     * @param cause the JSON parse error message to report
-     * @return a JSON string for the tool message {@code content}
-     */
-    private String buildRefusedToolResult(String cause) {
-        ObjectNode node = jsonMapper.createObjectNode();
-        node.put("error", "Invalid input, refused tool call: Cause: " + cause);
-        return jsonMapper.writeValueAsString(node);
-    }
 
     /**
      * Forwarding of LLM requests (streaming / non-streaming)
@@ -921,6 +603,12 @@ public class WebUiProxy {
             consumes = MediaType.APPLICATION_JSON_VALUE)
     public void completions(@RequestBody String requestBody,
                             @RequestHeader(value = "Cookie", required = false) String cookie,
+                            @RequestHeader(value = ChatContextStore.HEADER_CONVERSATION_ID,
+                                    required = false) String conversationId,
+                            @RequestHeader(value = ChatContextStore.HEADER_FORK_DEPTH,
+                                    required = false) String forkDepth,
+                            @RequestHeader(value = "x-session-id",
+                                    required = false) String xSessionId,
                             HttpServletRequest request,
                             HttpServletResponse response) {
         LOG.info("{} POST /chat/v1/chat/completions", LocalDateTime.now());
@@ -943,6 +631,12 @@ public class WebUiProxy {
                 requestPath = "/" + requestPath;
             }
 
+            // Remember what arrived, before anything is prepared: a prefix fork starts its children
+            // from exactly this body, so that they share the token prefix of this conversation
+            // (docs/webui.md §3.2). Failures here are logged, never turned into a failed chat turn.
+            ChatContextStore.getInstance().record(conversationId, forkDepth, requestNode,
+                    selfBaseUrlOf(request));
+
             // Check if streaming is requested
             boolean isStreaming = requestNode.has("stream") && requestNode.get("stream").asBoolean(false);
 
@@ -956,7 +650,7 @@ public class WebUiProxy {
                 response.setHeader("X-Accel-Buffering", "no"); // Disable Nginx buffering if applicable
 
                 // Forward request and pipe stream directly to response
-                forwardRequestToLLM(requestNode, cookie, requestPath, response, true);
+                forwardRequestToLLM(requestNode, cookie, xSessionId, requestPath, response, true);
             } else {
                 // --- NON-STREAMING MODE (Legacy Compatibility) ---
                 // Keep existing behavior: Buffer response, wrap in SSE, then send.
@@ -964,7 +658,7 @@ public class WebUiProxy {
                 response.setContentType("text/event-stream");
                 response.setCharacterEncoding("UTF-8");
 
-                String llmResponse = forwardRequestToLLMBuffered(requestNode, cookie, requestPath);
+                String llmResponse = forwardRequestToLLMBuffered(requestNode, cookie, xSessionId, requestPath);
 
                 if (llmResponse != null) {
                     // Convert to SSE format (Legacy behavior)
@@ -995,6 +689,26 @@ public class WebUiProxy {
                 LOG.error("Failed to write error response", ex);
             }
         }
+    }
+
+    /**
+     * Base URL this proxy is reachable under, derived from the request that just arrived instead
+     * of a configured property: the forked children loop back through the very endpoint the caller
+     * used (IPv4 versus IPv6 localhost, context path, port), which is what keeps their request on
+     * the identical preparation path (docs/webui.md §3.2).
+     *
+     * @param request the completion request being served
+     * @return e.g. {@code http://127.0.0.1:9091}, without a trailing slash
+     */
+    private static String selfBaseUrlOf(HttpServletRequest request) {
+        String fullUrl = request.getRequestURL().toString();
+        String uri = request.getRequestURI();
+        String contextPath = (request.getContextPath() == null) ? "" : request.getContextPath();
+        int cut = fullUrl.lastIndexOf(uri);
+        if (cut < 0) {
+            return fullUrl;
+        }
+        return fullUrl.substring(0, cut) + contextPath;
     }
 
     /**
@@ -1114,284 +828,35 @@ public class WebUiProxy {
     }
 
     /**
-     * Builds the chat_template to deliver via /props based on the configured reasoning mode.
-     * <ul>
-     *   <li>auto (default): the stored model template decides - reasoning is shown iff the
-     *       template contains thinking markers</li>
-     *   <li>on: always signal reasoning support (falls back to a minimal thinking template
-     *       if the stored model template has no thinking markers)</li>
-     *   <li>off: never signal reasoning support (delivers a non-thinking template)</li>
-     * </ul>
+     * Builds the chat_template to deliver via /props, see
+     * {@link ChatTemplateInfo#propsChatTemplate(String, String)}.
      *
      * @return the chat template to serve, or null to omit it (reasoning detection off)
      */
     private String buildChatTemplate() {
-        String stored = loadChatTemplate();
-        boolean storedThinks = templateSupportsThinking(stored);
-        return switch (normalizeReasoningMode(reasoningMode)) {
-            case "on" -> storedThinks ? stored : DEFAULT_THINKING_TEMPLATE;
-            case "off" -> storedThinks ? DEFAULT_NON_THINKING_TEMPLATE : stored;
-            default -> stored; // auto
-        };
+        return chatTemplateInfo.propsChatTemplate(getModelName(), reasoningMode);
     }
 
     /**
-     * Normalizes the reasoning mode property to on/off/auto (unknown values fall back to auto).
-     */
-    private String normalizeReasoningMode(String mode) {
-        String m = (mode == null ? "auto" : mode).trim().toLowerCase(Locale.ROOT);
-        if (!"on".equals(m) && !"off".equals(m)) {
-            m = "auto";
-        }
-        return m;
-    }
-
-    /**
-     * Loads the chat template for the configured model from the classpath directory
-     * {@code chat-templates/<normalized-model-name>.jinja}. Loaded once and cached.
-     *
-     * @return the template content, or null if no template matches the model
-     */
-    private String loadChatTemplate() {
-        if (chatTemplateLoaded) {
-            return chatTemplateCache;
-        }
-        chatTemplateLoaded = true;
-        String key = normalizeModelName(getModelName());
-        String resourcePath = "chat-templates/" + key + ".jinja";
-        try (InputStream is = getClass().getClassLoader().getResourceAsStream(resourcePath)) {
-            if (is == null) {
-                LOG.info("No chat template for model '{}' (looked for {}), reasoning detection disabled",
-                        getModelName(), resourcePath);
-                return null;
-            }
-            chatTemplateCache = new String(is.readAllBytes(), StandardCharsets.UTF_8);
-            LOG.info("Loaded chat template for model '{}' from {}", getModelName(), resourcePath);
-            return chatTemplateCache;
-        } catch (IOException e) {
-            LOG.warn("Failed to read chat template {}: {}", resourcePath, e.getMessage());
-            return null;
-        }
-    }
-
-    /**
-     * Normalizes a model name to a resource key.
-     */
-    private String normalizeModelName(String name) {
-        String n = (name == null ? "" : name);
-        n = n.replaceAll("[^A-Za-z0-9-]+", "_").replaceAll("^_+|_+$", "");
-        return n;
-    }
-
-    /**
-     * Heuristic check whether a chat template signals thinking/reasoning support,
-     * mirroring the detection used by the Web UI frontend.
-     */
-    private boolean templateSupportsThinking(String template) {
-        if (template == null || template.isBlank()) {
-            return false;
-        }
-        for (String marker : THINKING_MARKERS) {
-            if (template.contains(marker)) {
-                String markerNew = mapReasoning.putIfAbsent(getModelName(), marker);
-                if (markerNew != null) {
-                    LOG.info("Model {}: Reasoning-marker {}", getModelName(), marker);
-                }
-                return true;
-            }
-        }
-        LOG.info("Model {}: found no reasoning marker in template of length {}", getModelName(), template.length());
-        return false;
-    }
-
-    /**
-     * If the client only sent a thinking/reasoning token budget without an explicit
-     * {@code reasoning_effort}, derive the effort label from the budget and inject it as a
-     * {@code chat_template_kwargs.reasoning_effort} entry.
-     *
-     * <p>The Web UI (chat.service.ts) maps the user's effort choice onto a token budget
-     * ({@code thinking_budget_tokens}) and only ever passes {@code enable_thinking} as a
-     * template kwarg; {@code reasoning_effort} itself is never forwarded. Templates that
-     * branch on {@code reasoning_effort} (e.g. DeepSeek's {@code high}/{@code max} prompt
-     * injections) therefore never see the chosen level. This method closes that gap by
-     * reconstructing the effort label from the budget the UI did send.</p>
-     *
-     * <p>It is a no-op (and leaves the request untouched) when thinking is not enabled,
-     * when the client already supplied an explicit {@code reasoning_effort}, or when the
-     * budget does not correspond to a known effort level.</p>
+     * Derives the reasoning effort from the thinking budget of the request, llama.cpp spelling
+     * (see {@link ChatTemplateInfo#injectReasoningEffortFromBudget}). Both forwarding paths get
+     * this through {@link #requestPreparer()}; the delegate stays as the proxy-side entry
+     * point the unit test of the translation drives (docs/webui.md F1).
      *
      * @param llmRequest the deep-copied request forwarded to the LLM (mutated in place)
      */
     private void injectReasoningEffortFromBudget(ObjectNode llmRequest) {
-        JsonNode kwargs = llmRequest.get("chat_template_kwargs");
-        if (kwargs == null || !kwargs.isObject()) {
-            return;
-        }
-        ObjectNode kwargsObj = (ObjectNode) kwargs;
-
-        // An explicit reasoning_effort provided by the client always wins.
-        if (kwargsObj.has("reasoning_effort")) {
-            return;
-        }
-
-        // Only act on requests that explicitly enable thinking.
-        JsonNode enableThinking = kwargsObj.get("enable_thinking");
-        if (enableThinking == null || !enableThinking.asBoolean(false)) {
-            return;
-        }
-
-        int budget = reasoningBudget(llmRequest);
-        String effort = reasoningEffortForBudget(budget);
-        if (effort == null) {
-            return;
-        }
-
-        kwargsObj.put("reasoning_effort", effort);
-        LOG.debug("Injected reasoning_effort '{}' from budget {} (template labels {})",
-                effort, budget, templateEfforts());
+        chatTemplateInfo.injectReasoningEffortFromBudget(llmRequest, getModelName());
     }
 
     /**
-     * Applies backend-specific thinking/reasoning translations for a vLLM (DeepSeek-compatible)
-     * backend. Translates the llama.cpp-style parameters the Web UI sends into the DeepSeek
-     * OpenAI-format equivalents the vLLM backend understands:
-     * <ul>
-     *   <li>{@code {"thinking": {"type": "enabled"|"disabled"}}} instead of
-     *       {@code chat_template_kwargs.enable_thinking}</li>
-     *   <li>top-level {@code reasoning_effort} (low/high/max) instead of the token budget, because
-     *       DeepSeek maps effort directly and ignores the raw budget</li>
-     * </ul>
-     *
-     * <p>To avoid confusing a vLLM/DeepSeek backend with fields it does not understand, the
-     * llama.cpp-specific request fields are removed once they have been translated.</p>
-     *
-     * <p>It is a no-op when thinking is not explicitly addressed by the request.</p>
+     * Applies the vLLM (DeepSeek OpenAI-format) thinking translation
+     * (see {@link ChatTemplateInfo#applyVllmReasoning}).
      *
      * @param llmRequest the deep-copied request forwarded to the LLM (mutated in place)
      */
     private void applyVllmReasoning(ObjectNode llmRequest) {
-        JsonNode kwargs = llmRequest.get("chat_template_kwargs");
-        boolean enableThinking = false;
-        if (kwargs != null && kwargs.isObject()) {
-            JsonNode enableThinkingNode = kwargs.get("enable_thinking");
-            if (enableThinkingNode != null && enableThinkingNode.asBoolean(false)) {
-                enableThinking = true;
-            }
-        }
-
-        boolean hasExplicitEffort = llmRequest.has("reasoning_effort");
-
-        // Derive the DeepSeek effort label: an explicit reasoning_effort wins, otherwise map the
-        // budget the UI sent. When thinking is enabled and no budget was sent, DeepSeek defaults
-        // to "high" (matches the UI's max being unlimited, and high being the DeepSeek default).
-        String effort;
-        if (hasExplicitEffort) {
-            effort = llmRequest.get("reasoning_effort").asString();
-        } else {
-            effort = enableThinking ? vllmEffortForBudget(reasoningBudget(llmRequest)) : null;
-        }
-
-
-        ObjectNode thinking = jsonMapper.createObjectNode();
-        thinking.put("type", enableThinking ? "enabled" : "disabled");
-        llmRequest.set("thinking", thinking);
-
-        if (effort != null && !effort.isEmpty()) {
-            llmRequest.put("reasoning_effort", effort);
-            LOG.debug("Set vLLM reasoning_effort '{}' (template labels {})", effort, templateEfforts());
-        } else if (!hasExplicitEffort) {
-            // No known level: still leave reasoning_effort absent so the backend default applies.
-            llmRequest.remove("reasoning_effort");
-        }
-
-        // The Web UI never uses an explicit reasoning_effort, so in practice this branch sets it.
-
-        // Strip llama.cpp-specific controls a vLLM/DeepSeek backend would not interpret.
-        llmRequest.remove("chat_template_kwargs");
-        llmRequest.remove("thinking_budget_tokens");
-        llmRequest.remove("reasoning_budget_tokens");
-        llmRequest.remove("reasoning_control");
-    }
-
-    /**
-     * Reads the thinking/reasoning token budget the Web UI sent, normalized to -1 when absent.
-     */
-    private static int reasoningBudget(ObjectNode llmRequest) {
-        return llmRequest.has("thinking_budget_tokens")
-                ? llmRequest.get("thinking_budget_tokens").asInt(-1)
-                : llmRequest.has("reasoning_budget_tokens")
-                        ? llmRequest.get("reasoning_budget_tokens").asInt(-1)
-                        : -1;
-    }
-
-    /**
-     * Maps a thinking/reasoning token budget to the effort label accepted by the current model.
-     *
-     * <p>The label set is taken from the model's chat template whenever it declares one (see
-     * {@link #templateEfforts()}), so a template that uses a different vocabulary is served a label
-     * it actually accepts. DeepSeek-V4 for example branches on {@code high}/{@code max}, while
-     * Qwen3.8-Flash-Next only accepts {@code xhigh} (default), {@code medium} and {@code low} and
-     * rejects everything else with
-     * {@code Unexpected reasoning effort high. Supported types are xhigh (default), medium, and low.}</p>
-     *
-     * <p>Matches {@code REASONING_EFFORT_TOKENS} in the Web UI (chat.service.ts):
-     * low=512, medium=2048, high=8192, max=-1 (unlimited; the UI omits the budget field for max, so
-     * an absent budget resolves to -1 here). Without template information the llama.cpp label set
-     * {@code low/medium/high/max} is used.</p>
-     *
-     * @param budget the raw budget value (-1 when not present)
-     * @return the effort label, or {@code null} if the budget is not a known level
-     */
-    private String reasoningEffortForBudget(int budget) {
-        return ReasoningEfforts.effortForBudget(budget, ReasoningEfforts.EFFORT_BY_BUDGET,
-                templateEfforts());
-    }
-
-    /**
-     * Maps a thinking/reasoning token budget to the {@code reasoning_effort} label for a vLLM
-     * (DeepSeek OpenAI-format) backend. DeepSeek conventionally distinguishes {@code low},
-     * {@code high} and {@code max} and has no {@code medium}, so the UI's {@code medium} and
-     * {@code high} are both raised to {@code high} (per convention only {@code max} reaches
-     * {@code max}).
-     *
-     * <p>As in {@link #reasoningEffortForBudget(int)} the labels actually declared by the model's
-     * chat template take precedence over that convention: a template that accepts {@code medium}
-     * gets {@code medium}, and one that has no {@code max} (Qwen3.8-Flash-Next:
-     * {@code xhigh}/{@code medium}/{@code low}) receives its top level instead of a rejected
-     * {@code max}.</p>
-     *
-     * @param budget the raw budget value (-1 when not present)
-     * @return the DeepSeek effort label, or {@code null} if the budget is not a known level
-     */
-    private String vllmEffortForBudget(int budget) {
-        return ReasoningEfforts.effortForBudget(budget, ReasoningEfforts.VLLM_EFFORT_BY_BUDGET,
-                templateEfforts());
-    }
-
-    /**
-     * The reasoning-effort labels the chat template of the configured model accepts, e.g.
-     * {@code [high, max]} for DeepSeek-V4 or {@code [xhigh, medium, low]} for Qwen3.8-Flash-Next.
-     * The parsing itself lives in {@link ReasoningEfforts#parseTemplateEfforts(String)}; here the
-     * result is cached because a template can be several hundred kB and is read on every request.
-     *
-     * <p>An empty list means the template declares no effort vocabulary (or no template was found),
-     * in which case the backend default labels are used.</p>
-     *
-     * @return the declared labels in template order, empty if none are declared
-     */
-    private synchronized List<String> templateEfforts() {
-        if (templateEffortsCache == null) {
-            String template = loadChatTemplate();
-            templateEffortsCache = ReasoningEfforts.parseTemplateEfforts(template);
-            if (templateEffortsCache.isEmpty()) {
-                LOG.info("Model {}: chat template declares no reasoning_effort labels, keeping the "
-                        + "backend default labels", getModelName());
-            } else {
-                LOG.info("Model {}: chat template accepts reasoning effort labels {}",
-                        getModelName(), templateEffortsCache);
-            }
-        }
-        return templateEffortsCache;
+        chatTemplateInfo.applyVllmReasoning(llmRequest, getModelName());
     }
 
     /**
@@ -1449,47 +914,35 @@ public class WebUiProxy {
     }
 
     /**
+     * The preparation seam of both forwarding paths (docs/webui.md R4).
+     *
+     * <p>Built on first use, not in the constructor: the backend type, the model name and the
+     * default {@code max_tokens} come from injected properties, which are only set after
+     * construction. The preparer is stateless apart from those values, so the one instance also
+     * serves every later request.</p>
+     *
+     * @return the shared {@link ChatRequestPreparer} of this proxy
+     */
+    private synchronized ChatRequestPreparer requestPreparer() {
+        if (requestPreparer == null) {
+            requestPreparer = new ChatRequestPreparer(jsonMapper, chatTemplateInfo, getModelName(),
+                    backend, maxTokens);
+        }
+        return requestPreparer;
+    }
+
+    /**
      * Forwards a request to the LLM server and PIPES the response stream directly.
      * Used for Streaming (SSE).
      */
-    private void forwardRequestToLLM(JsonNode requestNode, String cookie, String requestPath,
-                                     HttpServletResponse clientResponse, boolean streaming) throws IOException {
-        // Deep-Copy von requestNode, um alle Parameter zu übernehmen.
-        ObjectNode llmRequest = (ObjectNode) requestNode.deepCopy();
-
-        // Set model name (overwrite if present)
-        llmRequest.put("model", getModelName());
-
-        // Backend-specific reasoning translation:
-        // - llamacpp (default): reconstruct reasoning_effort into chat_template_kwargs so
-        //   template branches like DeepSeek's high/max prompt injections actually trigger.
-        // - vllm: translate enable_thinking + budget into {"thinking":{"type":...}} and a
-        //   top-level reasoning_effort, dropping the llama.cpp-only fields.
-        if (BACKEND_VLLM.equalsIgnoreCase(backend)) {
-            applyVllmReasoning(llmRequest);
-        } else {
-            injectReasoningEffortFromBudget(llmRequest);
-        }
-
-        // Set default max_tokens if not present
-        if (!llmRequest.has("max_tokens") && maxTokens != null) {
-            llmRequest.put("max_tokens", maxTokens);
-        }
-
-        // Add stream_options to include usage info (token statistics) in the streaming response.
-        // include_usage       : final usage object in the last SSE chunk (OpenAI-compatible, supported by llama.cpp and vLLM)
-        // continuous_usage_stats: vLLM extension - reports usage in EVERY SSE chunk so per-chunk token statistics
-        //                        are available even before the stream finishes; llama.cpp ignores this field.
-        ObjectNode streamOptions = jsonMapper.createObjectNode();
-        streamOptions.put("include_usage", true);
-        if (BACKEND_VLLM.equalsIgnoreCase(backend)) {
-            streamOptions.put("continuous_usage_stats", true);
-        }
-        llmRequest.set("stream_options", streamOptions);
-
-        // Repair invalid tool-call arguments before forwarding so backends that validate
-        // tool-call JSON (e.g. vLLM) accept the request despite a poisoned chat history.
-        sanitizeToolCalls(llmRequest);
+    private void forwardRequestToLLM(JsonNode requestNode, String cookie, String xSessionId,
+                                     String requestPath, HttpServletResponse clientResponse,
+                                     boolean streaming) throws IOException {
+        // The seam "incoming body -> outgoing body" (docs/webui.md R4): deep-copy, model override,
+        // reasoning translation, max_tokens default, stream_options and the history repair - the
+        // same code the buffered path runs, so both stay identical by construction.
+        ObjectNode llmRequest = requestPreparer().prepare(requestNode,
+                ChatRequestPreparer.Mode.STREAMING);
 
         String requestOut = jsonMapper.writeValueAsString(llmRequest);
         LOG.debug("LLM Request: {}", shortenRequestBody(requestOut));
@@ -1547,6 +1000,11 @@ public class WebUiProxy {
 
             if (cookie != null) {
                 connection.setRequestProperty("Cookie", cookie);
+            }
+            // Session routing for backends behind a load balancer (docs/acp.md S3): the ACP
+            // chat marks its requests with the ACP session id; the proxy forwards the header.
+            if (xSessionId != null) {
+                connection.setRequestProperty("x-session-id", xSessionId);
             }
 
             try (OutputStream os = connection.getOutputStream();
@@ -2233,26 +1691,11 @@ public class WebUiProxy {
      * Legacy method for non-streaming requests.
      * Buffers the response to allow post-processing (SSE wrapping).
      */
-    private String forwardRequestToLLMBuffered(JsonNode requestNode, String cookie, String requestPath) throws IOException {
-        ObjectNode llmRequest = (ObjectNode) requestNode.deepCopy();
-        llmRequest.put("model", getModelName());
-
-        // Keep the reasoning translation consistent with the streaming path.
-        if (BACKEND_VLLM.equalsIgnoreCase(backend)) {
-            applyVllmReasoning(llmRequest);
-        } else {
-            injectReasoningEffortFromBudget(llmRequest);
-        }
-
-        // Force non-streaming for buffered mode
-        llmRequest.put("stream", false);
-
-        if (!llmRequest.has("max_tokens") && maxTokens != null) {
-            llmRequest.put("max_tokens", maxTokens);
-        }
-
-        // Repair invalid tool-call arguments before forwarding (see sanitizeToolCalls).
-        sanitizeToolCalls(llmRequest);
+    private String forwardRequestToLLMBuffered(JsonNode requestNode, String cookie, String xSessionId,
+                                               String requestPath) throws IOException {
+        // Same seam as the streaming path, buffered variant (docs/webui.md R4).
+        ObjectNode llmRequest = requestPreparer().prepare(requestNode,
+                ChatRequestPreparer.Mode.BUFFERED);
 
         String requestOut = jsonMapper.writeValueAsString(llmRequest);
 
@@ -2270,8 +1713,19 @@ public class WebUiProxy {
         if (cookie != null) {
             connection.setRequestProperty("Cookie", cookie);
         }
+        if (xSessionId != null) {
+            connection.setRequestProperty("x-session-id", xSessionId);
+        }
 
         final LocalDateTime tsStart = LocalDateTime.now();
+        // When enabled, sample the upstream vLLM cached-tokens counter before the request, so the
+        // delta after the response shows how many prompt tokens the prefix cache served. The
+        // streaming path did this already; the buffered path needs it too, because a forked child's
+        // whole turn lands here (docs/webui.md F11: the usage record is the only instrument the
+        // fork's premise is measured with) and vLLM's non-streaming usage node reports
+        // prompt_tokens_details only when the server was started with --enable-prompt-tokens-details.
+        boolean sampleMetrics = BACKEND_VLLM.equalsIgnoreCase(backend) && fetchMetrics;
+        long metricsBefore = sampleMetrics ? readVllmCachedTokensMetric() : -1;
         try (OutputStream os = connection.getOutputStream();
              OutputStreamWriter osw = new OutputStreamWriter(os, StandardCharsets.UTF_8)) {
             osw.write(requestOut);
@@ -2318,10 +1772,11 @@ public class WebUiProxy {
             if (responseNode.has("usage")) {
                 List<String> dataLines = new ArrayList<>();
                 dataLines.add(jsonMapper.writeValueAsString(responseNode));
-                // Non-streaming responses carry prompt_tokens_details.cached_tokens natively,
-                // so no extra /metrics sampling is needed here. No per-chunk timing is available,
-                // hence the firstOutputNano/tsStartNano/tsEndNano are left null/0 (ttftClientMs=0).
-                recordUsageStatistics(tsStart, dataLines, false, -1, null, 0L, 0L);
+                // No per-chunk timing is available here, hence firstOutputNano/tsStartNano/tsEndNano
+                // stay null/0 (ttftClientMs=0). The cached tokens come from the response's own
+                // prompt_tokens_details when vLLM was asked for them, and otherwise from the
+                // /metrics delta sampled around this request.
+                recordUsageStatistics(tsStart, dataLines, sampleMetrics, metricsBefore, null, 0L, 0L);
             }
         } catch (RuntimeException e) {
             LOG.warn("Could not parse usage from non-streaming response: {}", e.getMessage());
@@ -2930,357 +2385,6 @@ public class WebUiProxy {
         }
         long cachedTokens = cachedNode.asLong();
         return (cachedTokens >= 0L && cachedTokens <= promptN) ? cachedTokens : -1L;
-    }
-
-    /**
-     * Collector for the {@value #PROP_LOG_RESPONSES} DEBUG dump of an LLM response: it merges the
-     * SSE chunks into one compact JSON object so an answer appears as a <em>single</em> log line
-     * next to the "LLM Request" line instead of hundreds of chunk lines.
-     *
-     * <p>{@link #accept(String)} is fed the raw {@code data:} payloads; reasoning and answer
-     * deltas are concatenated, the last reported {@code finish_reason}, {@code model} and
-     * {@code usage} are kept and the number of chunks is counted. A buffered (non-streaming)
-     * payload keeps its text in {@code choices[].message} instead of {@code choices[].delta} and
-     * is handled the same way, as is the vLLM spelling {@code reasoning} (llama.cpp and the Web UI
-     * use {@code reasoning_content}).</p>
-     *
-     * <p>Tool calls are captured too, keyed by the streamed {@code index}: a turn that ends with
-     * {@code finish_reason=tool_calls} carries its whole payload in {@code delta.tool_calls}, so
-     * without them the dump would show the finish reason while hiding both the invoked tool and
-     * its arguments - often the larger part of the generated tokens.</p>
-     *
-     * <p>Per-part character totals ({@link #reasoningCharsTotal()} and friends) are tallied over
-     * <em>every</em> chunk and are not subject to the capture cap, which makes them usable for
-     * {@link #analyzeReasoningOutput} without holding a long chain of thought in memory.</p>
-     *
-     * <p>It is instantiated only when {@link #responseLogEnabled()} answers true, so a disabled
-     * switch means no buffering and no per-chunk JSON work at all. Captured text is bounded
-     * ({@value #RESPONSE_LOG_MAX_CHARS_PER_PART} characters per part) - a long chain of thought
-     * must not be held in memory for a debug line; the dropped characters are named in the output
-     * and the whole line is shortened by {@link #shortenResponseBody} anyway.</p>
-     */
-    private static final class SseResponseLog {
-
-        /** Mapper for reading the chunks and rendering the summary. */
-        private final JsonMapper jsonMapper;
-        /** Concatenated chain-of-thought deltas. */
-        private final BoundedText reasoning = new BoundedText(RESPONSE_LOG_MAX_CHARS_PER_PART);
-        /** Concatenated answer deltas. */
-        private final BoundedText answer = new BoundedText(RESPONSE_LOG_MAX_CHARS_PER_PART);
-        /**
-         * Tool-call accumulators keyed by the streamed {@code index}
-         * ({@code choices[].delta.tool_calls[]}). Insertion order is kept, which matches the
-         * order in which the model emitted the calls.
-         */
-        private final Map<Integer, ToolCallLog> toolCalls = new LinkedHashMap<>();
-        /** Chain-of-thought characters seen in total, counted before the {@link BoundedText} cap. */
-        private long reasoningChars = 0L;
-        /** Answer characters seen in total, counted before the {@link BoundedText} cap. */
-        private long contentChars = 0L;
-        /** {@code function.arguments} characters seen in total, across all tool calls. */
-        private long toolCallChars = 0L;
-        /** Model name as reported by the server (first chunk naming one). */
-        private String model;
-        /** Last non-empty {@code finish_reason} (stop, length, tool_calls, ...). */
-        private String finishReason;
-        /** {@code usage} object of the last chunk that carried one. */
-        private JsonNode usage;
-        /** Number of chunks fed in. */
-        private int chunks = 0;
-        /** Number of chunks whose payload was not decodable JSON (keep-alive frames and alike). */
-        private int unparsableChunks = 0;
-
-        /**
-         * @param jsonMapper mapper used to parse the chunk payloads and to render the summary
-         */
-        SseResponseLog(JsonMapper jsonMapper) {
-            this.jsonMapper = jsonMapper;
-        }
-
-        /**
-         * Consumes a single SSE data payload (without the {@code data:} prefix). A payload that
-         * is not JSON only bumps the counters - the dump must never break a running stream.
-         *
-         * @param dataLine raw chunk payload
-         */
-        void accept(String dataLine) {
-            chunks++;
-            JsonNode node;
-            try {
-                node = jsonMapper.readTree(dataLine);
-            } catch (RuntimeException e) {
-                unparsableChunks++;
-                return;
-            }
-            if (node == null || !node.isObject()) {
-                return;
-            }
-            JsonNode modelNode = node.get("model");
-            if (model == null && modelNode != null && modelNode.isString()) {
-                model = modelNode.asString();
-            }
-            JsonNode usageNode = node.get("usage");
-            if (usageNode != null && usageNode.isObject()) {
-                // Last chunk carrying usage wins (stream_options.include_usage / continuous stats).
-                // Detached copy: the summary owns everything it renders.
-                usage = usageNode.deepCopy();
-            }
-            JsonNode choices = node.get("choices");
-            if (choices == null || !choices.isArray() || choices.isEmpty()) {
-                return;
-            }
-            JsonNode choice = choices.get(0);
-            JsonNode finishNode = choice.get("finish_reason");
-            if (finishNode != null && finishNode.isString()) {
-                finishReason = finishNode.asString();
-            }
-            // Streaming sends the deltas in "delta", a buffered response in "message".
-            JsonNode part = choice.get("delta");
-            if (part == null || !part.isObject()) {
-                part = choice.get("message");
-            }
-            if (part == null || !part.isObject()) {
-                return;
-            }
-            String reasoningContent = textOf(part, "reasoning_content");
-            String reasoningVllm = textOf(part, "reasoning");
-            String answerDelta = textOf(part, "content");
-            reasoning.append(reasoningContent);
-            reasoning.append(reasoningVllm);
-            answer.append(answerDelta);
-            // Tally over the whole stream, deliberately taken before the BoundedText cap: a
-            // longer chain of thought is truncated in the dump but must still be countable here.
-            reasoningChars += lengthOf(reasoningContent) + lengthOf(reasoningVllm);
-            contentChars += lengthOf(answerDelta);
-            collectToolCalls(part.get("tool_calls"));
-        }
-
-        /**
-         * Folds a {@code tool_calls} array into {@link #toolCalls}, for both shapes it occurs in:
-         * streamed {@code delta.tool_calls} fragments of one call spread over many chunks, and the
-         * complete {@code choices[].message.tool_calls} array of a buffered response.
-         *
-         * <p>Streaming opens a call with the fragment carrying {@code id} and
-         * {@code function.name}; later fragments append to {@code function.arguments} only. A
-         * captured {@code id}/{@code name} is therefore never overwritten by a later null, while
-         * the argument fragments are concatenated in arrival order. Arguments are kept as the
-         * JSON string the backend sends and are not re-parsed, so a stream that breaks mid-call
-         * still shows the part that arrived.</p>
-         *
-         * @param toolCallsNode the {@code tool_calls} node of a delta/message; null and non-array
-         *                      values are ignored, so an unexpected shape cannot break the stream
-         */
-        private void collectToolCalls(JsonNode toolCallsNode) {
-            if (toolCallsNode == null || !toolCallsNode.isArray()) {
-                return;
-            }
-            for (int position = 0; position < toolCallsNode.size(); position++) {
-                JsonNode entry = toolCallsNode.get(position);
-                if (entry == null || !entry.isObject()) {
-                    continue;
-                }
-                String id = textOf(entry, "id");
-                JsonNode function = entry.get("function");
-                boolean hasFunction = function != null && function.isObject();
-                String name = hasFunction ? textOf(function, "name") : null;
-                String arguments = hasFunction ? textOf(function, "arguments") : null;
-                if (id == null && name == null && arguments == null) {
-                    // Element carries nothing (some backends emit empty tool_calls placeholders);
-                    // registering it would put a nameless phantom call into the dump.
-                    continue;
-                }
-                // The streamed "index" identifies a call; buffered payloads commonly omit it,
-                // then the array position is the best available key.
-                int index = entry.path("index").asInt(position);
-                ToolCallLog call = toolCalls.computeIfAbsent(index, key -> new ToolCallLog());
-                if (id != null) {
-                    call.id = id;
-                }
-                if (name != null) {
-                    call.name = name;
-                }
-                if (arguments != null) {
-                    toolCallChars += arguments.length();
-                    call.arguments.append(arguments);
-                }
-            }
-        }
-
-        /**
-         * Renders what was collected as a compact JSON object, ready for
-         * {@link #shortenResponseBody}. Fields that never appeared in the stream are omitted.
-         *
-         * @return the response summary as JSON
-         */
-        String toLogString() {
-            ObjectNode summary = jsonMapper.createObjectNode();
-            if (model != null) {
-                summary.put("model", model);
-            }
-            summary.put("chunks", chunks);
-            if (unparsableChunks > 0) {
-                summary.put("unparsableChunks", unparsableChunks);
-            }
-            if (finishReason != null) {
-                summary.put("finish_reason", finishReason);
-            }
-            if (!reasoning.isEmpty()) {
-                summary.put("reasoning", reasoning.text());
-            }
-            if (!answer.isEmpty()) {
-                summary.put("content", answer.text());
-            }
-            if (!toolCalls.isEmpty()) {
-                ArrayNode toolCallArray = jsonMapper.createArrayNode();
-                for (ToolCallLog call : toolCalls.values()) {
-                    ObjectNode callNode = jsonMapper.createObjectNode();
-                    if (call.id != null) {
-                        callNode.put("id", call.id);
-                    }
-                    // Absent on a stream that was cut before the opening fragment arrived.
-                    callNode.put("name", call.name != null ? call.name : "<incomplete>");
-                    callNode.put("arguments", call.arguments.text());
-                    toolCallArray.add(callNode);
-                }
-                summary.set("tool_calls", toolCallArray);
-            }
-            if (usage != null) {
-                summary.set("usage", usage);
-            }
-            return jsonMapper.writeValueAsString(summary);
-        }
-
-        /**
-         * @return number of SSE chunk payloads fed in, including the {@code [DONE]} frame's
-         *         siblings; put smaller line counts (usage collection keeps only the tail) in
-         *         perspective
-         */
-        int chunkCount() {
-            return chunks;
-        }
-
-        /**
-         * @return last reported {@code finish_reason}, or null if the stream never named one
-         */
-        String finishReasonValue() {
-            return finishReason;
-        }
-
-        /**
-         * @return chain-of-thought characters of the whole stream, unaffected by the capture cap
-         */
-        long reasoningCharsTotal() {
-            return reasoningChars;
-        }
-
-        /**
-         * @return answer-content characters of the whole stream, unaffected by the capture cap
-         */
-        long contentCharsTotal() {
-            return contentChars;
-        }
-
-        /**
-         * @return {@code function.arguments} characters of the whole stream, across all tool calls
-         */
-        long toolCallCharsTotal() {
-            return toolCallChars;
-        }
-
-        /**
-         * Reads a text field of a delta/message node. Absent fields and explicit nulls - which
-         * OpenAI-compatible streams send while thinking, and again for everything but the changed
-         * field - yield null.
-         *
-         * @param part  the delta or message node
-         * @param field field name
-         * @return the text value or null
-         */
-        private static String textOf(JsonNode part, String field) {
-            JsonNode value = part.get(field);
-            return (value != null && value.isString()) ? value.asString() : null;
-        }
-
-        /**
-         * @param text text or null
-         * @return length of the text, 0 for null
-         */
-        private static int lengthOf(String text) {
-            return text == null ? 0 : text.length();
-        }
-
-        /**
-         * Accumulation slot of a single tool call within {@link SseResponseLog}: the identity
-         * scalars taken from the opening fragment plus the bounded argument text.
-         */
-        private static final class ToolCallLog {
-            /** Call id, from the fragment that opened this call. */
-            String id;
-            /** Function name, from the fragment that opened this call. */
-            String name;
-            /** Concatenated {@code function.arguments} fragments. */
-            final BoundedText arguments = new BoundedText(RESPONSE_LOG_MAX_CHARS_PER_PART);
-        }
-    }
-
-    /**
-     * Text accumulator with a hard character limit, used to capture the answer and the reasoning
-     * of a streamed response for the DEBUG dump. Once the limit is reached, further text is only
-     * counted; {@link #text()} then names the dropped characters so the log line does not look
-     * like the complete answer.
-     */
-    private static final class BoundedText {
-        /** Cap for the captured characters. */
-        private final int maxChars;
-        /** Captured characters. */
-        private final StringBuilder sb;
-        /** Characters seen beyond the cap. */
-        private long droppedChars = 0L;
-
-        /**
-         * @param maxChars maximum number of characters to keep
-         */
-        BoundedText(int maxChars) {
-            this.maxChars = maxChars;
-            this.sb = new StringBuilder(Math.min(256, maxChars));
-        }
-
-        /**
-         * Appends a delta; null, empty and over-limit text are ignored (and counted).
-         *
-         * @param text delta text or null
-         */
-        void append(String text) {
-            if (text == null || text.isEmpty()) {
-                return;
-            }
-            int free = maxChars - sb.length();
-            if (free <= 0) {
-                droppedChars += text.length();
-            } else if (text.length() > free) {
-                sb.append(text, 0, free);
-                droppedChars += text.length() - free;
-            } else {
-                sb.append(text);
-            }
-        }
-
-        /**
-         * @return true if nothing was captured
-         */
-        boolean isEmpty() {
-            return sb.isEmpty();
-        }
-
-        /**
-         * @return the captured text, suffixed by the number of dropped characters if any
-         */
-        String text() {
-            if (droppedChars == 0L) {
-                return sb.toString();
-            }
-            return sb.append(" [...").append(droppedChars).append(" more chars]").toString();
-        }
     }
 
     /**

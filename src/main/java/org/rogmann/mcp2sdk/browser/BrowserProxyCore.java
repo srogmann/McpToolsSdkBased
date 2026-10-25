@@ -106,7 +106,8 @@ final class BrowserProxyCore {
         String nonce = BrowserRewriter.extractCspNonce(upstream.first("Content-Security-Policy"));
         BrowserRewriter rewriter = new BrowserRewriter(app, BrowserSessions.get().apps(),
                 session.id(), origin, BrowserSessions.get().settings().relaxCsp(),
-                BrowserSessions.get().settings().injectBridge(), nonce);
+                BrowserSessions.get().settings().injectBridge(), nonce,
+                proxyOriginOf(request), upstreamBase.getAuthority());
         String rewritten = null;
         if (textual) {
             try {
@@ -149,6 +150,19 @@ final class BrowserProxyCore {
             return URI.create("http://127.0.0.1:" + BrowserSessions.get().localPort() + app.selfPath());
         }
         return URI.create(app.upstream());
+    }
+
+    /**
+     * The origin the <b>browser</b> used to reach us - the address a return URL has to name for the
+     * round trip to land back in the session (docs/browser.md §3a, {@code to: "session"}). The Host
+     * header is the browser's own naming; without one (HTTP/1.0) the connector's view steps in.
+     */
+    private static String proxyOriginOf(HttpServletRequest request) {
+        String host = request.getHeader("Host");
+        if (host == null || host.isBlank()) {
+            host = request.getServerName() + ":" + request.getServerPort();
+        }
+        return request.getScheme() + "://" + host.trim();
     }
 
     /**

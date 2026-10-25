@@ -32,7 +32,8 @@ public interface ReviewService {
      * A readable name for the reviewer, used in headings, in the grouping of the list and in
      * notifications. Mandatory on purpose: a tool id like {@code python.exec} is precise but is not
      * what a human wants to read between two requests, and a page full of ids reads like a log.
-     * Keep it short and in the reviewer's language, e.g. {@code "Python-Ausführung"}.
+      * Keep it short, and keep it English like the page it appears on, e.g.
+     * {@code "Python execution"}.
      *
      * @return the display name of this tool
      */

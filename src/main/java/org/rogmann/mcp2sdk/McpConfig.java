@@ -8,10 +8,15 @@ import io.modelcontextprotocol.server.transport.HttpServletStreamableServerTrans
 import io.modelcontextprotocol.server.transport.HttpServletSseServerTransportProvider;
 import io.modelcontextprotocol.spec.McpSchema;
 
+import org.rogmann.mcp2sdk.agent.AgentBoardTool;
+import org.rogmann.mcp2sdk.agent.ForkIdentityFilter;
+import org.rogmann.mcp2sdk.agent.PrefixForkTool;
 import org.rogmann.mcp2sdk.browser.BrowserTool;
+import org.rogmann.mcp2sdk.m2.PomWatch;
 import org.rogmann.mcp2sdk.tools.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.boot.web.servlet.ServletRegistrationBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -89,10 +94,37 @@ public class McpConfig {
         return new ServletRegistrationBean<>(transportProvider, "/mcp/sse/*");
     }
 
+    /**
+     * Notes which MCP session belongs to which thread of a running {@code prefix_fork} batch, off
+     * the header the child's transport carries (docs/subagent.md §14, P0.2). Everything downstream -
+     * the {@code agent_board} tool and the {@code board} JavaScript module - reads that pairing and
+     * never asks the caller who it is.
+     *
+     * <p>The filter never refuses anything; it only reads two headers. Registered on both MCP
+     * endpoints, on nothing else.</p>
+     *
+     * @return the filter registration
+     */
+    @Bean
+    public FilterRegistrationBean<ForkIdentityFilter> forkIdentityFilter() {
+        FilterRegistrationBean<ForkIdentityFilter> registration =
+                new FilterRegistrationBean<>(new ForkIdentityFilter());
+        registration.setName("forkIdentityFilter");
+        registration.addUrlPatterns("/mcp", "/mcp/*", "/mcp/sse", "/mcp/sse/*");
+        return registration;
+    }
+
     // Helper method to populate the registry with available tools
     private void populateToolRegistry(ToolRegistry registry, Environment environment) {
         // Fail fast on a misconfigured add-on configuration (missing description, duplicates, ...).
         WorkProject.validateAddonConfiguration();
+
+        // Maven input guard: fingerprint every pom.xml and .mvn file in the writable project roots
+        // before the first tool call could change one. Asynchronous (a large reactor means many
+        // directories), and the phase stays RUNNING until it is through - an unfinished baseline
+        // denies a Maven run rather than allowing it. See docs/maven-guard.md.
+        PomWatch.startAsync();
+        PomWatch.logStartupAssessment();
 
         registry.registerToolDefinition(CreateNewFileTool.createToolInstance());
         registry.registerToolDefinition(ReadTextFileTool.createToolInstance());
@@ -111,6 +143,15 @@ public class McpConfig {
 
         // Browser session: operate an internal web application jointly (M0: read, do not write)
         registry.registerToolDefinition(BrowserTool.createToolInstance());
+
+        // Prefix fork: child threads that start at the frozen prefix of this very conversation
+        // (docs/webui.md §3). Registered but not activated by default - see tools.active.
+        registry.registerToolDefinition(PrefixForkTool.createToolInstance());
+
+        // Message board of a prefix_fork batch (docs/subagent.md): live only while a batch with
+        // board:true runs, refused otherwise. Registered but not activated by default - see
+        // tools.active; it must be active in the conversation for the children to reach it (F6).
+        registry.registerToolDefinition(AgentBoardTool.createToolInstance());
 
         //registry.registerToolDefinition(VideoPlayerTool.createToolInstance());
         //registry.registerToolDefinition(VideoSearchTool.createToolInstance());

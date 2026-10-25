@@ -233,12 +233,13 @@ public class CallLlmTool {
                         objTool.put("type", "function");
                         objTool.put("name", tool.name());
                         objTool.put("description", tool.description());
-                        JsonSchema jsonSchema = tool.inputSchema();
-                        if (jsonSchema != null) {
+                        Map<String, Object> schemaMap = tool.inputSchema();
+                        if (schemaMap != null) {
                             ObjectNode paramsNode = jsonMapper.createObjectNode();
-                            paramsNode.put("type", jsonSchema.type());
-                            paramsNode.set("properties", jsonMapper.valueToTree(jsonSchema.properties()));
-                            List<String> required = jsonSchema.required();
+                            paramsNode.put("type", (String) schemaMap.get("type"));
+                            paramsNode.set("properties", jsonMapper.valueToTree(schemaMap.get("properties")));
+                            @SuppressWarnings("unchecked")
+                            List<String> required = (List<String>) schemaMap.get("required");
                             if (required != null && !required.isEmpty()) {
                                 ArrayNode requiredArray = paramsNode.putArray("required");
                                 required.forEach(requiredArray::add);

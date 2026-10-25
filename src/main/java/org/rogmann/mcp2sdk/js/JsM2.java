@@ -1,6 +1,7 @@
 package org.rogmann.mcp2sdk.js;
 
 import org.rogmann.mcp2sdk.m2.M2Resolver;
+import org.rogmann.mcp2sdk.m2.PomWatch;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -18,7 +19,7 @@ import java.util.Map;
  * <h3>Public JavaScript API</h3>
  * <ul>
  *   <li>{@code m2.help()} - help text</li>
- *   <li>{@code m2.list(pom[, options])} - artifact list of the compile classpath</li>
+ *   <li>{@code m2.list(pom[, options])} - artifact list of the resolved classpath (test scope)</li>
  *   <li>{@code m2.classpath(pom)} - array of JAR paths</li>
  *   <li>{@code m2.tree(pom[, {verbose}])} - output of {@code mvn dependency:tree}</li>
  *   <li>{@code m2.findClass(fqcn, pom)} - artifact and entry containing a class</li>
@@ -64,7 +65,16 @@ public final class JsM2 {
     // ========================================================================
 
     /**
-     * Artifact list of the compile classpath of a POM.
+     * Artifact list of the resolved classpath of a POM.
+     *
+     * <p>
+     * "resolved" means what {@code mvn dependency:build-classpath} answers, and that is the
+     * <b>test</b> classpath: measured on this project it includes {@code junit-jupiter}, which the
+     * POM declares as {@code <scope>test</scope>}. Earlier text here called it "the compile
+     * classpath", and a reader who believed the name would treat a list containing the test
+     * libraries as the production ones - the misnomer {@code docs/js/espresso.md} §2.2 names. Ask
+     * {@link M2Resolver#resolveClasspath(Path, String)} with {@code "compile"} for that view.
+     * </p>
      *
      * @param pomPath POM path (sandbox-relative or absolute)
      * @param options optional: {@code contains} (case-insensitive substring of
@@ -126,7 +136,7 @@ public final class JsM2 {
         return result;
     }
 
-    /** JAR paths of the compile classpath, in Maven order. */
+    /** JAR paths of the resolved classpath (test scope, see {@link #list}), in Maven order. */
     public static List<String> classpath(String pomPath) throws IOException {
         List<String> out = new ArrayList<>();
         for (M2Resolver.Artifact a : M2Resolver.classpath(resolvePom(pomPath))) {
@@ -151,7 +161,7 @@ public final class JsM2 {
         return result;
     }
 
-    /** Artifact and entry that provide a class on the compile classpath. */
+    /** Artifact and entry that provide a class on the resolved (test-scope) classpath. */
     public static Map<String, Object> findClass(String className, String pomPath)
             throws IOException {
         return M2Resolver.findClass(resolvePom(pomPath), className);
@@ -204,6 +214,9 @@ public final class JsM2 {
         m.put("cacheTtlSeconds", M2Resolver.getProperty("tools.m2.cache-ttl-seconds", "300"));
         m.put("sourcesDownloadAllowed", M2Resolver.sourcesDownloadAllowed());
         m.put("repositoryExists", Files.isDirectory(M2Resolver.repository()));
+        // The Maven input guard, so that the operator (and a model) can see what a future mvn run
+        // will be compared against: phase, mode, root count, watched file count, findings.
+        m.put("pomGuard", PomWatch.summary().toMap());
         return m;
     }
 
@@ -322,7 +335,9 @@ public final class JsM2 {
                       this text
 
                   m2.list(pom[, options])
-                      artifacts of the compile classpath. Returns
+                      artifacts of the resolved classpath - which is Maven's TEST classpath:
+                      a <scope>test</scope> dependency is in it (measured: junit-jupiter is).
+                      Returns
                       { pom, repository, total, matched, truncated, entries[] }.
                       options: contains (substring of groupId:artifactId:version),
                                group (group id prefix), maxEntries (default 200, max 2000),
@@ -332,7 +347,8 @@ public final class JsM2 {
                       does not have to leave the sandbox as a whole.
 
                   m2.classpath(pom)
-                      array of JAR paths in Maven order.
+                      array of JAR paths in Maven order (test classpath, as in m2.list;
+                      for the compile-scope view use espresso.compile {classpath:"main"}).
 
                   m2.tree(pom[, options])
                       { text, verbose, truncated } of 'mvn dependency:tree'.
@@ -360,7 +376,8 @@ public final class JsM2 {
                       property tools.m2.allow-sources-download=false.
 
                   m2.info()
-                      repository root and effective configuration.
+                      repository root and effective configuration, including pomGuard: the state of
+                      the Maven input baseline (phase, mode, roots, watched files, findings).
 
                   m2.clearCache()
                       drops the cached classpath resolutions (they also expire by TTL and

@@ -9,6 +9,7 @@ import io.modelcontextprotocol.spec.McpSchema.JsonSchema;
 import org.rogmann.mcp2sdk.ToolSpecWithState;
 import org.rogmann.mcp2sdk.ToolState;
 import org.rogmann.mcp2sdk.WorkProject;
+import org.rogmann.mcp2sdk.watch.FileChangeWatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,10 +34,6 @@ public class CreateNewFileTool {
     private static final Logger LOGGER = LoggerFactory.getLogger(CreateNewFileTool.class);
 
     private static final String NAME = "create_new_file";
-
-    /** maximum number of lines counted for the size metrics (keeps the error
-     *  path cheap even for very large files) */
-    private static final int MAX_COUNTED_LINES = 100_000;
 
     /** tool state (active-flag, statistics) */
     private final ToolState state;
@@ -156,6 +153,7 @@ public class CreateNewFileTool {
 
         try {
             Files.createDirectories(targetFile.getParent());
+            FileChangeWatch.beforeWrite(targetFile);
             Files.writeString(targetFile, text,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
 
@@ -184,6 +182,10 @@ public class CreateNewFileTool {
                 .build();
         }
     }
+
+    /** maximum number of lines counted for the size metrics (keeps the error
+     *  path cheap even for very large files) */
+    private static final int MAX_COUNTED_LINES = 100_000;
 
     /**
      * Describes the size metrics of an existing file (byte size plus line

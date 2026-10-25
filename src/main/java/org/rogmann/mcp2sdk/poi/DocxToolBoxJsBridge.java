@@ -8,9 +8,12 @@ import org.rogmann.mcp2sdk.js.JsModuleInterface;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
+import java.util.function.IntFunction;
 
 /**
  * Bridge between GraalVM JavaScript and {@link DocxToolBox}.
@@ -87,6 +90,16 @@ public class DocxToolBoxJsBridge implements JsModuleInterface {
             box.close(stringArg("close", "docHandle", arg(args, 0)));
             return null;
         });
+
+        // --- document attachments: page setup and core properties (docs/js/docx.md §9.2/§9.3) ---
+        methods.put("setPageSetup", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.setPageSetup(
+                        stringArg("setPageSetup", "docHandle", arg(args, 0)),
+                        optionsArg("setPageSetup", arg(args, 1)))));
+        methods.put("setDocumentMeta", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.setDocumentMeta(
+                        stringArg("setDocumentMeta", "docHandle", arg(args, 0)),
+                        optionsArg("setDocumentMeta", arg(args, 1)))));
 
         // --- reading / inspection ---
         methods.put("getDocumentInfo", (ProxyExecutable) args ->
@@ -284,6 +297,112 @@ public class DocxToolBoxJsBridge implements JsModuleInterface {
             return null;
         });
 
+        // --- writing: table fine-tuning (M2, Aufgabe 7 - docs/js/docx.md §9.8) ---
+        // Every call takes a table reference (index or "t-n" handle) and answers with the
+        // table properties, so the caller sees what was written without reopening the file.
+        methods.put("getTableProps", (ProxyExecutable) args -> {
+            String fn = "getTableProps";
+            String doc = stringArg(fn, "docHandle", arg(args, 0));
+            return tableCall(fn, args, i -> box.getTableProps(doc, i),
+                    h -> box.getTablePropsByHandle(doc, h));
+        });
+        methods.put("setTableAlignment", (ProxyExecutable) args -> {
+            String fn = "setTableAlignment";
+            String doc = stringArg(fn, "docHandle", arg(args, 0));
+            String alignment = stringArg(fn, "alignment", arg(args, 2));
+            return tableCall(fn, args, i -> box.setTableAlignment(doc, i, alignment),
+                    h -> box.setTableAlignmentByHandle(doc, h, alignment));
+        });
+        methods.put("setTableWidth", (ProxyExecutable) args -> {
+            String fn = "setTableWidth";
+            String doc = stringArg(fn, "docHandle", arg(args, 0));
+            String spec = stringArg(fn, "spec", arg(args, 2));
+            return tableCall(fn, args, i -> box.setTableWidth(doc, i, spec),
+                    h -> box.setTableWidthByHandle(doc, h, spec));
+        });
+        methods.put("setTableLayout", (ProxyExecutable) args -> {
+            String fn = "setTableLayout";
+            String doc = stringArg(fn, "docHandle", arg(args, 0));
+            String layout = stringArg(fn, "layout", arg(args, 2));
+            return tableCall(fn, args, i -> box.setTableLayout(doc, i, layout),
+                    h -> box.setTableLayoutByHandle(doc, h, layout));
+        });
+        methods.put("setTableBorders", (ProxyExecutable) args -> {
+            String fn = "setTableBorders";
+            String doc = stringArg(fn, "docHandle", arg(args, 0));
+            Map<String, Object> edges = nestedOptionsArg(fn, arg(args, 2));
+            return tableCall(fn, args, i -> box.setTableBorders(doc, i, edges),
+                    h -> box.setTableBordersByHandle(doc, h, edges));
+        });
+        methods.put("setRowHeight", (ProxyExecutable) args -> {
+            String fn = "setRowHeight";
+            String doc = stringArg(fn, "docHandle", arg(args, 0));
+            int rowIndex = indexArg(fn, "rowIndex", arg(args, 2));
+            Map<String, Object> options = optionsArg(fn, arg(args, 3));
+            return tableCall(fn, args, i -> box.setRowHeight(doc, i, rowIndex, options),
+                    h -> box.setRowHeightByHandle(doc, h, rowIndex, options));
+        });
+        methods.put("setRowCantSplit", (ProxyExecutable) args -> {
+            String fn = "setRowCantSplit";
+            String doc = stringArg(fn, "docHandle", arg(args, 0));
+            int rowIndex = indexArg(fn, "rowIndex", arg(args, 2));
+            boolean cantSplit = boolArg(fn, "cantSplit", arg(args, 3));
+            return tableCall(fn, args, i -> box.setRowCantSplit(doc, i, rowIndex, cantSplit),
+                    h -> box.setRowCantSplitByHandle(doc, h, rowIndex, cantSplit));
+        });
+        methods.put("setRepeatHeaderRows", (ProxyExecutable) args -> {
+            String fn = "setRepeatHeaderRows";
+            String doc = stringArg(fn, "docHandle", arg(args, 0));
+            int rows = indexArg(fn, "rows", arg(args, 2));
+            return tableCall(fn, args, i -> box.setRepeatHeaderRows(doc, i, rows),
+                    h -> box.setRepeatHeaderRowsByHandle(doc, h, rows));
+        });
+        methods.put("setCellBorders", (ProxyExecutable) args -> {
+            String fn = "setCellBorders";
+            String doc = stringArg(fn, "docHandle", arg(args, 0));
+            CellRef cell = cellRef(fn, arg(args, 2), arg(args, 3));
+            Map<String, Object> edges = nestedOptionsArg(fn, arg(args, 4));
+            return tableCall(fn, args, i -> box.setCellBorders(doc, i, cell.row(), cell.col(), edges),
+                    h -> box.setCellBordersByHandle(doc, h, cell.row(), cell.col(), edges));
+        });
+        methods.put("setCellWidth", (ProxyExecutable) args -> {
+            String fn = "setCellWidth";
+            String doc = stringArg(fn, "docHandle", arg(args, 0));
+            CellRef cell = cellRef(fn, arg(args, 2), arg(args, 3));
+            String spec = stringArg(fn, "spec", arg(args, 4));
+            return tableCall(fn, args, i -> box.setCellWidth(doc, i, cell.row(), cell.col(), spec),
+                    h -> box.setCellWidthByHandle(doc, h, cell.row(), cell.col(), spec));
+        });
+        methods.put("setCellShading", (ProxyExecutable) args -> {
+            String fn = "setCellShading";
+            String doc = stringArg(fn, "docHandle", arg(args, 0));
+            CellRef cell = cellRef(fn, arg(args, 2), arg(args, 3));
+            String color = stringArg(fn, "shading", arg(args, 4));
+            return tableCall(fn, args,
+                    i -> box.setCellShading(doc, i, cell.row(), cell.col(), color),
+                    h -> box.setCellShadingByHandle(doc, h, cell.row(), cell.col(), color));
+        });
+        methods.put("setCellValign", (ProxyExecutable) args -> {
+            String fn = "setCellValign";
+            String doc = stringArg(fn, "docHandle", arg(args, 0));
+            CellRef cell = cellRef(fn, arg(args, 2), arg(args, 3));
+            String valign = stringArg(fn, "valign", arg(args, 4));
+            return tableCall(fn, args,
+                    i -> box.setCellValign(doc, i, cell.row(), cell.col(), valign),
+                    h -> box.setCellValignByHandle(doc, h, cell.row(), cell.col(), valign));
+        });
+        methods.put("mergeCells", (ProxyExecutable) args -> {
+            String fn = "mergeCells";
+            String doc = stringArg(fn, "docHandle", arg(args, 0));
+            int fromRow = indexArg(fn, "fromRow", arg(args, 2));
+            int fromCol = indexArg(fn, "fromCol", arg(args, 3));
+            int toRow = indexArg(fn, "toRow", arg(args, 4));
+            int toCol = indexArg(fn, "toCol", arg(args, 5));
+            return tableCall(fn, args,
+                    i -> box.mergeCells(doc, i, fromRow, fromCol, toRow, toCol),
+                    h -> box.mergeCellsByHandle(doc, h, fromRow, fromCol, toRow, toCol));
+        });
+
         // --- writing: drawings (docs/js/docx.md §1.4) ---
         methods.put("createDrawing", (ProxyExecutable) args -> box.createDrawing(
                 stringArg("createDrawing", "paragraphHandle", arg(args, 0)),
@@ -314,6 +433,15 @@ public class DocxToolBoxJsBridge implements JsModuleInterface {
             box.removeShape(stringArg("removeShape", "shapeHandle", arg(args, 0)));
             return null;
         });
+
+        // --- comments: read and remove; writing new ones is an open point (docs/js/docx.md §9.7) ---
+        methods.put("getComments", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.getComments(
+                        stringArg("getComments", "docHandle", arg(args, 0)))));
+        methods.put("removeComment", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.removeComment(
+                        stringArg("removeComment", "docHandle", arg(args, 0)),
+                        stringArg("removeComment", "commentId", arg(args, 1)))));
 
         methods.put("help", (ProxyExecutable) args -> box.help());
 
@@ -418,5 +546,81 @@ public class DocxToolBoxJsBridge implements JsModuleInterface {
     /** A table reference may be an index (0, 1, …) or a "t-n" handle - docx only. */
     private static boolean isTableHandle(Value value) {
         return value != null && value.isString() && value.asString().startsWith("t-");
+    }
+
+    /** Row and column of a cell call, converted once instead of in two branches. */
+    private record CellRef(int row, int col) { }
+
+    private static CellRef cellRef(String fn, Value rowIndex, Value colIndex) {
+        return new CellRef(indexArg(fn, "rowIndex", rowIndex), indexArg(fn, "colIndex", colIndex));
+    }
+
+    /**
+     * Dispatches a call that addresses one table by index or by "t-n" handle, and answers with
+     * the properties of that table (so the caller reads back what it just wrote).
+     * <p>
+     * Only the taken branch runs, which matters: {@link #indexArg} would refuse a handle and
+     * the handle overload would refuse an index.
+     * </p>
+     */
+    private static Object tableCall(String fn, Value[] args, IntFunction<Map<String, Object>> byIndex,
+                                    Function<String, Map<String, Object>> byHandle) {
+        Value tableRef = arg(args, 1);
+        Map<String, Object> result = isTableHandle(tableRef)
+                ? byHandle.apply(tableRef.asString())
+                : byIndex.apply(indexArg(fn, "tableIndex", tableRef));
+        return GraalProxies.toProxyObject(result);
+    }
+
+    /**
+     * Options with one nesting level - {@code docx.setTableBorders(doc, t, {top: {style:
+     * "single", widthPt: 1}})}. {@link PoiJsArgs#toPlain} stops at flat values on purpose (its
+     * own error says so), so the objects inside are flattened here with the same rules:
+     * strings, numbers, booleans and arrays stay what they are, a host object stays an error.
+     * A null value is dropped, which the toolbox documents as "leave that edge alone" - to
+     * switch a border off, the style name {@code "none"} is the one that means it.
+     */
+    private static Map<String, Object> nestedOptionsArg(String fn, Value value) {
+        if (value == null || value.isNull()) {
+            return Map.of();
+        }
+        if (!value.hasMembers() || value.hasArrayElements()) {
+            throw A.badArg(fn, "options", value, "an object ({top: {style: \"single\"}, ...})");
+        }
+        Map<String, Object> options = new LinkedHashMap<>();
+        for (String key : value.getMemberKeys()) {
+            Object plain = plainOrNested(fn, key, value.getMember(key));
+            if (plain != null) {
+                options.put(key, plain);
+            }
+        }
+        return options;
+    }
+
+    /** One value of {@link #nestedOptionsArg}: a flat value, or one more object of them. */
+    private static Object plainOrNested(String fn, String name, Value value) {
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        if (value.isBoolean()) {
+            return value.asBoolean();
+        }
+        if (value.isNumber()) {
+            return value.asDouble();
+        }
+        if (value.isString()) {
+            return value.asString();
+        }
+        if (value.hasArrayElements()) {
+            List<Object> entries = new ArrayList<>();
+            for (int i = 0; i < value.getArraySize(); i++) {
+                entries.add(plainOrNested(fn, name + "[" + i + "]", value.getArrayElement(i)));
+            }
+            return entries;
+        }
+        if (value.hasMembers()) {
+            return nestedOptionsArg(fn + "." + name, value);
+        }
+        throw A.badArg(fn, name, value, "a string, number, boolean, array or object");
     }
 }
