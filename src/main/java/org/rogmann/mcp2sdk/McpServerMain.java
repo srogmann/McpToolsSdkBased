@@ -74,6 +74,7 @@ public class McpServerMain {
                 "reactor.core.publisher.MonoIgnoreElements",
                 "reactor.core.publisher.MonoRunnable",
                 "reactor.core.publisher.MonoSink",
+                "reactor.core.publisher.MonoWhen$WhenCoordinator",
                 "reactor.core.publisher.Operators");
 
         SpringApplication.run(McpServerMain.class, args);

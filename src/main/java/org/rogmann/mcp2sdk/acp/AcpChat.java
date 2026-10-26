@@ -10,6 +10,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -17,8 +18,11 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.time.Duration;
 
+import io.modelcontextprotocol.common.McpTransportContext;
 import io.modelcontextprotocol.spec.McpClientTransport;
 import org.rogmann.mcp2sdk.agent.ChatContextStore;
+import org.rogmann.mcp2sdk.browser.BrowserReviewService;
+import org.rogmann.mcp2sdk.m2.MavenGuard;
 
 import com.agentclientprotocol.sdk.agent.AcpAgent;
 import com.agentclientprotocol.sdk.agent.AcpSyncAgent;
@@ -72,6 +76,14 @@ import io.modelcontextprotocol.spec.McpSchema;
  * <p>One agent instance serves all the sessions of its connection; the conversation history
  * is per chat id and in memory only (a restart forgets it — the Web-UI history stays
  * untouched, and the proxy's own statistics keep flowing for the loopback requests).</p>
+ *
+ * <p><b>Permission route (S6)</b>: a tool named in {@code acp.permission.tools} asks the IDE
+ * user via {@code session/request_permission} before it executes — options allow once /
+ * allow always / reject, "allow always" remembered per ACP session. The list is empty by
+ * default and re-read on every call (the {@code acp.ide-diff} pattern); it is a UX
+ * affordance, deliberately not a security boundary, and review-backed tools
+ * ({@link PythonReviewService}, {@link MavenGuard}, {@link BrowserReviewService}) are
+ * never asked twice — their decision path is the four-eyes queue.</p>
  */
 final class AcpChat {
 
@@ -97,6 +109,20 @@ final class AcpChat {
     private static final long TURN_DEADLINE_MINUTES = 10;
 
     /**
+     * Tools whose approval lives in the four-eyes {@code ReviewService} — their decision
+     * path exists, so the ACP dialog never asks them twice (docs/acp.md §6, S6). Keep in
+     * sync when a review-backed tool appears; there is no registry to ask (the review
+     * area holds no catalogue of tools by design).
+     */
+    private static final Set<String> REVIEWED_TOOLS = Set.of(
+            MavenGuard.TOOL_ID, BrowserReviewService.TOOL_ID);
+
+    /** Option ids of the S6 permission dialog — the ids are ours, the labels face the user. */
+    private static final String OPT_ALLOW_ONCE = "allow_once";
+    private static final String OPT_ALLOW_ALWAYS = "allow_always";
+    private static final String OPT_REJECT = "reject_once";
+
+    /**
      * Serializes the history updates and snapshots across all connections. A ReentrantLock
      * instead of a monitor: the build targets Java 17, but the same code runs on a JDK 21
      * runtime, where the SDK's transports execute on virtual threads — and a virtual
@@ -108,13 +134,51 @@ final class AcpChat {
     private final String selfBaseUrl;
 
     /** Conversation history per chat id (see {@link ChatIds}). */
-    private final Map<String, List<ObjectNode>> histories = new ConcurrentHashMap<>();
+    /**
+     * Process-wide, not per connection: the IDE opens one connection per conversation and
+     * rebuilds them on every reconnect (an IDE restart, a dropped WebSocket) — a new
+     * {@code AcpChat} with an instance-owned map would forget every conversation on the
+     * first reconnect, and the {@code session/load} that arrives on the fresh connection
+     * has to find the replay there. The {@code ReviewStore}/{@code ForkIdentity} pattern:
+     * the map is static, every handler reads the same object. (Found by the S6 load round:
+     * the reconnect after an IDE restart answered "unknown session" for a conversation the
+     * same server process had held.)
+     */
+    private static final Map<String, List<ObjectNode>> histories = new ConcurrentHashMap<>();
 
     /** MCP client for in-process tool execution; lazily created per connection. */
     private McpSyncClient mcpClient;
 
     /** The active tools as of this connection's first tool listing. */
     private volatile List<McpSchema.Tool> activeTools;
+
+    /**
+     * Tool names the IDE user freed with "allow always", per ACP session id (S6). In
+     * memory only — a restart asks again, which is the honest default for a permission.
+     * Process-wide like {@link #histories}: the session ids outlive the connections that
+     * created them, and "always" must not expire on a reconnect.
+     */
+    private static final Map<String, Set<String>> alwaysAllowedTools = new ConcurrentHashMap<>();
+
+    /**
+     * The chat id of the tool loop running right now, read by the transport-context
+     * provider on the thread that makes the call (the prompt thread) — a thread-local
+     * inside the transport customizer would be against the SDK's own advice, because the
+     * request is built on whatever thread the reactor chain reaches; the provider runs
+     * before that, and the context travels with the request.
+     */
+    private static final ThreadLocal<String> CURRENT_CONVERSATION = new ThreadLocal<>();
+
+    /** Key under which the tool loop puts the chat id into the {@link McpTransportContext}. */
+    private static final String CONTEXT_CONVERSATION_ID = "acpConversationId";
+
+    /**
+     * The agent this chat serves, set by {@link #build} right after construction. The load
+     * handler needs it: the sync load handler takes no agent parameter, and the session
+     * updates of the replay go through the agent — there is no prompt turn to attach a
+     * prompt context to.
+     */
+    private AcpSyncAgent agent;
 
     private AcpChat(String selfBaseUrl) {
         this.selfBaseUrl = selfBaseUrl;
@@ -169,7 +233,10 @@ final class AcpChat {
             .initializeHandler(request -> {
                 LOG.info("AcpChat initialize: protocolVersion={}, clientInfo={}, clientCapabilities={}",
                         request.protocolVersion(), request.clientInfo(), request.clientCapabilities());
-                return AcpSchema.InitializeResponse.ok();
+                // Our own handler replaces the SDK default, and InitializeResponse.ok()
+                // advertises an empty capability set — loadSession goes in by hand (S6).
+                return AcpSchema.InitializeResponse.ok(
+                        AcpSchema.AgentCapabilities.builder().loadSession(true).build());
             })
             .newSessionHandler(request -> {
                 String sessionId = UUID.randomUUID().toString();
@@ -179,7 +246,9 @@ final class AcpChat {
                 return new AcpSchema.NewSessionResponse(sessionId);
             })
             .promptHandler(chat::onPrompt)
+            .loadSessionHandler(chat::onLoadSession)
             .build();
+        chat.agent = agent;
         return agent;
     }
 
@@ -203,6 +272,51 @@ final class AcpChat {
             context.sendMessage("\n\n(The LLM call failed: " + e.getMessage() + ")");
             return AcpSchema.PromptResponse.endTurn();
         }
+    }
+
+    /**
+     * Serves {@code session/load} (S6): the client reopens a session, and this agent replays
+     * its conversation as session updates before the response — text turns only, the
+     * tool-call entries of the history stay out (the IDE saw them live, and a full
+     * tool-call replay is a later throw). The history is in memory only: a session unknown
+     * to this process is an honest protocol error, not an empty conversation — a restart
+     * forgets it (docs/acp.md §3; the serialized second throw stays open).
+     */
+    private AcpSchema.LoadSessionResponse onLoadSession(AcpSchema.LoadSessionRequest request) {
+        String sessionId = request.sessionId();
+        List<ObjectNode> history = histories.get(sessionId);
+        if (history == null) {
+            throw new IllegalStateException("Unknown session " + sessionId
+                    + ": conversations are kept in memory only, and a restart forgets them.");
+        }
+        LOCK.lock();
+        List<ObjectNode> snapshot;
+        try {
+            snapshot = List.copyOf(history);
+        }
+        finally {
+            LOCK.unlock();
+        }
+        int replayed = 0;
+        for (ObjectNode message : snapshot) {
+            String text = message.path("content").asString("");
+            if (text.isEmpty()) {
+                continue;
+            }
+            String role = message.path("role").asString("");
+            AcpSchema.SessionUpdate update = "user".equals(role)
+                    ? new AcpSchema.UserMessageChunk(new AcpSchema.TextContent(text))
+                    : "assistant".equals(role)
+                            ? new AcpSchema.AgentMessageChunk(new AcpSchema.TextContent(text))
+                            : null;
+            if (update != null) {
+                agent.sendSessionUpdate(sessionId, update);
+                replayed++;
+            }
+        }
+        LOG.info("AcpChat load: session {} replayed {} of {} history entr(ies)", sessionId,
+                replayed, snapshot.size());
+        return new AcpSchema.LoadSessionResponse(null);
     }
 
     private AcpSchema.PromptResponse completionLoop(ChatIds ids, List<ObjectNode> history,
@@ -338,6 +452,24 @@ final class AcpChat {
                 LOG.info("AcpChat executes tool calls with finish_reason={}", finishReason);
             }
 
+            toolCallsExecuted = executeToolCalls(history, context, calls, ids.chatId(),
+                    deadline, toolCallsExecuted);
+            // The next completion turn sees the assistant call and the tool results in its history.
+        }
+    }
+
+    /**
+     * Runs one batch of tool calls under this conversation's identity: every MCP request
+     * below carries the chat id in {@code X-Conversation-Id} (S6) — supplied per call out
+     * of the transport context, so {@code prefix_fork} can tie a call to the session that
+     * made it even though all ACP sessions of this connection share one MCP client.
+     * Returns the updated tool-call count.
+     */
+    private int executeToolCalls(List<ObjectNode> history, SyncPromptContext context,
+                                 List<ToolCallAcc> calls, String chatId, long deadline,
+                                 int toolCallsExecuted) {
+        CURRENT_CONVERSATION.set(chatId);
+        try {
             for (int i = 0; i < calls.size(); i++) {
                 ToolCallAcc call = calls.get(i);
                 String toolCallId = call.callId(toolCallsExecuted + i);
@@ -369,22 +501,40 @@ final class AcpChat {
                         LOG.warn("AcpChat ide-diff pre-read failed for {}: {}", diffTarget, e.getMessage());
                     }
                 }
-                executeToolCall(history, context, toolCallId, call);
-                if (diffTarget != null) {
+                boolean executed = executeToolCall(history, context, toolCallId, call);
+                if (diffTarget != null && executed) {
                     sendFileDiffUpdate(context, toolCallId, diffTarget.toString(), diffBefore);
                 }
                 toolCallsExecuted++;
             }
-            // The next completion turn sees the assistant call and the tool results in its history.
         }
+        finally {
+            CURRENT_CONVERSATION.remove();
+        }
+        return toolCallsExecuted;
     }
 
-    private void executeToolCall(List<ObjectNode> history, SyncPromptContext context,
-                                 String toolCallId, ToolCallAcc call) {
+    private boolean executeToolCall(List<ObjectNode> history, SyncPromptContext context,
+                                    String toolCallId, ToolCallAcc call) {
         AcpSchema.ToolKind kind = kindOf(call.name);
         String title = call.title();
         context.sendSessionUpdate(new AcpSchema.ToolCall(null, toolCallId, title, call.name,
                 kind, AcpSchema.ToolCallStatus.IN_PROGRESS, null, null, null, null, null));
+
+        // S6: the permission route sits between the announce and the execution. The IDE
+        // user decides on the tools listed in acp.permission.tools (empty by default);
+        // everything else runs silently, as it did before S6 and as the web UI does.
+        PermissionDecision permission = permissionFor(context, call, toolCallId, title, kind);
+        if (!permission.granted()) {
+            context.sendSessionUpdate(new AcpSchema.ToolCallUpdateNotification(null, toolCallId,
+                    null, null, null, AcpSchema.ToolCallStatus.FAILED,
+                    List.of(new AcpSchema.ToolCallContentBlock(null,
+                            new AcpSchema.TextContent(permission.note()))), null, null, null, null));
+            appendSyntheticToolResult(history, toolCallId, permission.note());
+            LOG.info("AcpChat tool call {} ({}) skipped: {}", call.name, toolCallId,
+                    permission.note());
+            return false;
+        }
 
         McpSchema.CallToolResult result;
         boolean failed = false;
@@ -420,6 +570,80 @@ final class AcpChat {
         }
         LOG.info("AcpChat tool call {} ({}) -> {}", call.name, toolCallId,
                 (failed ? "error" : "ok"));
+        return true;
+    }
+
+    /**
+     * The S6 permission step for one tool call: returns whether it may execute, and asks
+     * the IDE user when the tool is listed in {@code acp.permission.tools}. The request
+     * rides on the already sent {@code tool_call} announce and carries this very
+     * {@code toolCallId} — not the {@code askPermission} convenience, which would announce
+     * a second tool call of its own with a random id. The user's answer counts against the
+     * agent's request timeout; a prompt turn cancelled meanwhile must come back as a
+     * {@code PermissionCancelled} outcome (schema v1 requires the client to answer pending
+     * permission requests of the cancelled turn that way) and skips the call. A client
+     * without a handler answers {@code -32601}; either way, no answer means no execution —
+     * the safe side.
+     */
+    private PermissionDecision permissionFor(SyncPromptContext context, ToolCallAcc call,
+                                             String toolCallId, String title, AcpSchema.ToolKind kind) {
+        if (!permissionTools().contains(call.name) || REVIEWED_TOOLS.contains(call.name)) {
+            return PermissionDecision.GRANTED;
+        }
+        String sessionId = context.getSessionId();
+        if (allowedAlways(sessionId).contains(call.name)) {
+            return PermissionDecision.GRANTED;
+        }
+        List<AcpSchema.PermissionOption> options = List.of(
+                new AcpSchema.PermissionOption(OPT_ALLOW_ONCE, "Allow once",
+                        AcpSchema.PermissionOptionKind.ALLOW_ONCE),
+                new AcpSchema.PermissionOption(OPT_ALLOW_ALWAYS, "Allow always",
+                        AcpSchema.PermissionOptionKind.ALLOW_ALWAYS),
+                new AcpSchema.PermissionOption(OPT_REJECT, "Reject",
+                        AcpSchema.PermissionOptionKind.REJECT_ONCE));
+        AcpSchema.RequestPermissionResponse response;
+        try {
+            response = context.client().requestPermission(new AcpSchema.RequestPermissionRequest(
+                    sessionId,
+                    new AcpSchema.ToolCallUpdate(toolCallId, title, kind,
+                            AcpSchema.ToolCallStatus.IN_PROGRESS),
+                    options));
+        }
+        catch (RuntimeException e) {
+            LOG.warn("AcpChat permission request for {} failed: {}", call.name, e.toString());
+            return PermissionDecision.declined("Not executed: the permission dialog failed ("
+                    + e.getMessage() + ").");
+        }
+        if (response.outcome() instanceof AcpSchema.PermissionSelected selected) {
+            if (OPT_ALLOW_ALWAYS.equals(selected.optionId())) {
+                allowedAlways(sessionId).add(call.name);
+                LOG.info("AcpChat: {} allowed for the rest of session {} (allow always)",
+                        call.name, sessionId);
+            }
+            if (OPT_ALLOW_ONCE.equals(selected.optionId())
+                    || OPT_ALLOW_ALWAYS.equals(selected.optionId())) {
+                return PermissionDecision.GRANTED;
+            }
+            // An unoffered option id is treated like a rejection — the safe side.
+            return PermissionDecision.declined("Not executed: the user rejected this tool call"
+                    + " in the IDE permission dialog.");
+        }
+        return PermissionDecision.declined("Not executed: the prompt turn was cancelled while"
+                + " the tool call awaited approval.");
+    }
+
+    /** The "allow always" memory of one ACP session, created on first use. */
+    private Set<String> allowedAlways(String sessionId) {
+        return alwaysAllowedTools.computeIfAbsent(sessionId, id -> ConcurrentHashMap.newKeySet());
+    }
+
+    /** Either the call runs, or it is skipped with a note that reaches model and IDE. */
+    private record PermissionDecision(boolean granted, String note) {
+        static final PermissionDecision GRANTED = new PermissionDecision(true, null);
+
+        static PermissionDecision declined(String note) {
+            return new PermissionDecision(false, note);
+        }
     }
 
     private void appendSyntheticToolResult(List<ObjectNode> history, String toolCallId, String text) {
@@ -481,6 +705,28 @@ final class AcpChat {
      */
     private static boolean ideDiffEnabled() {
         return Boolean.parseBoolean(System.getProperty("acp.ide-diff", "true"));
+    }
+
+    /**
+     * The tools that ask the IDE user before executing (S6): system property
+     * {@code acp.permission.tools}, comma-separated, default empty — re-read on every
+     * call, the {@code acp.ide-diff} pattern, so a test entry is a one-liner without a
+     * restart (a toggle in the {@code ToolController} can follow later). A UX affordance,
+     * deliberately not a security boundary; the choice is not in the LLM's hands.
+     */
+    private static List<String> permissionTools() {
+        String raw = System.getProperty("acp.permission.tools", "");
+        if (raw.isBlank()) {
+            return List.of();
+        }
+        List<String> tools = new ArrayList<>();
+        for (String name : raw.split(",")) {
+            String trimmed = name.trim();
+            if (!trimmed.isEmpty()) {
+                tools.add(trimmed);
+            }
+        }
+        return List.copyOf(tools);
     }
 
     /**
@@ -563,7 +809,11 @@ final class AcpChat {
      * streamable-HTTP client against this server's own {@code /mcp} endpoint, so every
      * call respects the {@code ToolRegistry}'s active state and runs with a real server
      * exchange. Created lazily on the first tool use, never closed (one per connection,
-     * the connection outlives it).
+     * the connection outlives it). Every call carries its conversation id in
+     * {@code X-Conversation-Id} — supplied per call out of the transport context and put
+     * on the request by the customizer, so {@code prefix_fork} can tie a call to the
+     * session that made it (S6): all ACP sessions of this connection share this one
+     * client, and the model never names the conversation itself.
      */
     private McpSyncClient mcpClient() {
         LOCK.lock();
@@ -572,9 +822,23 @@ final class AcpChat {
                 McpClientTransport transport = HttpClientStreamableHttpTransport
                         .builder(selfBaseUrl)
                         .endpoint("/mcp")
+                        .addHttpRequestCustomizer((builder, method, endpoint, body, context) -> {
+                            Object conversation = (context == null) ? null
+                                    : context.get(CONTEXT_CONVERSATION_ID);
+                            if (conversation != null) {
+                                builder.header(ChatContextStore.HEADER_CONVERSATION_ID,
+                                        String.valueOf(conversation));
+                            }
+                        })
                         .build();
                 McpSyncClient client = McpClient.sync(transport)
                         .requestTimeout(Duration.ofSeconds(MCP_REQUEST_TIMEOUT_SECONDS))
+                        .transportContextProvider(() -> {
+                            String conversation = CURRENT_CONVERSATION.get();
+                            return (conversation == null) ? McpTransportContext.EMPTY
+                                    : McpTransportContext.create(Map.of(
+                                            CONTEXT_CONVERSATION_ID, conversation));
+                        })
                         .build();
                 client.initialize();
                 mcpClient = client;

@@ -278,7 +278,9 @@ public class PrefixForkTool {
                     + tasksNode.size() + "). Nothing was started - a call that is refused still costs"
                     + " a turn, so fix the arguments instead of splitting the round.");
         }
-        ContextSnapshot snapshot = resolveSnapshot();
+        String callerConversation = (exchange == null) ? null
+                : McpConversations.getInstance().lookup(exchange.sessionId());
+        ContextSnapshot snapshot = resolveSnapshot(callerConversation);
         ContextSnapshot newest = ChatContextStore.getInstance().latestAny();
         if (snapshot == null) {
             // Nothing human to start from. Said before the nested-fork case, because the two look
@@ -469,15 +471,23 @@ public class PrefixForkTool {
      * MCP session cannot be tied to a conversation has no better key, and the local single-user
      * case is exactly one conversation).
      *
+     * <p>An ACP session is tied to its conversation (S6): its MCP client carries the chat id in
+     * {@code X-Conversation-Id}, the filter pairs it with the session, and {@code callerConversation}
+     * is that pairing read back. The configured key stays the fallback for callers the filter does
+     * not know (the web UI path).</p>
+     *
      * <p>Child snapshots are skipped on purpose: a forked completion arrives at the same proxy and
      * is recorded too (under {@code "default"}, the runner sends no conversation header). Forking
      * from that would make the second fork of a chat inherit the first one's thread.</p>
      *
+     * @param callerConversation the conversation of the calling MCP session, or {@code null} when
+     *                           the filter observed none for it
      * @return the snapshot or {@code null}
      */
-    private ContextSnapshot resolveSnapshot() {
+    private ContextSnapshot resolveSnapshot(String callerConversation) {
         ChatContextStore store = ChatContextStore.getInstance();
-        ContextSnapshot snapshot = store.latestRoot(conversationKey);
+        String key = (callerConversation != null) ? callerConversation : conversationKey;
+        ContextSnapshot snapshot = store.latestRoot(key);
         return (snapshot != null) ? snapshot : store.latestRootAny();
     }
 

@@ -14,9 +14,11 @@ import java.io.IOException;
 
 /**
  * Reads the identity of a fork thread off the request and writes it into {@link ForkIdentity}
- * (docs/subagent.md §14, P0.2). Registered in front of {@code /mcp/*} by {@code McpConfig}.
+ * (docs/subagent.md §14, P0.2), and the conversation of an MCP session into
+ * {@link McpConversations} (docs/acp.md §6, S6 — {@code prefix_fork} ties a call to the
+ * session that made it). Registered in front of {@code /mcp/*} by {@code McpConfig}.
  *
- * <p>The filter is deliberately stupid: two headers in, one map entry out, then straight through.
+ * <p>The filter is deliberately stupid: three headers in, two map entries out, then straight through.
  * It never refuses a request - a thread whose identity did not arrive is not a threat, it is
  * simply someone the board does not know, and the tool that needs the identity says so. Refusing
  * here would also mean deciding for every MCP client on this port, which is not this filter's
@@ -36,11 +38,14 @@ public class ForkIdentityFilter implements Filter {
             throws IOException, ServletException {
         if (request instanceof HttpServletRequest httpRequest) {
             try {
-                ForkIdentity.getInstance().register(httpRequest.getHeader(HttpHeaders.MCP_SESSION_ID),
+                String sessionId = httpRequest.getHeader(HttpHeaders.MCP_SESSION_ID);
+                ForkIdentity.getInstance().register(sessionId,
                         httpRequest.getHeader(ForkIdentity.HEADER));
+                McpConversations.getInstance().register(sessionId,
+                        httpRequest.getHeader(ChatContextStore.HEADER_CONVERSATION_ID));
             } catch (RuntimeException e) {
                 // Identity is an observation, never a reason to break a request.
-                LOG.warn("Fork identity could not be recorded: {}", e.toString());
+                LOG.warn("Fork identity could not be recorded", e);
             }
         }
         chain.doFilter(request, response);
