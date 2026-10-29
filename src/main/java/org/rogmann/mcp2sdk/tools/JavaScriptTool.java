@@ -196,6 +196,27 @@ public class JavaScriptTool {
         return modules;
     }
 
+    /** One JS module as the ACP chat's {@code /modules} command lists it. */
+    public record JsModuleListing(String namespace, String summary, boolean advertised,
+                                  boolean enabled) {
+    }
+
+    /**
+     * The JS modules of this tool, in the tool's own insertion order — the {@code /modules}
+     * command of the ACP chat lists them. Cheap to call: the modules are stateless bridge
+     * objects, built exactly the way {@link #createToolInstance()} builds them.
+     * @return one entry per module, insertion-ordered
+     */
+    public static List<JsModuleListing> moduleListing() {
+        List<JsModuleListing> listing = new ArrayList<>();
+        for (Map.Entry<String, JsModuleInterface> entry : createModules().entrySet()) {
+            JsModuleInterface module = entry.getValue();
+            listing.add(new JsModuleListing(entry.getKey(), module.getSummary(),
+                    module.isAdvertised(), module.isEnabled()));
+        }
+        return listing;
+    }
+
     /**
      * Builds the MCP tool-description from the summaries of the enabled modules.
      * @param modules available modules

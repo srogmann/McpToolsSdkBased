@@ -6,6 +6,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import com.agentclientprotocol.sdk.agent.AcpAgentFactory;
 import com.agentclientprotocol.sdk.agent.transport.StreamableHttpAcpServlet;
 import com.agentclientprotocol.sdk.json.AcpJsonMapper;
+import org.rogmann.mcp2sdk.ToolRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -48,13 +49,29 @@ public class AcpChatConfig {
     private int serverPort;
 
     /**
-     * The ACP endpoint: one agent (an {@code AcpChat}) per client connection.
+     * The LLM backend ({@code webui.model.url}) — the base the ACP chat's context-window
+     * detection asks for the model list; blank disables the detection (then only the system
+     * property {@code acp.chat.context-window} can name a window).
+     */
+    @Value("${webui.model.url:}")
+    private String modelUrl;
+
+    /** The model the proxy overrides to ({@code webui.model.name}) — the id the detection looks up. */
+    @Value("${webui.model.name:}")
+    private String modelName;
+
+    /**
+     * The ACP endpoint: one agent (an {@code AcpChat}) per client connection. The
+     * {@code ToolRegistry} rides along — the {@code /tools} command reads the live active
+     * state from it, in-process.
+     * @param toolRegistry the central tool registry
      * @return the servlet, unregistered
      */
     @Bean
-    public StreamableHttpAcpServlet acpServlet() {
+    public StreamableHttpAcpServlet acpServlet(ToolRegistry toolRegistry) {
         String selfBaseUrl = "http://127.0.0.1:" + serverPort;
-        AcpAgentFactory factory = AcpAgentFactory.sync(transport -> AcpChat.build(transport, selfBaseUrl));
+        AcpAgentFactory factory = AcpAgentFactory.sync(transport -> AcpChat.build(transport,
+                selfBaseUrl, modelUrl, modelName, toolRegistry));
         return new StreamableHttpAcpServlet(AcpJsonMapper.createDefault(), factory);
     }
 

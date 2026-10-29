@@ -9,6 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
@@ -17,12 +18,16 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.time.Duration;
+import java.time.LocalDateTime;
 
 import io.modelcontextprotocol.common.McpTransportContext;
 import io.modelcontextprotocol.spec.McpClientTransport;
+import org.rogmann.mcp2sdk.ToolRegistry;
+import org.rogmann.mcp2sdk.ToolSpecWithState;
 import org.rogmann.mcp2sdk.agent.ChatContextStore;
 import org.rogmann.mcp2sdk.browser.BrowserReviewService;
 import org.rogmann.mcp2sdk.m2.MavenGuard;
+import org.rogmann.mcp2sdk.tools.JavaScriptTool;
 
 import com.agentclientprotocol.sdk.agent.AcpAgent;
 import com.agentclientprotocol.sdk.agent.AcpSyncAgent;
@@ -81,8 +86,8 @@ import io.modelcontextprotocol.spec.McpSchema;
  * user via {@code session/request_permission} before it executes — options allow once /
  * allow always / reject, "allow always" remembered per ACP session. The list is empty by
  * default and re-read on every call (the {@code acp.ide-diff} pattern); it is a UX
- * affordance, deliberately not a security boundary, and review-backed tools
- * ({@link PythonReviewService}, {@link MavenGuard}, {@link BrowserReviewService}) are
+ * affordance, deliberately not a security boundary, and review-backed tools,
+ * {@link MavenGuard}, {@link BrowserReviewService}) are
  * never asked twice — their decision path is the four-eyes queue.</p>
  */
 final class AcpChat {
@@ -109,6 +114,12 @@ final class AcpChat {
     private static final long TURN_DEADLINE_MINUTES = 10;
 
     /**
+     * The head of the original content that stands in when a summary request fails — the
+     * truncation fallback of /compact (docs/acp.md §6 S8).
+     */
+    private static final int COMPACTION_HEAD_CHARS = 1_000;
+
+    /**
      * Tools whose approval lives in the four-eyes {@code ReviewService} — their decision
      * path exists, so the ACP dialog never asks them twice (docs/acp.md §6, S6). Keep in
      * sync when a review-backed tool appears; there is no registry to ask (the review
@@ -132,6 +143,18 @@ final class AcpChat {
     private static final Lock LOCK = new ReentrantLock();
 
     private final String selfBaseUrl;
+
+    /**
+     * Base of the LLM backend ({@code webui.model.url}) for the context-window detection
+     * (see {@link AcpContextWindow}); may be blank — then only the configured budget counts.
+     */
+    private final String modelUrl;
+
+    /** The model the proxy overrides to ({@code webui.model.name}); may be blank. */
+    private final String modelName;
+
+    /** The tool registry — {@code /tools} reads the live active state from it, in-process. */
+    private final ToolRegistry toolRegistry;
 
     /** Conversation history per chat id (see {@link ChatIds}). */
     /**
@@ -161,6 +184,28 @@ final class AcpChat {
     private static final Map<String, Set<String>> alwaysAllowedTools = new ConcurrentHashMap<>();
 
     /**
+     * The backend's own token accounting of the last loopback request per chat id — the
+     * ground truth the {@code usage_update} rides on and the /chat list header quotes.
+     */
+    private static final Map<String, Measured> lastMeasured = new ConcurrentHashMap<>();
+
+    /**
+     * Highest usage band already hinted per ACP session id (0 none, 1 = 75%, 2 = 90%,
+     * 3 = 95%): one hint per band, re-armed when the usage falls below the lowest band.
+     */
+    private static final Map<String, Integer> usageBandWarned = new ConcurrentHashMap<>();
+
+    /**
+     * The chat a session currently prompts into — the /compact fork redirects it (S3
+     * default: the chat id is the session id). A restart forgets the redirect together with
+     * the histories; session/load then finds the root chat or errors honestly.
+     */
+    private static final Map<String, String> activeChatBySession = new ConcurrentHashMap<>();
+
+    /** Compaction-fork counter per session — child chat ids read {@code session + "_c" + n}. */
+    private static final Map<String, Integer> compactSeqBySession = new ConcurrentHashMap<>();
+
+    /**
      * The chat id of the tool loop running right now, read by the transport-context
      * provider on the thread that makes the call (the prompt thread) — a thread-local
      * inside the transport customizer would be against the SDK's own advice, because the
@@ -180,8 +225,11 @@ final class AcpChat {
      */
     private AcpSyncAgent agent;
 
-    private AcpChat(String selfBaseUrl) {
+    private AcpChat(String selfBaseUrl, String modelUrl, String modelName, ToolRegistry toolRegistry) {
         this.selfBaseUrl = selfBaseUrl;
+        this.modelUrl = modelUrl;
+        this.modelName = modelName;
+        this.toolRegistry = toolRegistry;
     }
 
     /**
@@ -198,6 +246,22 @@ final class AcpChat {
         static ChatIds forSession(String sessionId) {
             return new ChatIds(sessionId, sessionId);
         }
+    }
+
+    /**
+     * Prompt and completion tokens of one loopback request, taken from the final usage
+     * chunk ({@code stream_options.include_usage} — LlmLogProxy sets it unconditionally).
+     */
+    private record Measured(long promptTokens, long completionTokens) {
+    }
+
+    /**
+     * The ChatIds of a prompt: the session's live chat — the /compact fork redirects it
+     * (S3 default: the chat id is the session id). A restart forgets the redirect together
+     * with the histories; session/load then finds the root chat or errors honestly.
+     */
+    private static ChatIds chatIdsFor(String sessionId) {
+        return new ChatIds(sessionId, activeChatBySession.getOrDefault(sessionId, sessionId));
     }
 
     /**
@@ -225,10 +289,14 @@ final class AcpChat {
      * @param transport the connection's transport
      * @param selfBaseUrl this server's base URL for the loopback completion,
      *                    e.g. {@code http://127.0.0.1:9092}
+     * @param modelUrl the LLM backend base ({@code webui.model.url}), may be blank
+     * @param modelName the model the proxy overrides to ({@code webui.model.name}), may be blank
+     * @param toolRegistry the tool registry (the {@code /tools} command lists from it)
      * @return a new agent, not started
      */
-    static AcpSyncAgent build(AcpAgentTransport transport, String selfBaseUrl) {
-        AcpChat chat = new AcpChat(selfBaseUrl);
+    static AcpSyncAgent build(AcpAgentTransport transport, String selfBaseUrl, String modelUrl,
+                              String modelName, ToolRegistry toolRegistry) {
+        AcpChat chat = new AcpChat(selfBaseUrl, modelUrl, modelName, toolRegistry);
         AcpSyncAgent agent = AcpAgent.sync(transport)
             .initializeHandler(request -> {
                 LOG.info("AcpChat initialize: protocolVersion={}, clientInfo={}, clientCapabilities={}",
@@ -243,6 +311,8 @@ final class AcpChat {
                 chat.startHistory(sessionId, request.cwd());
                 LOG.info("AcpChat session/new: cwd={}, mcpServers={}", request.cwd(),
                         request.mcpServers() == null ? 0 : request.mcpServers().size());
+                chat.advertiseCommands(sessionId);
+                chat.sendUsageUpdate(ChatIds.forSession(sessionId), null, null);
                 return new AcpSchema.NewSessionResponse(sessionId);
             })
             .promptHandler(chat::onPrompt)
@@ -253,9 +323,17 @@ final class AcpChat {
     }
 
     private AcpSchema.PromptResponse onPrompt(AcpSchema.PromptRequest request, SyncPromptContext context) {
-        ChatIds ids = ChatIds.forSession(request.sessionId());
+        ChatIds ids = chatIdsFor(request.sessionId());
         String userText = extractText(request.prompt());
         LOG.info("AcpChat prompt in session {} (chat {}): {}", ids.sessionId(), ids.chatId(), summarize(userText));
+        String commandText = userText.strip();
+        if (commandText.startsWith("/") && commandText.length() > 1) {
+            AcpSchema.PromptResponse commandResponse = handleCommand(ids, context, commandText);
+            if (commandResponse != null) {
+                return commandResponse;
+            }
+            // Unknown "/..." — not ours (a path?), the model sees the text as usual.
+        }
         List<ObjectNode> history = histories.computeIfAbsent(ids.chatId(), id -> new ArrayList<>());
         LOCK.lock();
         try {
@@ -284,7 +362,8 @@ final class AcpChat {
      */
     private AcpSchema.LoadSessionResponse onLoadSession(AcpSchema.LoadSessionRequest request) {
         String sessionId = request.sessionId();
-        List<ObjectNode> history = histories.get(sessionId);
+        String chatId = activeChatBySession.getOrDefault(sessionId, sessionId);
+        List<ObjectNode> history = histories.get(chatId);
         if (history == null) {
             throw new IllegalStateException("Unknown session " + sessionId
                     + ": conversations are kept in memory only, and a restart forgets them.");
@@ -317,6 +396,656 @@ final class AcpChat {
         LOG.info("AcpChat load: session {} replayed {} of {} history entr(ies)", sessionId,
                 replayed, snapshot.size());
         return new AcpSchema.LoadSessionResponse(null);
+    }
+
+    // --- Commands (S7) and context usage ---------------------------------------------
+
+    /**
+     * Advertises the chat's slash commands right after session/new, before the response —
+     * the same channel the load replay uses — so the client renders them in its "/" menu.
+     * Commands are answered locally: they never reach the model or the history.
+     */
+    private void advertiseCommands(String sessionId) {
+        agent.sendSessionUpdate(sessionId, new AcpSchema.AvailableCommandsUpdate(null, List.of(
+                new AcpSchema.AvailableCommand("help",
+                        "Show the commands of this ACP chat", null),
+                new AcpSchema.AvailableCommand("tools",
+                        "List the active and the disabled tools", null),
+                new AcpSchema.AvailableCommand("modules",
+                        "List the JS modules of the js tool", null),
+                new AcpSchema.AvailableCommand("chat",
+                        "Show the numbered entries of this conversation (the numbers /compact"
+                                + " consumes)",
+                        new AcpSchema.AvailableCommandInput("list")),
+                new AcpSchema.AvailableCommand("compact",
+                        "Compact chat entries into summaries and continue in a forked chat"
+                                + " (the parent stays untouched)",
+                        new AcpSchema.AvailableCommandInput("4-7 12 | top 3"))), null));
+    }
+
+    /**
+     * Handles a prompt that starts with "/". Returns null when the text is not one of our
+     * commands — the prompt then flows to the model unchanged (a path like "/etc/hosts" is
+     * not a command). A command is answered locally: nothing enters the history. The one
+     * exception is /compact, whose summaries come from a tools-less loopback request of
+     * their own (still no history entry, still not the model's turn).
+     */
+    private AcpSchema.PromptResponse handleCommand(ChatIds ids, SyncPromptContext context,
+                                                   String text) {
+        String body = text.substring(1).strip();
+        int space = body.indexOf(' ');
+        String name = space < 0 ? body : body.substring(0, space);
+        String args = space < 0 ? "" : body.substring(space + 1).strip();
+        try {
+            switch (name) {
+                case "help" -> context.sendMessage(commandHelpText());
+                case "tools" -> context.sendMessage(commandToolsText());
+                case "modules" -> context.sendMessage(commandModulesText());
+                case "chat" -> {
+                    if (!args.isEmpty() && !"list".equals(args)) {
+                        context.sendMessage("(Unknown /chat argument '" + args
+                                + "' — try /chat list.)");
+                    }
+                    else {
+                        context.sendMessage(chatListText(ids));
+                    }
+                }
+                case "compact" -> context.sendMessage(compactChat(ids, context, args));
+                default -> {
+                    return null;
+                }
+            }
+        }
+        catch (RuntimeException e) {
+            LOG.warn("AcpChat command /{} failed", name, e);
+            context.sendMessage("(The command /" + name + " failed: " + e.getMessage() + ")");
+        }
+        LOG.info("AcpChat command /{} in session {}", name, ids.sessionId());
+        return AcpSchema.PromptResponse.endTurn();
+    }
+
+    private static String commandHelpText() {
+        return """
+                **Commands of this ACP chat:**
+
+                - `/help` — this text
+                - `/tools` — the active and the disabled tools (live ToolRegistry state)
+                - `/modules` — the JS modules of the js tool
+                - `/chat list` — the numbered entries of this conversation, with sizes and previews
+                - `/compact 4-7 12` or `/compact top 3` — compact entries into summaries and continue in a forked chat
+
+                Commands are answered locally: they neither reach the model nor the history,
+                and an unknown `/...` passes through to the model as a normal prompt.
+
+                The context usage is reported after every request (`usage_update`); hints appear
+                when the conversation passes 75%, 90% and 95% of the window —
+                `-Dacp.chat.context-window=<tokens>` caps the window deliberately.""";
+    }
+
+    private String commandToolsText() {
+        StringBuilder active = new StringBuilder();
+        StringBuilder disabled = new StringBuilder();
+        int activeCount = 0;
+        int disabledCount = 0;
+        for (Map.Entry<String, ToolSpecWithState> entry : toolRegistry.getMapTools().entrySet()) {
+            McpSchema.Tool tool = entry.getValue().spec().tool();
+            boolean isActive = entry.getValue().state().isActive().get();
+            if (isActive) {
+                active.append(markdownListItem(tool.name(), tool.description()));
+                activeCount++;
+            }
+            else {
+                disabled.append(markdownListItem(tool.name(), tool.description()));
+                disabledCount++;
+            }
+        }
+        return "**Tools (ToolRegistry) — active (" + activeCount + "):**\n\n"
+                + (active.isEmpty() ? "_none_\n\n" : active + "\n")
+                + "**Disabled (" + disabledCount + "):**\n\n"
+                + (disabled.isEmpty() ? "_none_\n" : disabled)
+                + "\nThe model sees only the active ones; the toggles live behind `/tools` of the web UI.";
+    }
+
+    private static String commandModulesText() {
+        StringBuilder sb = new StringBuilder("**JS modules of the js tool:**\n\n");
+        for (JavaScriptTool.JsModuleListing module : JavaScriptTool.moduleListing()) {
+            sb.append("- `").append(module.namespace()).append("` — ")
+                    .append(excerpt(module.summary().replace('\n', ' '), 100));
+            if (!module.advertised()) {
+                sb.append(" _[not advertised]_");
+            }
+            if (!module.enabled()) {
+                sb.append(" _[disabled]_");
+            }
+            sb.append('\n');
+        }
+        sb.append("\nEvery module documents itself in the tool description (e.g. `fs.help()`, `archive.help()`).");
+        return sb.toString();
+    }
+
+    /**
+     * The /chat list: every history entry on one line — number, kind, size (chars/4
+     * estimate) and a one-line preview. The numbers are what a later /compact consumes; the
+     * header quotes the backend's exact accounting of the last request when it arrived.
+     */
+    private String chatListText(ChatIds ids) {
+        List<ObjectNode> snapshot;
+        LOCK.lock();
+        try {
+            snapshot = List.copyOf(histories.getOrDefault(ids.chatId(), new ArrayList<>()));
+        }
+        finally {
+            LOCK.unlock();
+        }
+        if (snapshot.isEmpty()) {
+            return "(The conversation is empty.)";
+        }
+        Map<String, String> toolNames = new TreeMap<>();
+        for (ObjectNode message : snapshot) {
+            JsonNode calls = message.get("tool_calls");
+            if (calls != null && calls.isArray()) {
+                for (JsonNode call : calls) {
+                    String callId = call.path("id").asString("");
+                    if (!callId.isEmpty()) {
+                        toolNames.put(callId, call.path("function").path("name").asString("?"));
+                    }
+                }
+            }
+        }
+        StringBuilder lines = new StringBuilder();
+        long totalChars = 0;
+        int index = 1;
+        for (ObjectNode message : snapshot) {
+            String role = message.path("role").asString("");
+            String content = message.path("content").asString("");
+            JsonNode calls = message.get("tool_calls");
+            String kind;
+            String preview;
+            long chars = content.length();
+            if ("tool".equals(role)) {
+                String callId = message.path("tool_call_id").asString("");
+                kind = "tool ← " + toolNames.getOrDefault(callId, callId);
+                preview = content;
+            }
+            else if ("assistant".equals(role) && calls != null && calls.isArray() && !calls.isEmpty()) {
+                StringBuilder names = new StringBuilder();
+                for (JsonNode call : calls) {
+                    if (names.length() > 0) {
+                        names.append(", ");
+                    }
+                    String callArgs = call.path("function").path("arguments").asString("");
+                    chars += callArgs.length();
+                    names.append(call.path("function").path("name").asString("?"))
+                            .append('(').append(excerpt(callArgs.replace('\n', ' '), 40)).append(')');
+                }
+                kind = "assistant → " + calls.size() + " call(s)";
+                preview = content.isEmpty() ? names.toString() : content + " | " + names;
+            }
+            else {
+                kind = role.isEmpty() ? "?" : role;
+                preview = content;
+            }
+            totalChars += chars;
+            lines.append(String.format(Locale.ROOT, "%3d. %s ~%s tok  %s%n", index++,
+                    padTo(kind, 30), grouped(Math.max(1, chars / 4)),
+                    excerpt(preview.replace('\n', ' '), 80)));
+        }
+        StringBuilder sb = new StringBuilder("**Chat ")
+                .append(shortChatId(ids.chatId()))
+                .append("** — ").append(snapshot.size()).append(" entries, ~")
+                .append(grouped(totalChars / 4)).append(" tok (chars/4 estimate)\n\n");
+        Measured measured = lastMeasured.get(ids.chatId());
+        if (measured != null) {
+            sb.append("Last measured request: **").append(grouped(measured.promptTokens()))
+                    .append("** prompt + **").append(grouped(measured.completionTokens()))
+                    .append("** completion tokens (backend accounting)\n\n");
+        }
+        long window = AcpContextWindow.effectiveWindow(modelUrl, modelName);
+        if (window > 0) {
+            sb.append("Context window: **").append(grouped(window)).append(" tokens**");
+            if (measured != null) {
+                double percent = (measured.promptTokens() + measured.completionTokens()) * 100.0 / window;
+                sb.append(" (**").append(String.format(Locale.ROOT, "%.1f", percent)).append("% used**)");
+            }
+            sb.append("\n\n");
+        }
+        else {
+            sb.append("Context window: unknown (`-Dacp.chat.context-window=<tokens>`, or make")
+                    .append(" `webui.model.url` reachable)\n\n");
+        }
+        // The listing rides in a fenced code block: the IDE renders message chunks as
+        // Markdown, and plain lines would lose their single breaks (soft breaks) while the
+        // leading "1." "2." "3." would start an ordered list — the first runtime round's
+        // two rendering effects, both avoided by fence.
+        String table = lines.toString();
+        String fence = fenceFor(table);
+        sb.append(fence).append('\n').append(table);
+        if (!table.endsWith("\n")) {
+            sb.append('\n');
+        }
+        sb.append(fence).append("\n\nReasoning is streamed as thought chunks and is not part of this")
+                .append(" history; the model re-sends every entry above with the next request,")
+                .append(" and the entry numbers are the ids `/compact` consumes.");
+        return sb.toString();
+    }
+
+    /**
+     * Sends the context-window usage as a {@code usage_update} session update. The spec
+     * requires both values and says to send nothing without a meaningful size — so an
+     * unresolvable window (no config, no reachable backend) means no update. The used value
+     * is the backend's own accounting (prompt + completion of the last request) when the
+     * final usage chunk arrived, a chars/4 estimate of the history otherwise.
+     */
+    private void sendUsageUpdate(ChatIds ids, SyncPromptContext context, Measured measured) {
+        long size = AcpContextWindow.effectiveWindow(modelUrl, modelName);
+        if (size <= 0) {
+            return;
+        }
+        long used = measured != null && measured.promptTokens() > 0
+                ? measured.promptTokens() + measured.completionTokens()
+                : estimateHistoryTokens(ids);
+        if (used <= 0) {
+            return;
+        }
+        try {
+            agent.sendSessionUpdate(ids.sessionId(),
+                    new AcpSchema.UsageUpdate(null, used, size, null, null));
+        }
+        catch (RuntimeException e) {
+            LOG.debug("AcpChat usage_update failed: {}", e.getMessage());
+        }
+        if (context != null) {
+            maybeUsageHint(context, used, size);
+        }
+    }
+
+    /**
+     * The usage RFD's warning bands, one hint per band per session. The hint rides as a
+     * display-only message chunk (the S3 error-note pattern): visible in the IDE chat, never
+     * in the history — the model must not read our gauge. Re-arms below 75% (a compaction).
+     */
+    private void maybeUsageHint(SyncPromptContext context, long used, long size) {
+        int percent = (int) Math.round(used * 100.0 / size);
+        int band = percent >= 95 ? 3 : percent >= 90 ? 2 : percent >= 75 ? 1 : 0;
+        String sessionId = context.getSessionId();
+        int previous = usageBandWarned.getOrDefault(sessionId, 0);
+        if (band == 0) {
+            usageBandWarned.remove(sessionId);
+            return;
+        }
+        if (band <= previous) {
+            return;
+        }
+        usageBandWarned.put(sessionId, band);
+        String detail = switch (band) {
+            case 2 -> " /chat list shows the largest entries.";
+            case 3 -> " The next prompts may fail at the backend — open a new session"
+                    + " (compaction follows in a later throw).";
+            default -> "";
+        };
+        context.sendMessage("(Context usage " + percent + "%: " + grouped(used) + " of "
+                + grouped(size) + " tokens." + detail + ")");
+    }
+
+    /** The chars/4 token estimate over the whole history (content plus tool-call arguments). */
+    private static long estimateHistoryTokens(ChatIds ids) {
+        List<ObjectNode> history = histories.get(ids.chatId());
+        if (history == null) {
+            return 0;
+        }
+        LOCK.lock();
+        try {
+            long chars = 0;
+            for (ObjectNode message : history) {
+                chars += message.path("content").asString("").length();
+                JsonNode calls = message.get("tool_calls");
+                if (calls != null && calls.isArray()) {
+                    for (JsonNode call : calls) {
+                        chars += call.path("function").path("arguments").asString("").length()
+                                + call.path("function").path("name").asString("").length();
+                    }
+                }
+            }
+            return chars / 4;
+        }
+        finally {
+            LOCK.unlock();
+        }
+    }
+
+    // --- /compact (S8): the second throw ----------------------------------------------
+
+    /**
+     * The compaction fork: shrinks the selected entries in place and continues the
+     * conversation in a fork child — the S3 fork pattern (chat id {@code session + "_c" + n},
+     * flat from the session id; the parent chat untouched; {@code x-session-id} unchanged,
+     * so the backend's warm prefix survives up to the first compacted entry). Every entry
+     * keeps its role, its position and its tool pairing — a tool result remains the result
+     * of its call — and only the content becomes a marker that names timestamp and sizes,
+     * "[Compacted 2026-10-28T23:22:44: was ~31,497 tok, now ~250 tok]", followed by the
+     * summary: no one mistakes it for the original output.
+     *
+     * <p>The summaries come from a tools-less loopback request without the conversation
+     * headers, exactly how the fork children's own completions reach the store (key
+     * "default"); a SubAgentRunner child was deliberately not used — it would run with
+     * tools and inherit the conversation's occupation (docs/webui.md §3.8 point 16),
+     * while a summary needs neither. When a summary request fails, the head of the
+     * original content stands in (the truncation the command is named after) — the fork
+     * still happens, and the parent chat still holds the original.</p>
+     *
+     * <p>Syntax: {@code /compact 4-7 12} (the /chat list numbers) or {@code /compact top N}
+     * (the N largest entries). Every entry keeps its position, so the numbering is stable
+     * across compactions; the summaries are generated highest-position first ("von
+     * hinten"). An entry that already carries a marker stays as it is.</p>
+     */
+    private String compactChat(ChatIds ids, SyncPromptContext context, String args) {
+        String what = args.strip();
+        if (what.isEmpty() || "help".equals(what)) {
+            return compactHelpText();
+        }
+        List<ObjectNode> snapshot;
+        LOCK.lock();
+        try {
+            snapshot = List.copyOf(histories.getOrDefault(ids.chatId(), new ArrayList<>()));
+        }
+        finally {
+            LOCK.unlock();
+        }
+        if (snapshot.isEmpty()) {
+            return "(The conversation is empty — nothing to compact.)";
+        }
+        boolean systemSeeded = "system".equals(snapshot.get(0).path("role").asString(""));
+        boolean[] selected = new boolean[snapshot.size()];
+        if (what.startsWith("top")) {
+            int count;
+            try {
+                count = Integer.parseInt(what.substring(3).strip());
+            }
+            catch (NumberFormatException e) {
+                return compactUsage("'top' needs the entry count: /compact top 3");
+            }
+            if (count < 1) {
+                return compactUsage("The entry count must be at least 1.");
+            }
+            List<Integer> rank = new ArrayList<>();
+            for (int i = systemSeeded ? 1 : 0; i < snapshot.size(); i++) {
+                rank.add(i);
+            }
+            rank.sort((a, b) -> Long.compare(spanTokens(snapshot, b, b), spanTokens(snapshot, a, a)));
+            for (int r = 0; r < Math.min(count, rank.size()); r++) {
+                selected[rank.get(r)] = true;
+            }
+        }
+        else {
+            for (String token : what.split("[,\\s]+")) {
+                if (token.isEmpty()) {
+                    continue;
+                }
+                int from;
+                int to;
+                int dash = token.indexOf('-');
+                try {
+                    if (dash > 0) {
+                        from = Integer.parseInt(token.substring(0, dash));
+                        to = Integer.parseInt(token.substring(dash + 1));
+                    }
+                    else {
+                        from = to = Integer.parseInt(token);
+                    }
+                }
+                catch (NumberFormatException e) {
+                    return compactUsage("'" + token + "' is not an entry number or range.");
+                }
+                if (from < 1 || to > snapshot.size() || from > to) {
+                    return compactUsage("Entries " + token + " are out of range 1-"
+                            + snapshot.size() + ".");
+                }
+                for (int i = from; i <= to; i++) {
+                    selected[i - 1] = true;
+                }
+            }
+        }
+        if (systemSeeded && selected[0]) {
+            return "(Entry 1 is the system seed (AGENTS.md) — it stays; compact from entry 2 on.)";
+        }
+        Map<String, String> toolNames = new TreeMap<>();
+        for (ObjectNode message : snapshot) {
+            JsonNode calls = message.get("tool_calls");
+            if (calls != null && calls.isArray()) {
+                for (JsonNode call : calls) {
+                    String callId = call.path("id").asString("");
+                    if (!callId.isEmpty()) {
+                        toolNames.put(callId, call.path("function").path("name").asString("?"));
+                    }
+                }
+            }
+        }
+        // "Von hinten": the summaries are generated highest-position first, so the /chat
+        // list numbering stays meaningful across the whole operation. An entry that already
+        // carries a marker stays as it is — re-compacting a summary would burn a request
+        // for nothing.
+        Map<Integer, String> summaries = new TreeMap<>();
+        for (int i = snapshot.size() - 1; i >= 0; i--) {
+            if (!selected[i]
+                    || snapshot.get(i).path("content").asString("").startsWith("[Compacted")) {
+                continue;
+            }
+            summaries.put(i, summarizeEntry(snapshot, i, toolNames));
+        }
+        List<ObjectNode> child = new ArrayList<>(snapshot.size());
+        List<String> reportLines = new ArrayList<>();
+        int shrunkEntries = 0;
+        long beforeTokens = 0;
+        long afterTokens = 0;
+        String timestamp = LocalDateTime.now().withNano(0).toString();
+        for (int i = 0; i < snapshot.size(); i++) {
+            ObjectNode entry = snapshot.get(i);
+            if (!selected[i]) {
+                child.add(entry);
+                continue;
+            }
+            String kind = entryKind(entry, toolNames);
+            if (!summaries.containsKey(i)) {
+                // already compacted — the marker stays as it is
+                child.add(entry);
+                reportLines.add("- Entry " + (i + 1) + " (" + kind + "): already compacted");
+                continue;
+            }
+            long before = spanTokens(snapshot, i, i);
+            String summary = summaries.get(i);
+            String body = summary != null
+                    ? summary
+                    : head(entry.path("content").asString(""), COMPACTION_HEAD_CHARS);
+            long after = Math.max(1, body.length() / 4);
+            String content = "[Compacted " + timestamp + ": was ~" + grouped(before) + " tok, now ~"
+                    + grouped(after) + " tok"
+                    + (summary != null ? ""
+                        : "; the summary request failed, the head of the original stands in")
+                    + "] " + body;
+            // The copy matters: the snapshot shares its nodes with the live parent history,
+            // and only the child's content changes.
+            ObjectNode shrunk = entry.deepCopy();
+            shrunk.put("content", content);
+            child.add(shrunk);
+            shrunkEntries++;
+            beforeTokens += before;
+            afterTokens += after;
+            reportLines.add("- Entry " + (i + 1) + " (" + kind + ", ~" + grouped(before) + " → ~"
+                    + grouped(after) + " tok): "
+                    + (summary != null ? summary : "_truncated head — summary request failed_"));
+        }
+        if (shrunkEntries == 0) {
+            return "(Nothing to do — the selected entries are already compacted.)";
+        }
+        int seq = compactSeqBySession.merge(ids.sessionId(), 1, Integer::sum);
+        String childChatId = ids.sessionId() + "_c" + seq;
+        histories.put(childChatId, child);
+        activeChatBySession.put(ids.sessionId(), childChatId);
+        LOG.info("AcpChat compact: session {} forked chat {} -> {} ({} of {} entries shrunk,"
+                        + " ~{} -> ~{} tok)",
+                ids.sessionId(), ids.chatId(), childChatId, shrunkEntries, snapshot.size(),
+                beforeTokens, afterTokens);
+        sendUsageUpdate(new ChatIds(ids.sessionId(), childChatId), context, null);
+        StringBuilder report = new StringBuilder("**Compacted ")
+                .append(shrunkEntries)
+                .append(shrunkEntries == 1 ? " entry" : " entries")
+                .append(" (~").append(grouped(beforeTokens)).append(" → ~")
+                .append(grouped(afterTokens)).append(" tok)** — the conversation continues in chat `")
+                .append(shortChatId(ids.sessionId())).append("_c").append(seq)
+                .append("`; the parent chat `").append(shortChatId(ids.chatId()))
+                .append("` is untouched.\n\n");
+        for (String line : reportLines) {
+            report.append(line).append('\n');
+        }
+        report.append("\nEach entry keeps its role, its position and its tool pairing — only the content")
+                .append(" became the marked summary, so nothing is mistaken for the original output.")
+                .append(" `x-session-id` is unchanged, the backend's warm prefix survives up to the first")
+                .append(" compacted entry. The next prompt and `/chat list` run in the child.");
+        return report.toString();
+    }
+
+    private static String compactUsage(String problem) {
+        return "(" + problem + " Usage: `/compact 4-7 12` or `/compact top 3` — numbers from"
+                + " `/chat list`.)";
+    }
+
+    private static String compactHelpText() {
+        return """
+                **/compact — shrink chat entries to summaries in a forked continuation**
+
+                - `/compact 4-7 12` — the listed entries (numbers from `/chat list`)
+                - `/compact top 3` — the 3 largest entries
+
+                Each selected entry shrinks in place: role, position and tool pairing stay,
+                and the content becomes a marker with timestamp and sizes plus a summary —
+                when the summary request fails, the head of the original stands in. The
+                system seed (entry 1) stays. The child chat keeps the prefix up to the first
+                compacted entry (warm backend cache); the parent chat is untouched.""";
+    }
+
+    /**
+     * One summary per entry, from a tools-less loopback request without the conversation
+     * headers: no {@code X-Conversation-Id} (the store keys it "default" — the fork
+     * children's own requests do the same) and no {@code x-session-id} (a foreign prompt
+     * under the chat's routing key could displace the warm prefix it is meant to preserve).
+     * Null when the request failed — the marker then carries the head of the original.
+     */
+    private String summarizeEntry(List<ObjectNode> snapshot, int index,
+                                  Map<String, String> toolNames) {
+        ObjectNode entry = snapshot.get(index);
+        String text = entry.path("content").asString("");
+        StringBuilder labeled = new StringBuilder("[entry ").append(index + 1).append(" | ");
+        JsonNode calls = entry.get("tool_calls");
+        if (calls != null && calls.isArray() && !calls.isEmpty()) {
+            labeled.append("assistant tool call(s)");
+            for (JsonNode call : calls) {
+                labeled.append(' ').append(call.path("function").path("name").asString("?"))
+                        .append('(').append(call.path("function").path("arguments").asString(""))
+                        .append(')');
+            }
+            labeled.append(']');
+            if (!text.isBlank()) {
+                labeled.append(' ').append(text);
+            }
+        }
+        else if ("tool".equals(entry.path("role").asString(""))) {
+            labeled.append("tool result for ")
+                    .append(toolNames.getOrDefault(entry.path("tool_call_id").asString(""),
+                            entry.path("tool_call_id").asString("")))
+                    .append("] ").append(text);
+        }
+        else {
+            labeled.append(entry.path("role").asString("")).append("] ").append(text);
+        }
+        ObjectNode body = JSON.createObjectNode();
+        body.put("stream", false);
+        body.put("max_tokens", 400);
+        ArrayNode messages = body.putArray("messages");
+        messages.add(message("system",
+                "You compress excerpts of a work chat into summaries. Reply with a dense"
+                        + " summary of at most 80 words. Preserve file paths, identifiers,"
+                        + " numbers and outcomes. No preamble."));
+        messages.add(message("user",
+                "This entry of a work chat will be replaced by your summary:\n\n"
+                        + labeled
+                        + "\n\nSummarize what happened in it and what matters for the ongoing work."));
+        HttpURLConnection connection = null;
+        try {
+            URL url = URI.create(selfBaseUrl + COMPLETIONS_PATH).toURL();
+            connection = (HttpURLConnection) url.openConnection();
+            connection.setRequestMethod("POST");
+            connection.setRequestProperty("Content-Type", "application/json");
+            connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
+            connection.setReadTimeout(READ_TIMEOUT_MS);
+            connection.setDoOutput(true);
+            try (OutputStream out = connection.getOutputStream();
+                 OutputStreamWriter writer = new OutputStreamWriter(out, StandardCharsets.UTF_8)) {
+                writer.write(JSON.writeValueAsString(body));
+                writer.flush();
+            }
+            int status = connection.getResponseCode();
+            if (status >= 400) {
+                LOG.warn("AcpChat compact summary: HTTP {} ({})", status,
+                        excerpt(readBody(connection.getErrorStream()), 200));
+                return null;
+            }
+            JsonNode root = completionResult(readBody(connection.getInputStream()));
+            String summary = root.path("choices").path(0).path("message").path("content")
+                    .asString("").strip();
+            if (summary.isEmpty()) {
+                LOG.warn("AcpChat compact summary: the model answered without content");
+                return null;
+            }
+            return summary;
+        }
+        catch (IOException | RuntimeException e) {
+            LOG.warn("AcpChat compact summary failed: {}", e.toString());
+            return null;
+        }
+        finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+    }
+
+    /** The chars/4 estimate over one entry (the same metric the /chat list shows). */
+    private static long spanTokens(List<ObjectNode> snapshot, int start, int end) {
+        long chars = 0;
+        for (int i = start; i <= end; i++) {
+            ObjectNode message = snapshot.get(i);
+            chars += message.path("content").asString("").length();
+            JsonNode calls = message.get("tool_calls");
+            if (calls != null && calls.isArray()) {
+                for (JsonNode call : calls) {
+                    chars += call.path("function").path("arguments").asString("").length()
+                            + call.path("function").path("name").asString("").length();
+                }
+            }
+        }
+        return Math.max(1, chars / 4);
+    }
+
+    /** The kind label of a history entry as the listings show it ("tool ← get_file_text_by_path"). */
+    private static String entryKind(ObjectNode message, Map<String, String> toolNames) {
+        String role = message.path("role").asString("");
+        JsonNode calls = message.get("tool_calls");
+        if ("tool".equals(role)) {
+            String callId = message.path("tool_call_id").asString("");
+            return "tool ← " + toolNames.getOrDefault(callId, callId);
+        }
+        if ("assistant".equals(role) && calls != null && calls.isArray() && !calls.isEmpty()) {
+            return "assistant → " + calls.size() + " call(s)";
+        }
+        return role.isEmpty() ? "?" : role;
+    }
+
+    /** The verbatim head of a text, keeping the line breaks — /compact's no-LLM fallback. */
+    private static String head(String text, int chars) {
+        if (text.length() <= chars) {
+            return text;
+        }
+        return text.substring(0, chars) + "\n… (truncated)";
     }
 
     private AcpSchema.PromptResponse completionLoop(ChatIds ids, List<ObjectNode> history,
@@ -354,8 +1083,9 @@ final class AcpChat {
                     context.sendMessage("\n\n(The LLM call failed: " + detail + ")");
                     return AcpSchema.PromptResponse.endTurn();
                 }
-                try (BufferedReader reader = new BufferedReader(
-                        new InputStreamReader(connection.getInputStream(), StandardCharsets.UTF_8))) {
+                try (InputStream is = connection.getInputStream();
+                     InputStreamReader isr = new InputStreamReader(is, StandardCharsets.UTF_8);
+                     BufferedReader reader = new BufferedReader(isr)) {
                     String line;
                     while ((line = reader.readLine()) != null) {
                         if (context.isCancelled()) {
@@ -377,6 +1107,14 @@ final class AcpChat {
                         catch (RuntimeException e) {
                             LOG.warn("AcpChat skipping a non-JSON SSE line: {}", e.getMessage());
                             continue;
+                        }
+                        JsonNode usageNode = chunk.get("usage");
+                        if (usageNode != null && usageNode.isObject()) {
+                            long promptTokens = usageNode.path("prompt_tokens").asLong(0);
+                            if (promptTokens > 0) {
+                                lastMeasured.put(ids.chatId(), new Measured(promptTokens,
+                                        usageNode.path("completion_tokens").asLong(0)));
+                            }
                         }
                         JsonNode choice = chunk.path("choices").path(0);
                         JsonNode delta = choice.path("delta");
@@ -424,6 +1162,11 @@ final class AcpChat {
                 context.sendMessage("\n\n(The LLM stream failed: " + e.getMessage() + ")");
                 return AcpSchema.PromptResponse.endTurn();
             }
+
+            // The final usage chunk names what the backend counted for this request — the
+            // gauge the usage_update rides on (sent per completion request, so a tool loop
+            // shows the fill level growing turn by turn).
+            sendUsageUpdate(ids, context, lastMeasured.get(ids.chatId()));
 
             if (callAccumulators.isEmpty()) {
                 if (assistantContent.length() > 0) {
@@ -975,6 +1718,38 @@ final class AcpChat {
         }
     }
 
+    /**
+     * The completion result as JSON. The proxy answers a non-streaming request in its
+     * "legacy" SSE shape — one {@code data:} line holding the whole response object, then
+     * {@code [DONE]} (the WebUI expects SSE even for stream:false) — and the
+     * SubAgentRunner unwraps the same shape for its children ({@code unwrapSse}); a plain
+     * JSON body passes through unchanged.
+     */
+    private static JsonNode completionResult(String body) {
+        String trimmed = body == null ? "" : body.stripLeading();
+        if (!trimmed.startsWith("data:")) {
+            return JSON.readTree(body);
+        }
+        for (String line : trimmed.split("\n")) {
+            String payload = line.strip();
+            if (!payload.startsWith("data:")) {
+                continue;
+            }
+            payload = payload.substring("data:".length()).strip();
+            if (!payload.isEmpty() && !"[DONE]".equals(payload)) {
+                return JSON.readTree(payload);
+            }
+        }
+        return JSON.readTree(body);
+    }
+
+    /** The chat label for listings: the first 8 characters, plus a "_cN" suffix a fork left. */
+    private static String shortChatId(String chatId) {
+        String head = chatId.substring(0, Math.min(8, chatId.length()));
+        int fork = chatId.indexOf("_c");
+        return fork > 0 ? head + chatId.substring(fork) : head;
+    }
+
     private static String summarize(String text) {
         String oneLine = text.replace('\n', ' ');
         return oneLine.length() > 200 ? oneLine.substring(0, 200) + "…" : oneLine;
@@ -983,5 +1758,58 @@ final class AcpChat {
     private static String excerpt(String text, int max) {
         String oneLine = text.replace('\n', ' ');
         return oneLine.length() > max ? oneLine.substring(0, max) + "…" : oneLine;
+     }
+
+    /** Thousand-separated number for the chat listings ("12,345"). */
+    private static String grouped(long value) {
+        return String.format(Locale.ROOT, "%,d", value);
+    }
+
+    /** Left-aligned column for the /chat list kinds, cut with an ellipsis when longer. */
+    private static String padTo(String text, int len) {
+        String oneLine = text.replace('\n', ' ');
+        if (oneLine.length() >= len) {
+            return oneLine.substring(0, Math.max(1, len - 1)) + "…";
+        }
+        StringBuilder sb = new StringBuilder(oneLine);
+        while (sb.length() < len) {
+            sb.append(' ');
+        }
+        return sb.toString();
+    }
+
+    /**
+     * A fence longer than any backtick run in the content — a preview that quotes Markdown
+     * must not be able to close the /chat list code block early (CommonMark: a run of N
+     * backticks ends a fence of length ≤ N).
+     */
+    private static String fenceFor(String content) {
+        int maxRun = 0;
+        int run = 0;
+        for (int i = 0; i < content.length(); i++) {
+            if (content.charAt(i) == '`') {
+                run++;
+                maxRun = Math.max(maxRun, run);
+            }
+            else {
+                run = 0;
+            }
+        }
+        return "`".repeat(Math.max(3, maxRun + 1));
+    }
+
+    /**
+     * One Markdown bullet for a name plus an optional description. The command listings go
+     * through the IDE's Markdown renderer, where a bare line break is a soft break (a space)
+     * and a line starting "N." starts an ordered list — only real Markdown structure keeps
+     * items apart, and the backticks keep names like edit_file_tool unitalicized.
+     */
+    private static String markdownListItem(String name, String description) {
+        String desc = description == null ? "" : description.strip();
+        StringBuilder sb = new StringBuilder("- `").append(name).append('`');
+        if (!desc.isEmpty()) {
+            sb.append(" — ").append(excerpt(desc.replace('\n', ' '), 90));
+        }
+        return sb.append('\n').toString();
     }
 }
