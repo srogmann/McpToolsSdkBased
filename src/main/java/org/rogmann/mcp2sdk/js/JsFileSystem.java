@@ -159,6 +159,20 @@ public class JsFileSystem {
     }
 
     /**
+     * The project base directory - the one anchor every module shares.
+     * <p>
+     * Modules that work on the same files as {@code fs.*} (e.g. {@code git}) must use this and not
+     * the process directory of the server: the file a caller reads and the file a tool acts on have
+     * to be the same file.
+     * </p>
+     * @return the resolved base path
+     * @throws JsUserRuntimeException if no project directory is configured
+     */
+    public static Path projectBase() {
+        return getBasePath();
+    }
+
+    /**
      * Resolves a file path against the selected directory and validates it.
      * <p>
      * A leading {@code /addonName} segment (e.g. {@code /repository/...}) addresses an

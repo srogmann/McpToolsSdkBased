@@ -12,7 +12,10 @@ import org.rogmann.mcp2sdk.agent.AgentBoardTool;
 import org.rogmann.mcp2sdk.agent.ForkIdentityFilter;
 import org.rogmann.mcp2sdk.agent.PrefixForkTool;
 import org.rogmann.mcp2sdk.browser.BrowserTool;
+import org.rogmann.mcp2sdk.image.VisionClient;
 import org.rogmann.mcp2sdk.m2.PomWatch;
+import org.rogmann.mcp2sdk.security.McpLockdownFilter;
+import org.rogmann.mcp2sdk.security.WebUiSessionFilter;
 import org.rogmann.mcp2sdk.tools.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -114,6 +117,46 @@ public class McpConfig {
         return registration;
     }
 
+    /**
+     * Lockdown mode for shared hosts ({@code -Dwebui.lockdown=true}): on a Citrix / terminal
+     * server every user runs their own instance, but the loopback interface is shared, so the
+     * instance of one user is reachable from every other user's session. The HTTP session of
+     * the Web UI is the only secret that stays inside one user - hence
+     * {@link WebUiSessionFilter} (marks every {@code /chat/*} session) and
+     * {@link McpLockdownFilter} (refuses {@code /mcp*} without such a session). Without the
+     * lockdown both filters pass everything through unchanged and external MCP clients
+     * (Cline, opencode, ...) work as always.
+     *
+     * <p>Ordering: the guard refuses in front of the observing {@code ForkIdentityFilter}.</p>
+     *
+     * @return the session-marking filter registration
+     */
+    @Bean
+    public FilterRegistrationBean<WebUiSessionFilter> webUiSessionFilter() {
+        FilterRegistrationBean<WebUiSessionFilter> registration =
+                new FilterRegistrationBean<>(new WebUiSessionFilter());
+        registration.setName("webUiSessionFilter");
+        registration.addUrlPatterns("/chat/*");
+        registration.setOrder(10);
+        return registration;
+    }
+
+    /**
+     * The refusing half of the lockdown mode, on both MCP endpoints - see
+     * {@link #webUiSessionFilter()} for the threat model and the switch.
+     *
+     * @return the MCP guard registration
+     */
+    @Bean
+    public FilterRegistrationBean<McpLockdownFilter> mcpLockdownFilter() {
+        FilterRegistrationBean<McpLockdownFilter> registration =
+                new FilterRegistrationBean<>(new McpLockdownFilter());
+        registration.setName("mcpLockdownFilter");
+        registration.addUrlPatterns("/mcp", "/mcp/*", "/mcp/sse", "/mcp/sse/*");
+        registration.setOrder(20);
+        return registration;
+    }
+
     // Helper method to populate the registry with available tools
     private void populateToolRegistry(ToolRegistry registry, Environment environment) {
         // Fail fast on a misconfigured add-on configuration (missing description, duplicates, ...).
@@ -134,6 +177,10 @@ public class McpConfig {
         // Set Environment for ReadDependencyClassSourceTool before creating instance
         ReadDependencyClassSourceTool.setEnvironment(environment);
         registry.registerToolDefinition(ReadDependencyClassSourceTool.createToolInstance());
+
+        // The image module's vision call resolves webui.* (current model, hasVision, token)
+        // through the Spring environment - see docs/js/image.md §7.
+        VisionClient.setEnvironment(environment);
 
         registry.registerToolDefinition(GlossaryTool.createToolInstance());
 

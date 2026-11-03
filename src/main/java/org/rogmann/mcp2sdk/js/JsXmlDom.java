@@ -1,9 +1,7 @@
-package org.rogmann.mcp2sdk.xml;
+package org.rogmann.mcp2sdk.js;
 
-import org.rogmann.mcp2sdk.js.JsFileSystem;
-import org.rogmann.mcp2sdk.js.JsUserRuntimeException;
-import org.rogmann.mcp2sdk.xml.JsXmlErrors.Parse;
-import org.rogmann.mcp2sdk.xml.JsXmlErrors.TooLarge;
+import org.rogmann.mcp2sdk.js.JsXmlErrors.Parse;
+import org.rogmann.mcp2sdk.js.JsXmlErrors.TooLarge;
 
 import org.w3c.dom.Attr;
 import org.w3c.dom.Document;

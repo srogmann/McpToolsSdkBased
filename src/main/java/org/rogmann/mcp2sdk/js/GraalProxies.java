@@ -154,6 +154,42 @@ public class GraalProxies {
     }
 
     /**
+     * Names the type of a JavaScript value the way an error message needs it: {@code "null"},
+     * {@code "string"}, {@code "number"}, {@code "boolean"}, {@code "array"}, {@code "object"} or
+     * {@code "value"}.
+     * <p>
+     * This is the shared part of the type hints every bridge writes ("option 'x' must be a number,
+     * but was " + ...). What a bridge knows beyond the structure stays in the bridge: only the
+     * search module knows what a {@code RegExp} or a typed array is in its API, so it names those
+     * cases itself and asks here for the rest.
+     * </p>
+     *
+     * @param value the value to describe, may be {@code null}
+     * @return the type name, never {@code null}
+     */
+    public static String describeType(Value value) {
+        if (value == null || value.isNull()) {
+            return "null";
+        }
+        if (value.isString()) {
+            return "string";
+        }
+        if (value.isNumber()) {
+            return "number";
+        }
+        if (value.isBoolean()) {
+            return "boolean";
+        }
+        if (value.hasArrayElements()) {
+            return "array";
+        }
+        if (value.hasMembers()) {
+            return "object";
+        }
+        return "value";
+    }
+
+    /**
      * Names what arrived where a number was expected, so the type hint says what the caller
      * actually passed instead of only blaming "element 0". Especially the nested-array case
      * (a block list) gets its own wording, because that is what callers pass when they try to

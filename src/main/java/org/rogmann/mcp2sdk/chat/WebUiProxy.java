@@ -1,5 +1,7 @@
 package org.rogmann.mcp2sdk.chat;
 
+import org.rogmann.mcp2sdk.ToolRegistry;
+import org.rogmann.mcp2sdk.ToolSpecWithState;
 import org.rogmann.mcp2sdk.agent.ChatContextStore;
 import org.rogmann.mcp2sdk.utils.LlmUsage;
 import tools.jackson.databind.JsonNode;
@@ -16,6 +18,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -45,7 +48,7 @@ import java.util.zip.GZIPInputStream;
  * <p>Endpoint structure (all relative to /chat):
  * - /chat/*              : Static web resources (HTML, CSS, JS, images)
  * - /chat/props          : Model properties (llama.cpp compatible)
- * - /chat/tools          : Server-specific tools (currently disabled)
+ * - /chat/tools          : Server-specific tools (GET: tool list with get_info, POST: execute)
  * - /chat/v1/models      : List of available models
  * - /chat/v1/chat/completions: LLM request forwarding (supports Streaming)
  * - /chat/cors-proxy     : CORS proxy placeholder
@@ -91,6 +94,29 @@ public class WebUiProxy {
     private static final String PROP_UI_CONFIG = "webui.uiConfig";
     /** Convenience accessor for the single {@code customCss} UI setting (the "Custom CSS" field). */
     private static final String PROP_CUSTOM_CSS = "webui.customCss";
+    /**
+     * Optional API key (system property {@value #PROP_LLM_TOKEN}) sent as an
+     * {@code Authorization: Bearer} header with the LLM requests, for endpoints that
+     * require authentication. Undefined or empty disables the header.
+     */
+    private static final String PROP_LLM_TOKEN = "webui.llm.token";
+
+    /**
+     * Name of the runtime-info tool expected by the Web UI (bundle constant
+     * {@code Ri.SERVER_GET_INFO}). Serving a tool with this name via {@code GET /tools}
+     * suppresses the Web UI's built-in fallback tool, whose result tells the model
+     * "This environment is browser-only, it cannot read or modify local files, and it
+     * cannot run shell commands" - a message that is wrong for this backend, which
+     * exposes local file access through its MCP tools (see {@link #FILE_TOOL_NAMES}).
+     */
+    private static final String TOOL_GET_INFO = "get_info";
+
+    /**
+     * MCP tools that expose local file access
+     * (keep in sync with {@code McpConfig.populateToolRegistry}).
+     */
+    private static final Set<String> FILE_TOOL_NAMES = Set.of(
+            "create_new_file", "get_file_text_by_path", "edit_file_tool", "find_files_by_glob");
 
     /** Key of the "Custom CSS" setting inside {@code ui_settings} (Web UI: {@code customCss}). */
     private static final String UI_SETTING_CUSTOM_CSS = "customCss";
@@ -217,6 +243,14 @@ public class WebUiProxy {
     private final ResponseLogFormat responseLogFormat;
 
     /**
+     * Tool inventory and active-state of the in-process MCP servers ({@code tools.active}).
+     * Field injection keeps the no-arg constructor of the unit tests working; in that context
+     * the field stays null, therefore every use is null-guarded (no file tools advertised).
+     */
+    @Autowired(required = false)
+    private ToolRegistry toolRegistry;
+
+    /**
      * Chat template of the configured model and the reasoning translations built on it
      * (docs/webui.md R2). Stateless apart from its caches, so one instance per proxy is enough;
      * {@code ChatRequestPreparer} is handed the same one.
@@ -309,6 +343,39 @@ public class WebUiProxy {
      */
     public String getModelUrl() {
         return modelUrlProp;
+    }
+
+    /**
+     * Returns the API key to send with the LLM requests, or {@code null} when the requests
+     * should go out without an {@code Authorization} header.
+     *
+     * <p>First draft: the key is read from the optional system property
+     * {@value #PROP_LLM_TOKEN} (e.g. {@code -Dwebui.llm.token=sk-...}). If the property is
+     * undefined or blank, {@code null} is returned and the LLM requests carry no
+     * {@code Authorization} header at all.</p>
+     *
+     * @return the API key, or {@code null} if none is configured
+     */
+    String getApiKey() {
+        String apiKey = System.getProperty(PROP_LLM_TOKEN);
+        if (apiKey != null && !apiKey.isBlank()) {
+            return apiKey;
+        }
+        return null;
+    }
+
+    /**
+     * Applies the optional API key of {@link #getApiKey()} to an LLM connection as an
+     * {@code Authorization: Bearer} header. A connection without a configured key is
+     * left untouched.
+     *
+     * @param connection the LLM connection to authenticate
+     */
+    private void applyApiKey(HttpURLConnection connection) {
+        String apiKey = getApiKey();
+        if (apiKey != null) {
+            connection.setRequestProperty("Authorization", "Bearer " + apiKey);
+        }
     }
 
     /**
@@ -481,30 +548,215 @@ public class WebUiProxy {
     }
 
     /**
-     * Delivers server-specific tools.
+     * Delivers server-specific tools (llama.cpp Web UI contract).
      * Accessible at: /chat/tools
-     * Currently disabled; may be extended to expose server-specific tools in the future.
+     *
+     * <p>The Web UI fetches this list (bundle: {@code fetchServerTools} → {@code B2.list()})
+     * and injects a built-in {@code get_info} fallback tool whenever the list carries no tool
+     * of that name. That fallback's result tells the model "This environment is browser-only,
+     * it cannot read or modify local files, and it cannot run shell commands" - misleading for
+     * this backend, so this endpoint serves a {@code get_info} definition of its own. Its
+     * description advertises local file access only while at least one file tool is active
+     * (see {@link #activeFileToolNames()}). Serving {@code get_info} also routes its execution
+     * to {@link #executeTool(String)}: the Web UI resolves a tool's source from this list
+     * (SERVER), and only the - now absent - browser fallback would have been answered locally.</p>
+     *
+     * <p>Response format (bundle: {@code this._serverTools = e.map(r => r.definition)}): a JSON
+     * array of {@code {tool, definition, uses_cwd}} entries, {@code definition} being the
+     * OpenAI function-calling schema.</p>
      */
     @GetMapping(value = "/tools", produces = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<String> getTools() {
         LOG.info("{} GET /chat/tools", LocalDateTime.now());
 
-        ObjectNode root = jsonMapper.createObjectNode();
-        ObjectNode error = jsonMapper.createObjectNode();
-        error.put("message", "this feature is disabled");
-        error.put("type", "feature_disabled");
-        root.set("error", error);
+        ObjectNode definition = jsonMapper.createObjectNode();
+        definition.put("type", "function");
+        ObjectNode function = definition.putObject("function");
+        function.put("name", TOOL_GET_INFO);
+        function.put("description", buildGetInfoDescription());
+        ObjectNode parameters = function.putObject("parameters");
+        parameters.put("type", "object");
+        parameters.putObject("properties");
+        parameters.putArray("required");
+
+        ObjectNode entry = jsonMapper.createObjectNode();
+        entry.put("tool", TOOL_GET_INFO);
+        entry.put("uses_cwd", false);
+        entry.set("definition", definition);
+
+        ArrayNode tools = jsonMapper.createArrayNode();
+        tools.add(entry);
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         applyNoStoreCacheHeaders(headers);
 
         try {
-            return ResponseEntity.ok().headers(headers).body(jsonMapper.writeValueAsString(root));
+            return ResponseEntity.ok().headers(headers).body(jsonMapper.writeValueAsString(tools));
         } catch (RuntimeException e) {
             LOG.error("Error serializing tools response", e);
+            return ResponseEntity.status(500).body("[]");
+        }
+    }
+
+    /**
+     * Executes a server-specific tool (llama.cpp Web UI contract).
+     * Accessible at: /chat/tools (POST)
+     *
+     * <p>Request body (bundle: {@code B2.executeTool} → POST /tools):
+     * {@code {"tool": "...", "params": {...}}}. Response: {@code {"plain_text_response": "..."}}
+     * (mapped to an OK tool result by the Web UI) or {@code {"error": "..."}} (mapped to an
+     * error tool result).</p>
+     *
+     * <p>The Web UI picks the execution path by the tool's <em>source</em> (bundle:
+     * {@code J=Bn.getToolSource(H)}): a {@code get_info} served by {@link #getTools()} has
+     * source SERVER and is executed via this POST. Only a browser-injected fallback
+     * {@code get_info} - which is not injected while this list serves one - would have been
+     * answered locally with the misleading "browser-only" note. Serving {@code get_info}
+     * therefore deactivates that note without any Web UI patch.</p>
+     */
+    @PostMapping(value = "/tools", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<String> executeTool(@RequestBody String requestBody) {
+        LOG.info("{} POST /chat/tools", LocalDateTime.now());
+
+        String error;
+        try {
+            JsonNode root = jsonMapper.readTree(requestBody);
+            String toolName = root == null || !root.hasNonNull("tool")
+                    ? null : root.get("tool").asText();
+            if (toolName == null || toolName.isBlank()) {
+                error = "missing 'tool' in request body";
+            } else if (TOOL_GET_INFO.equals(toolName)) {
+                return toolResult(buildGetInfoResult());
+            } else {
+                error = "unknown tool: " + toolName;
+            }
+        } catch (RuntimeException e) {
+            LOG.error("Error processing tool request body: {}", requestBody, e);
+            error = "invalid request body";
+        }
+        return toolResultError(error);
+    }
+
+    /** Wraps a plain text result in the Web UI's OK shape (see {@link #executeTool(String)}). */
+    private ResponseEntity<String> toolResult(String plainText) {
+        ObjectNode root = jsonMapper.createObjectNode();
+        root.put("plain_text_response", plainText);
+        return jsonToolResponse(root);
+    }
+
+    /** Wraps an error message in the Web UI's error shape (see {@link #executeTool(String)}). */
+    private ResponseEntity<String> toolResultError(String message) {
+        ObjectNode root = jsonMapper.createObjectNode();
+        root.put("error", message);
+        return jsonToolResponse(root);
+    }
+
+    private ResponseEntity<String> jsonToolResponse(ObjectNode root) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        applyNoStoreCacheHeaders(headers);
+        try {
+            return ResponseEntity.ok().headers(headers).body(jsonMapper.writeValueAsString(root));
+        } catch (RuntimeException e) {
+            LOG.error("Error serializing tool result", e);
             return ResponseEntity.status(500).body("{\"error\": \"Internal server error\"}");
         }
+    }
+
+    /**
+     * Builds the {@code get_info} tool description. The local file access note is included
+     * only while at least one file tool is active - an inactive file tool set must not be
+     * advertised.
+     */
+    private String buildGetInfoDescription() {
+        List<String> fileTools = activeFileToolNames();
+        if (fileTools.isEmpty()) {
+            return "Get runtime info: operating system name and the MCP tools that are currently"
+                    + " active. Note: no local file access is available in this environment"
+                    + " (no file tool is active).";
+        }
+        return "Get runtime info: operating system name and the MCP tools that are currently"
+                + " active. Local file access is available through the MCP file tools: "
+                + String.join(", ", fileTools)
+                + ". May call when the user asks about the OS, local files or the tools"
+                + " available in this environment.";
+    }
+
+    /**
+     * Builds the plain text result of a get_info call: OS line, active MCP tools and - only
+     * while a file tool is active - the local file access note.
+     */
+    private String buildGetInfoResult() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("os: ").append(describeOs()).append('\n');
+        sb.append("active MCP tools: ").append(String.join(", ", activeToolNames())).append('\n');
+        List<String> fileTools = activeFileToolNames();
+        if (fileTools.isEmpty()) {
+            sb.append("local file access: none (no file tool is active)");
+        } else {
+            sb.append("local file access: available via the MCP file tools: ")
+                    .append(String.join(", ", fileTools));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Human-readable OS name derived from the {@code os.name} system property (ASCII only,
+     * following the Web UI's own OS detection: Windows / macOS / Linux / BSD).
+     */
+    private static String describeOs() {
+        String osName = System.getProperty("os.name", "unknown");
+        String osArch = System.getProperty("os.arch", "");
+        String lower = osName.toLowerCase(Locale.ROOT);
+        String family;
+        if (lower.contains("win")) {
+            family = "Windows";
+        } else if (lower.contains("mac") || lower.contains("darwin")) {
+            family = "macOS";
+        } else if (lower.contains("linux")) {
+            family = "Linux";
+        } else if (lower.contains("bsd")) {
+            family = "BSD";
+        } else {
+            family = osName;
+        }
+        if (osArch.isBlank()) {
+            return family + " (os.name=" + osName + ")";
+        }
+        return family + " (os.name=" + osName + ", os.arch=" + osArch + ")";
+    }
+
+    /**
+     * Names of the MCP tools that are currently active (registered on the MCP servers),
+     * sorted. Empty without a {@link ToolRegistry} (plain unit test context).
+     */
+    private List<String> activeToolNames() {
+        if (toolRegistry == null) {
+            return List.of();
+        }
+        List<String> names = new ArrayList<>();
+        for (Map.Entry<String, ToolSpecWithState> entry : toolRegistry.getMapTools().entrySet()) {
+            if (entry.getValue().state().isActive().get()) {
+                names.add(entry.getKey());
+            }
+        }
+        Collections.sort(names);
+        return names;
+    }
+
+    /**
+     * Names of the active file tools ({@link #FILE_TOOL_NAMES} ∩ registry), sorted.
+     * A file tool counts as active when its {@code ToolState} is active in the registry.
+     */
+    private List<String> activeFileToolNames() {
+        List<String> result = new ArrayList<>();
+        for (String name : activeToolNames()) {
+            if (FILE_TOOL_NAMES.contains(name)) {
+                result.add(name);
+            }
+        }
+        return result;
     }
 
     /**
@@ -993,6 +1245,7 @@ public class WebUiProxy {
             // Accept both JSON and SSE depending on backend capability
             connection.setRequestProperty("Accept", "application/json, text/event-stream");
             connection.setDoOutput(true);
+            applyApiKey(connection);
             // Note: do NOT send an Expect header at all. HttpURLConnection does not send
             // "Expect: 100-continue" by default; explicitly setting an empty header value
             // would still transmit "Expect:" and Tomcat rejects that with HTTP 417
@@ -1709,6 +1962,7 @@ public class WebUiProxy {
         connection.setRequestProperty("Content-Type", "application/json");
         connection.setRequestProperty("Accept", "application/json");
         connection.setDoOutput(true);
+        applyApiKey(connection);
 
         if (cookie != null) {
             connection.setRequestProperty("Cookie", cookie);

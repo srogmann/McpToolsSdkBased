@@ -1,7 +1,6 @@
-package org.rogmann.mcp2sdk.xml;
+package org.rogmann.mcp2sdk.js;
 
-import org.rogmann.mcp2sdk.js.JsUserRuntimeException;
-import org.rogmann.mcp2sdk.xml.JsXmlErrors.Parse;
+import org.rogmann.mcp2sdk.js.JsXmlErrors.Parse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

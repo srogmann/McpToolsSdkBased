@@ -1,10 +1,8 @@
-package org.rogmann.mcp2sdk.xml;
+package org.rogmann.mcp2sdk.js;
 
 import org.graalvm.polyglot.Value;
 import org.graalvm.polyglot.proxy.ProxyExecutable;
 import org.graalvm.polyglot.proxy.ProxyObject;
-import org.rogmann.mcp2sdk.js.GraalProxies;
-import org.rogmann.mcp2sdk.js.JsModuleInterface;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;

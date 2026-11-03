@@ -1,12 +1,11 @@
-package org.rogmann.mcp2sdk.xml;
+package org.rogmann.mcp2sdk.js;
 
-import org.rogmann.mcp2sdk.js.JsUserRuntimeException;
-import org.rogmann.mcp2sdk.xml.JsXmlDom.Loaded;
-import org.rogmann.mcp2sdk.xml.JsXmlDom.TextCollect;
-import org.rogmann.mcp2sdk.xml.JsXmlDom.XPathProblem;
-import org.rogmann.mcp2sdk.xml.JsXmlErrors.NotFound;
-import org.rogmann.mcp2sdk.xml.JsXmlErrors.Parse;
-import org.rogmann.mcp2sdk.xml.JsXmlErrors.TooLarge;
+import org.rogmann.mcp2sdk.js.JsXmlDom.Loaded;
+import org.rogmann.mcp2sdk.js.JsXmlDom.TextCollect;
+import org.rogmann.mcp2sdk.js.JsXmlDom.XPathProblem;
+import org.rogmann.mcp2sdk.js.JsXmlErrors.NotFound;
+import org.rogmann.mcp2sdk.js.JsXmlErrors.Parse;
+import org.rogmann.mcp2sdk.js.JsXmlErrors.TooLarge;
 
 import org.w3c.dom.Attr;
 import org.w3c.dom.Element;

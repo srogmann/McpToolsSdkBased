@@ -42,6 +42,11 @@ public class McpServerMain {
         };
         String[] sClasses = {
                 "ch.qos.logback.classic.spi.ClassPackagingData",
+                "com.agentclientprotocol.sdk.http.server.StreamableHttpConnection",
+                "com.agentclientprotocol.sdk.http.server.WebSocketConnection",
+                "com.agentclientprotocol.sdk.util.AcpSchedulers",
+                "com.agentclientprotocol.sdk.util.AcpSchedulers$TimeoutHolder",
+                "com.agentclientprotocol.sdk.util.VirtualThreads",
                 "org.apache.catalina.Lifecycle$SingleUse",
                 "org.apache.catalina.util.RequestUtil",
                 "org.apache.catalina.webresources.WarResourceSet",
@@ -66,16 +71,23 @@ public class McpServerMain {
         preloadReactorClasses(cl,
                 "io.modelcontextprotocol.spec.McpServerSession",
                 "reactor.core.Exceptions",
+                "reactor.core.Scannable$Attr$1",
+                "reactor.core.Scannable$Attr$RunStyle",
                 "reactor.core.publisher.FluxFlatMap",
                 "reactor.core.publisher.FluxIterable",
                 "reactor.core.publisher.FluxOnErrorReturn",
+                "reactor.core.publisher.FluxTimeout$TimeoutMainSubscriber",
                 "reactor.core.publisher.LambdaMonoSubscriber",
+                "reactor.core.publisher.MonoCompletionStage$MonoCompletionStageSubscription",
                 "reactor.core.publisher.MonoPeekTerminal",
                 "reactor.core.publisher.MonoIgnoreElements",
+                "reactor.core.publisher.MonoIgnoreThen$ThenIgnoreMain",
                 "reactor.core.publisher.MonoRunnable",
                 "reactor.core.publisher.MonoSink",
                 "reactor.core.publisher.MonoWhen$WhenCoordinator",
-                "reactor.core.publisher.Operators");
+                "reactor.core.publisher.Operators",
+                "reactor.core.scheduler.DelegateServiceScheduler",
+                "reactor.core.scheduler.ExecutorScheduler");
 
         SpringApplication.run(McpServerMain.class, args);
     }

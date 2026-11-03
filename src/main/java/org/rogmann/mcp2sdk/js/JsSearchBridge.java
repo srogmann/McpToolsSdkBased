@@ -780,35 +780,29 @@ public class JsSearchBridge implements JsModuleInterface {
      * Describes a JS value type for error messages. Typed arrays are named the way JavaScript
      * names them ({@code Uint8Array}, {@code Int8Array}, ...), because that is the word the
      * caller used and the one that explains what to pass instead.
+     * <p>
+     * The structural part is {@link GraalProxies#describeType(Value)}; only the two cases that
+     * belong to this module's API - a {@code RegExp} and the name of a typed array - are decided
+     * here.
+     * </p>
      */
     private static String describe(Value v, RegExpSupport regexps) {
         if (v == null || v.isNull()) {
             return "null";
         }
-        if (v.isString()) {
-            return "string";
-        }
-        if (v.isNumber()) {
-            return "number";
-        }
-        if (v.isBoolean()) {
-            return "boolean";
+        String type = GraalProxies.describeType(v);
+        if ("string".equals(type) || "number".equals(type) || "boolean".equals(type)) {
+            return type;
         }
         if (regexps != null ? regexps.isRegExp(v) : looksLikeRegExp(v)) {
             return "RegExp";
         }
-        if (v.hasArrayElements()) {
-            if (regexps != null) {
-                String name = regexps.typeName(v);
-                if (name != null && name.endsWith("Array") && !"Array".equals(name)) {
-                    return name;
-                }
+        if (regexps != null && "array".equals(type)) {
+            String name = regexps.typeName(v);
+            if (name != null && name.endsWith("Array") && !"Array".equals(name)) {
+                return name;
             }
-            return "array";
         }
-        if (v.hasMembers()) {
-            return "object";
-        }
-        return "value";
+        return type;
     }
 }

@@ -1,4 +1,4 @@
-package org.rogmann.mcp2sdk.xml;
+package org.rogmann.mcp2sdk.js;
 
 import java.io.Serial;
 import java.util.LinkedHashMap;

@@ -116,7 +116,7 @@ public class JsFileSystemBridge implements JsModuleInterface {
                     if (end != null) {
                         endLine = end;
                     }
-                    enc = encodingArg(second);
+                    enc = hasEncodingSettings(second) ? encodingArg(second) : EncodingArg.DEFAULT;
                 } else {
                     throw new IllegalArgumentException("Usage: fs.readLines(path[, startLine[, endLine"
                             + "[, encoding|options]]]) - startLine must be a number or an options object"
@@ -548,6 +548,18 @@ public class JsFileSystemBridge implements JsModuleInterface {
         }
         Object obj = GraalProxies.fromValue(value);
         return obj != null ? String.valueOf(obj) : null;
+    }
+
+    /**
+     * True if an options object carries encoding settings. A pure range object
+     * ({@code {startLine, endLine}}) does not, and handing it to the encoding parser would be
+     * rejected - although the range is the whole point of that call.
+     *
+     * @param object the options object
+     * @return true if {@code encoding} or {@code errors} is present
+     */
+    private static boolean hasEncodingSettings(Value object) {
+        return object.hasMember("encoding") || object.hasMember("errors");
     }
 
     /**

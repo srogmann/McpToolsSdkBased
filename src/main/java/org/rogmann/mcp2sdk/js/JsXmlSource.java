@@ -1,10 +1,7 @@
-package org.rogmann.mcp2sdk.xml;
+package org.rogmann.mcp2sdk.js;
 
-import org.rogmann.mcp2sdk.js.JsArchive;
-import org.rogmann.mcp2sdk.js.JsFileSystem;
-import org.rogmann.mcp2sdk.js.JsUserRuntimeException;
-import org.rogmann.mcp2sdk.xml.JsXmlErrors.NotFound;
-import org.rogmann.mcp2sdk.xml.JsXmlErrors.TooLarge;
+import org.rogmann.mcp2sdk.js.JsXmlErrors.NotFound;
+import org.rogmann.mcp2sdk.js.JsXmlErrors.TooLarge;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayInputStream;

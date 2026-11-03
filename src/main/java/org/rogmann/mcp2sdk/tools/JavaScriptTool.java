@@ -21,10 +21,11 @@ import org.rogmann.mcp2sdk.js.GraalProxies;
 import org.rogmann.mcp2sdk.js.JsAgentBoardBridge;
 import org.rogmann.mcp2sdk.js.JsArchiveBridge;
 import org.rogmann.mcp2sdk.js.JsCryptoBridge;
-import org.rogmann.mcp2sdk.js.JsCrypto;
-import org.rogmann.mcp2sdk.js.JsCryptoBridge;
+import org.rogmann.mcp2sdk.js.JsDiffBridge;
 import org.rogmann.mcp2sdk.js.JsFileSystem;
 import org.rogmann.mcp2sdk.js.JsFileSystemBridge;
+import org.rogmann.mcp2sdk.js.JsGitBridge;
+import org.rogmann.mcp2sdk.js.JsImageBridge;
 import org.rogmann.mcp2sdk.js.JsJavapBridge;
 import org.rogmann.mcp2sdk.js.JsM2Bridge;
 import org.rogmann.mcp2sdk.js.JsMcpProxyBridge;
@@ -32,7 +33,7 @@ import org.rogmann.mcp2sdk.js.JsModuleInterface;
 import org.rogmann.mcp2sdk.js.JsPdfBridge;
 import org.rogmann.mcp2sdk.js.JsSearchBridge;
 import org.rogmann.mcp2sdk.js.JsSQLiteBridge;
-import org.rogmann.mcp2sdk.xml.JsXmlBridge;
+import org.rogmann.mcp2sdk.js.JsXmlBridge;
 import org.rogmann.mcp2sdk.poi.DocxToolBoxJsBridge;
 import org.rogmann.mcp2sdk.poi.PoiToolBoxJsBridge;
 import org.rogmann.mcp2sdk.poi.PptxToolBoxJsBridge;
@@ -86,7 +87,7 @@ public class JavaScriptTool {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(JavaScriptTool.class);
 
-    private static final String NAME = "javascript_tool";
+    private static final String NAME = "javascript";
 
     /**
      * System property to configure the default execution timeout in seconds, e.g.
@@ -171,6 +172,17 @@ public class JavaScriptTool {
         // Grep-like search over files, directories and archives (docs/js/search.md).
         // Uses the same path rules as `fs` and the same archive formats as `archive`.
         modules.put("search", new JsSearchBridge());
+        // Structured line diffs: hunks with line numbers and byte offsets, blocks instead of
+        // hunks, and a unified patch (docs/js/diff.md). Reads with the same path rules as `fs`,
+        // decodes strictly (a malformed byte is an error with its offset) and never touches
+        // the network. Diffing itself is pure CPU and bounded by maxCost/maxHunks.
+        modules.put("diff", new JsDiffBridge());
+        // Read-only git access to the repository of the project directory (docs/js/git.md):
+        // status/branches/remotes from git's machine formats (porcelain=v2 -z, for-each-ref),
+        // history and diffs follow, and a read-only view of the configured GitHub/GHE server
+        // (git.hub.*, server from a property - never from the caller). No MCP tool on purpose:
+        // git calls are rare, and a module costs one line here instead of a schema per call.
+        modules.put("git", new JsGitBridge());
         modules.put("javap", new JsJavapBridge());
         // Read-only Maven repository (M2) access: classpath of a pom.xml, dependency tree,
         // JAR entry reads (the core is org.rogmann.mcp2sdk.m2.M2Resolver). The entry bytes
@@ -187,6 +199,14 @@ public class JavaScriptTool {
         modules.put("poi", new PoiToolBoxJsBridge());
         modules.put("docx", new DocxToolBoxJsBridge());
         modules.put("pptx", new PptxToolBoxJsBridge());
+        // Image metadata and analysis without an external library (docs/js/image.md): the format
+        // headers themselves (PNG chunks, JPEG SOF/EXIF, GIF blocks, BMP), colour/texture
+        // statistics with a measured kind guess (text/screenshot/drawing/photo, tuned on the
+        // sample images src/test/resources/js/image_*.{png,jpg}) and the bitmap side
+        // (create/encode/save; the drawing family follows in P3). Sources are paths, archive
+        // display paths ('report.docx#word/media/image1.png', read per level from memory) or raw
+        // bytes. Disable with -Dmcp.js.image.enabled=false.
+        modules.put("image", new JsImageBridge());
         // The message board of a running prefix_fork batch (docs/subagent.md §14). Two switches,
         // on purpose: the property names it in the tool description at all (off by default), and
         // the caller decides whether anything is bound - a script outside a fork thread has no

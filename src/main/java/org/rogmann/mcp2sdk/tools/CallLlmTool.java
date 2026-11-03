@@ -458,7 +458,20 @@ public class CallLlmTool {
 
         int responseCode = connection.getResponseCode();
         if (responseCode != HttpURLConnection.HTTP_OK) {
-            LOG.error(String.format("HTTP error accessing %s: %d - %s", targetUrl, responseCode, connection.getResponseMessage()));
+            // For status != 200 the response body is only exposed via getErrorStream()
+            // (getInputStream() throws). Read it once and log it, so that the error message
+            // of the LLM service (e.g. details about an invalid request) is not lost.
+            String errorBody = "";
+            try (InputStream errorStream = connection.getErrorStream()) {
+                if (errorStream != null) {
+                    errorBody = new String(errorStream.readAllBytes(), StandardCharsets.UTF_8);
+                }
+            } catch (IOException e) {
+                LOG.warn("Failed to read error stream of HTTP response", e);
+            }
+            LOG.error("HTTP error accessing {}: {} - {}: {}", targetUrl, responseCode,
+                    connection.getResponseMessage(),
+                    errorBody.length() > 2000 ? errorBody.substring(0, 2000) + "..." : errorBody);
             throw new IOException("HTTP error: " + responseCode);
         }
 
