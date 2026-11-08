@@ -342,9 +342,18 @@ final class SubAgentRunner {
                 if (usageNode.isObject()) {
                     promptTokens += usageNode.path("prompt_tokens").asLong(0L);
                     completionTokens += usageNode.path("completion_tokens").asLong(0L);
-                    JsonNode cachedNode = usageNode.path("prompt_tokens_details").path("cached_tokens");
-                    if (cachedNode.isNumber()) {
-                        cachedTokens += cachedNode.asLong();
+                    long cachedThisTurn = usageNode.path("prompt_tokens_details")
+                            .path("cached_tokens").asLong(-1L);
+                    if (cachedThisTurn < 0L) {
+                        // A backend in the llama.cpp family (llama.cpp, maya) has no OpenAI usage
+                        // detail and reports the prefix-cache share in its own timings instead.
+                        // Without this fallback every fork of such a backend would report
+                        // cacheHit "unknown" although the number arrived - and the whole premise
+                        // of the prefix fork (decision F11) would be unmeasurable.
+                        cachedThisTurn = response.path("timings").path("cache_n").asLong(-1L);
+                    }
+                    if (cachedThisTurn >= 0L) {
+                        cachedTokens += cachedThisTurn;
                         cachedKnown = true;
                     }
                 }

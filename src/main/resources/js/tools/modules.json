@@ -1,0 +1,6 @@
+{
+  "pdftext": {
+    "file": "lib/pdftext.js",
+    "summary": "`loadShipped('pdftext')` is a small typesetter on pdfedit (headings, justified paragraphs, tables, flowcharts) - docs/js/pdftext.md"
+  }
+}

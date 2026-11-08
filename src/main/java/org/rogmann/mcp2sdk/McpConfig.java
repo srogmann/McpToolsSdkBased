@@ -12,6 +12,10 @@ import org.rogmann.mcp2sdk.agent.AgentBoardTool;
 import org.rogmann.mcp2sdk.agent.ForkIdentityFilter;
 import org.rogmann.mcp2sdk.agent.PrefixForkTool;
 import org.rogmann.mcp2sdk.browser.BrowserTool;
+ import org.rogmann.mcp2sdk.chat.PublicDirWebServer;
+import org.rogmann.mcp2sdk.image.ImageClient;
+import org.rogmann.mcp2sdk.image.ImageLimits;
+import org.rogmann.mcp2sdk.image.JsImage;
 import org.rogmann.mcp2sdk.image.VisionClient;
 import org.rogmann.mcp2sdk.m2.PomWatch;
 import org.rogmann.mcp2sdk.security.McpLockdownFilter;
@@ -181,6 +185,26 @@ public class McpConfig {
         // The image module's vision call resolves webui.* (current model, hasVision, token)
         // through the Spring environment - see docs/js/image.md §7.
         VisionClient.setEnvironment(environment);
+        // The diffusion client resolves mcp.js.image.gen.*/edit.* and the gateway the same way.
+        ImageClient.setEnvironment(environment);
+        // Image limits: resolved once and strictly - a bad mcp.js.image.* value stops the start
+        // instead of surfacing in the middle of a call (AGENTS.md: no silent defaults).
+        ImageLimits.setCurrent(ImageLimits.from(environment));
+        // Where 'output: demo' publishes pictures: <webui.public.path>/gen-images, served by the
+        // Web UI under /chat/gen-images (a directory of the module's own, not the UI's root).
+        // The port is read lazily: with server.port=0 only local.server.port knows the bound one,
+        // and that property appears after the web server has started. No number of ours is used -
+        // 0 means "not known yet" and the module answers with a hint instead of a guessed URL.
+        JsImage.setLocalWebServer(PublicDirWebServer.of(
+                environment.getProperty("webui.public.path"),
+                () -> {
+                    Integer bound = environment.getProperty("local.server.port", Integer.class);
+                    if (bound != null && bound > 0) {
+                        return bound;
+                    }
+                    Integer configured = environment.getProperty("server.port", Integer.class);
+                    return configured != null ? configured : 0;
+                }));
 
         registry.registerToolDefinition(GlossaryTool.createToolInstance());
 

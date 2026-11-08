@@ -156,7 +156,6 @@ final class AcpChat {
     /** The tool registry — {@code /tools} reads the live active state from it, in-process. */
     private final ToolRegistry toolRegistry;
 
-    /** Conversation history per chat id (see {@link ChatIds}). */
     /**
      * Process-wide, not per connection: the IDE opens one connection per conversation and
      * rebuilds them on every reconnect (an IDE restart, a dropped WebSocket) — a new
@@ -511,6 +510,9 @@ final class AcpChat {
         for (JavaScriptTool.JsModuleListing module : JavaScriptTool.moduleListing()) {
             sb.append("- `").append(module.namespace()).append("` — ")
                     .append(excerpt(module.summary().replace('\n', ' '), 100));
+            if ("shipped".equals(module.kind())) {
+                sb.append(" _[shipped with the server, not a bound namespace]_");
+            }
             if (!module.advertised()) {
                 sb.append(" _[not advertised]_");
             }

@@ -34,6 +34,7 @@ import org.rogmann.mcp2sdk.js.JsPdfBridge;
 import org.rogmann.mcp2sdk.js.JsSearchBridge;
 import org.rogmann.mcp2sdk.js.JsSQLiteBridge;
 import org.rogmann.mcp2sdk.js.JsXmlBridge;
+import org.rogmann.mcp2sdk.pdfedit.JsPdfEditBridge;
 import org.rogmann.mcp2sdk.poi.DocxToolBoxJsBridge;
 import org.rogmann.mcp2sdk.poi.PoiToolBoxJsBridge;
 import org.rogmann.mcp2sdk.poi.PptxToolBoxJsBridge;
@@ -166,6 +167,7 @@ public class JavaScriptTool {
         modules.put("crypto", new JsCryptoBridge());
         modules.put("archive", new JsArchiveBridge());
         modules.put("pdf", new JsPdfBridge());
+        modules.put("pdfedit", new JsPdfEditBridge());
         // Read-only access to SQLite database files (tables/rows/forEachRow) with a small
         // built-in parser - no sqlite-jdbc dependency.
         modules.put("sqlite", new JsSQLiteBridge());
@@ -218,23 +220,43 @@ public class JavaScriptTool {
 
     /** One JS module as the ACP chat's {@code /modules} command lists it. */
     public record JsModuleListing(String namespace, String summary, boolean advertised,
-                                  boolean enabled) {
+                                  boolean enabled, String kind) {
     }
 
     /**
      * The JS modules of this tool, in the tool's own insertion order — the {@code /modules}
      * command of the ACP chat lists them. Cheap to call: the modules are stateless bridge
      * objects, built exactly the way {@link #createToolInstance()} builds them.
-     * @return one entry per module, insertion-ordered
+     * <p>
+     * The libraries that ship inside the jar follow as {@code kind = "shipped"}: they are not
+     * bound namespaces (there is no global {@code pdftext}), so the list must say which of the two
+     * a name is.
+     * </p>
+     * @return one entry per module and per shipped library, insertion-ordered
      */
     public static List<JsModuleListing> moduleListing() {
         List<JsModuleListing> listing = new ArrayList<>();
         for (Map.Entry<String, JsModuleInterface> entry : createModules().entrySet()) {
             JsModuleInterface module = entry.getValue();
             listing.add(new JsModuleListing(entry.getKey(), module.getSummary(),
-                    module.isAdvertised(), module.isEnabled()));
+                    module.isAdvertised(), module.isEnabled(), "namespace"));
+        }
+        for (ShippedJsModules.Entry shipped : ShippedJsModules.byName().values()) {
+            listing.add(new JsModuleListing(shipped.name(), shipped.summary(), true, true,
+                    "shipped"));
         }
         return listing;
+    }
+
+    /**
+     * The first declared shipped module name - an example for an error message.
+     * @return the name, or {@code "name"} when nothing ships
+     */
+    private static String firstShippedName() {
+        for (String name : ShippedJsModules.byName().keySet()) {
+            return name;
+        }
+        return "name";
     }
 
     /**
@@ -258,6 +280,18 @@ public class JavaScriptTool {
             first = false;
         }
         if (!first) {
+            sb.append(".");
+        }
+        if (!ShippedJsModules.byName().isEmpty()) {
+            sb.append(" Shipped with the server: ");
+            boolean firstShipped = true;
+            for (ShippedJsModules.Entry shipped : ShippedJsModules.byName().values()) {
+                if (!firstShipped) {
+                    sb.append("; ");
+                }
+                sb.append(shipped.summary());
+                firstShipped = false;
+            }
             sb.append(".");
         }
         sb.append(" Scripts run with an execution timeout (default ")
@@ -788,7 +822,10 @@ public class JavaScriptTool {
                             "Cannot find module '" + module + "'. This sandbox provides only "
                             + requireList + " (also bound globally as "
                             + String.join(", ", requireNames) + "); project files can be loaded "
-                            + "with require('./file.js') or load('./file.js'). "
+                            + "with require('./file.js') or load('./file.js'), and the libraries"
+                            + " that ship with the server with loadShipped(name) - "
+                            + ModuleLoader.shippedNames() + " (see "
+                            + ShippedJsModules.MANIFEST + "). "
                             + "There is no Node.js require for arbitrary modules, no process, "
                             + "no Buffer and no network access.");
                 }
@@ -816,6 +853,30 @@ public class JavaScriptTool {
                 return moduleLoader.load(cArgs[0].asString(), expectedSha256);
             };
             context.getBindings("js").putMember("load", loadFunc);
+
+            // --- Wire loadShipped() for the libraries that travel with the server ---
+            // loadShipped('pdftext') names a module from js/tools/modules.json; the manifest is
+            // the whole list, so the sandbox never sees the jar as a file tree.
+            ProxyExecutable loadShippedFunc = (cArgs) -> {
+                if (cArgs == null || cArgs.length < 1 || cArgs[0].isNull()) {
+                    throw new IllegalArgumentException(
+                            "loadShipped(name) requires a module name, e.g. loadShipped('"
+                            + firstShippedName() + "'), optionally followed by {sha256: '<64 hex"
+                            + " chars>'}. This server ships "
+                            + ModuleLoader.shippedNames() + " (declared in "
+                            + ShippedJsModules.MANIFEST + ").");
+                }
+                if (cArgs.length > 2) {
+                    throw new IllegalArgumentException("loadShipped(name, options) takes at most "
+                            + "two arguments, got " + cArgs.length + ".");
+                }
+                String expectedSha256 = null;
+                if (cArgs.length > 1 && cArgs[1] != null && !cArgs[1].isNull()) {
+                    expectedSha256 = moduleLoader.extractPinnedSha256(cArgs[1]);
+                }
+                return moduleLoader.loadShipped(cArgs[0].asString(), expectedSha256);
+            };
+            context.getBindings("js").putMember("loadShipped", loadShippedFunc);
             LOGGER.info("CommonJS module loader bound to JavaScript context "
                     + "(require/load of '.js' project files, relative paths based on: {})",
                     (basePath != null) ? basePath : "<project base>");
@@ -1346,6 +1407,16 @@ public class JavaScriptTool {
      * base directory.
      * </p>
      * <p>
+     * <b>Shipped libraries.</b> {@code loadShipped('pdftext')} names a module inside the server's
+     * own jar instead of a file of the project: the name is looked up in
+     * {@code js/tools/modules.json}, and the file it declares
+     * ({@code src/main/resources/js/tools/lib/pdftext.js}, in the Spring-Boot jar
+     * {@code BOOT-INF/classes/js/tools/lib/pdftext.js}) is read from the classpath. Without that
+     * way a library that ships with the server would be invisible to a caller whose project
+     * directory is somewhere else - which is the normal case, because the server runs outside the
+     * build project. A name is not a search: what the manifest does not declare cannot be loaded.
+     * </p>
+     * <p>
      * The optional second argument of {@code load} pins the file content: the SHA-256 of the
      * file (identical to {@code crypto.sha256(path)}, i.e. over the raw UTF-8 file bytes) must
      * match, otherwise the module is not executed. This lets a caller verify that exactly the
@@ -1362,6 +1433,15 @@ public class JavaScriptTool {
 
         /** Maximum nesting depth of module loads (defensive bound; cycles are caught by the cache). */
         private static final int MAX_MODULE_DEPTH = 32;
+
+        /**
+         * Prefix of a module that ships inside the server's own jar. It is not a caller API: a
+         * caller names a shipped module with {@code loadShipped('pdftext')}, and the manifest
+         * turns that into this resource name (see {@link #loadShipped(String, String)}). The
+         * prefix exists so that a relative {@code require} inside a shipped module has an address
+         * to resolve against, and every use of it is checked against the manifest.
+         */
+        static final String SHIPPED_PREFIX = "shipped:";
 
         private final Context context;
         private final AtomicBoolean cancelRequested;
@@ -1460,6 +1540,12 @@ public class JavaScriptTool {
             } else {
                 candidate = moduleArg;
             }
+            if (candidate.startsWith(SHIPPED_PREFIX)) {
+                // A relative require inside a shipped module resolves here - and only to a file
+                // the manifest declares.
+                return loadShippedResource(candidate.substring(SHIPPED_PREFIX.length()),
+                        expectedSha256);
+            }
             // Same path rules as fs: containment, no traversal, no escaping symbolic links.
             Path safePath = JsFileSystem.resolveSafePath(candidate);
             String display = JsFileSystem.toRelative(safePath);
@@ -1467,19 +1553,164 @@ public class JavaScriptTool {
                 throw new IllegalArgumentException("Only '.js' files can be loaded as modules, "
                         + "got: " + display + " (asked for '" + moduleArg + "')");
             }
-
-            Value cached = moduleCache.get(display);
+            Value cached = cachedModule(display, expectedSha256);
             if (cached != null) {
-                // Cyclic require: the still-initializing module returns its partial exports.
-                if (expectedSha256 != null && !expectedSha256.equals(moduleSha256.get(display))) {
-                    throw new IllegalArgumentException(
-                            pinningMismatchMessage(display, expectedSha256, moduleSha256.get(display)));
-                }
-                LOGGER.debug("JavaScript module cache hit ({}), returning exports", display);
                 return cached;
             }
+            return evaluate(display, JsFileSystem.readFile(display), expectedSha256);
+        }
 
-            String content = JsFileSystem.readFile(display);
+        /**
+         * Loads a library that ships inside the server's jar by its <b>declared name</b>.
+         * <p>
+         * {@code loadShipped('pdftext')} looks the name up in {@code js/tools/modules.json} and
+         * evaluates {@code js/tools/lib/pdftext.js} from the classpath. A name is not a path:
+         * there is no search, no directory to enumerate, no jar layout in the caller's string, and
+         * nothing outside the manifest can be reached. That is the way a library gets to a server
+         * that does not run in the build project (where {@code src/main/resources} is not on
+         * disk); a project file keeps being loaded with {@code load('./file.js')}.
+         * </p>
+         * @param name the declared name ({@code pdftext})
+         * @param expectedSha256 the pinned SHA-256, or null
+         * @return the module's exports
+         */
+        Value loadShipped(String name, String expectedSha256) {
+            if (name == null || name.isBlank()) {
+                throw new IllegalArgumentException("loadShipped(name): the module name must not"
+                        + " be empty - this server ships " + shippedNames() + " (see "
+                        + ShippedJsModules.MANIFEST + ")");
+            }
+            ShippedJsModules.Entry entry = ShippedJsModules.byName().get(name.trim());
+            if (entry == null) {
+                throw new IllegalArgumentException("loadShipped('" + name + "'): no such module -"
+                        + " this server ships " + shippedNames() + " (declared in "
+                        + ShippedJsModules.MANIFEST + "); project files are loaded with"
+                        + " load('./file.js')");
+            }
+            return loadShippedEntry(entry, expectedSha256);
+        }
+
+        /**
+         * Loads a shipped module by its resource name - the way a relative {@code require} inside
+         * a shipped module names its neighbour. A file the manifest does not declare is refused,
+         * so this adds no second way into the jar.
+         * @param resource the resource name relative to {@code js/tools/lib/}
+         * @param expectedSha256 the pinned SHA-256, or null
+         * @return the module's exports
+         */
+        private Value loadShippedResource(String resource, String expectedSha256) {
+            String normalized = normalizeResource(resource);
+            ShippedJsModules.Entry entry = ShippedJsModules.byFile(normalized);
+            if (entry == null) {
+                throw new IllegalArgumentException("No shipped module '" + normalized + "' - this"
+                        + " server ships " + shippedNames() + " (declared in "
+                        + ShippedJsModules.MANIFEST + "); a module inside the jar is named by"
+                        + " loadShipped(name)");
+            }
+            return loadShippedEntry(entry, expectedSha256);
+        }
+
+        /**
+         * Reads and evaluates one declared module.
+         * @param entry the manifest entry
+         * @param expectedSha256 the pinned SHA-256, or null
+         * @return the module's exports
+         */
+        private Value loadShippedEntry(ShippedJsModules.Entry entry, String expectedSha256) {
+            String display = SHIPPED_PREFIX + entry.file();
+            Value cached = cachedModule(display, expectedSha256);
+            if (cached != null) {
+                return cached;
+            }
+            String content;
+            try (InputStream in = JavaScriptTool.class.getClassLoader()
+                    .getResourceAsStream(ShippedJsModules.ROOT + entry.file())) {
+                if (in == null) {
+                    throw new IllegalStateException("The manifest declares '" + entry.name()
+                            + "' as " + ShippedJsModules.ROOT + entry.file() + ", but the"
+                            + " resource is not on the classpath - the build did not copy"
+                            + " src/main/resources");
+                }
+                content = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                throw new IllegalArgumentException("Cannot read the shipped module '" + entry.name()
+                        + "': " + e.getMessage(), e);
+            }
+            return evaluate(display, content, expectedSha256);
+        }
+
+        /**
+         * The declared module names, for an error message the caller can act on.
+         * @return the names in quotes, comma-separated
+         */
+        static String shippedNames() {
+            StringBuilder sb = new StringBuilder();
+            for (String name : ShippedJsModules.byName().keySet()) {
+                if (!sb.isEmpty()) {
+                    sb.append(", ");
+                }
+                sb.append('\'').append(name).append('\'');
+            }
+            return sb.isEmpty() ? "(none)" : sb.toString();
+        }
+
+        /**
+         * Normalizes a resource name: backslashes become slashes, empty and {@code .} segments
+         * vanish, and a {@code ..} segment is refused (a shipped module is never resolved
+         * upwards).
+         * @param resource the resource name as the caller wrote it
+         * @return the normalized name
+         */
+        private static String normalizeResource(String resource) {
+            StringBuilder out = new StringBuilder();
+            for (String part : resource.replace('\\', '/').split("/")) {
+                if (part.isEmpty() || ".".equals(part)) {
+                    continue;
+                }
+                if ("..".equals(part)) {
+                    throw new IllegalArgumentException("'..' is not allowed in a shipped module"
+                            + " path: " + resource);
+                }
+                if (!out.isEmpty()) {
+                    out.append('/');
+                }
+                out.append(part);
+            }
+            return out.toString();
+        }
+
+        /**
+         * Answers an already loaded module - the still-initializing partial exports for a cyclic
+         * require - or null.
+         * @param display the display path of the module
+         * @param expectedSha256 the pinned SHA-256, or null
+         * @return the exports, or null when the module was not loaded yet
+         */
+        private Value cachedModule(String display, String expectedSha256) {
+            Value cached = moduleCache.get(display);
+            if (cached == null) {
+                return null;
+            }
+            // Cyclic require: the still-initializing module returns its partial exports.
+            if (expectedSha256 != null && !expectedSha256.equals(moduleSha256.get(display))) {
+                throw new IllegalArgumentException(
+                        pinningMismatchMessage(display, expectedSha256, moduleSha256.get(display)));
+            }
+            LOGGER.debug("JavaScript module cache hit ({}), returning exports", display);
+            return cached;
+        }
+
+        /**
+         * Evaluates a module's source as CommonJS: pin check, depth check, the
+         * {@code (function (exports, require, module, __filename, __dirname) …)} wrapper and the
+         * cache entry (inserted before the evaluation so a cyclic require sees the partial
+         * exports).
+         * @param display the display path (a project file path or {@code shipped:lib/x.js})
+         * @param content the module source
+         * @param expectedSha256 the pinned SHA-256, or null
+         * @return the module's exports
+         */
+        private Value evaluate(String display, String content, String expectedSha256) {
             String sha256 = sha256Hex(content);
             if (expectedSha256 != null && !expectedSha256.equals(sha256)) {
                 throw new IllegalArgumentException(
