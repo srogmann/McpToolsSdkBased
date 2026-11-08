@@ -72,6 +72,7 @@ public class McpServerMain {
                 "io.modelcontextprotocol.spec.McpServerSession",
                 "reactor.core.Exceptions",
                 "reactor.core.Scannable$Attr$1",
+                "reactor.core.Scannable$Attr$2",
                 "reactor.core.Scannable$Attr$RunStyle",
                 "reactor.core.publisher.FluxFlatMap",
                 "reactor.core.publisher.FluxIterable",
@@ -86,6 +87,7 @@ public class McpServerMain {
                 "reactor.core.publisher.MonoSink",
                 "reactor.core.publisher.MonoWhen$WhenCoordinator",
                 "reactor.core.publisher.Operators",
+                "reactor.core.publisher.SerializedSubscriber",
                 "reactor.core.scheduler.DelegateServiceScheduler",
                 "reactor.core.scheduler.ExecutorScheduler");
 
