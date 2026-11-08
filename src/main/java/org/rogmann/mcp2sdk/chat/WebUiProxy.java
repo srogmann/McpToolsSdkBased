@@ -1452,6 +1452,13 @@ public class WebUiProxy {
      * via {@code cachedTokensKnown}, and server-side usage inconsistencies are emitted as
      * {@code usageWarnings} outside that raw node.</p>
      *
+     * <p>The prefix-cache share has three sources, in this order: {@code usage.prompt_tokens_details
+     * .cached_tokens} (vLLM with {@code --enable-prompt-tokens-details}), then
+     * {@code timings.cache_n} (llama.cpp and maya report it with their timings - for them the first
+     * source never exists), then the {@code /metrics} counter delta when sampling is enabled. All
+     * three end in the same {@code cachedTokensKnown} flag, so consumers never have to know which
+     * backend answered.</p>
+     *
      * @param tsStart         timestamp when the request started
      * @param sseDataLines    collected SSE data line JSON strings
      * @param sampleMetrics   whether the upstream vLLM cache metrics were sampled
@@ -1524,6 +1531,32 @@ public class WebUiProxy {
                     }
                 } else {
                     usageWarnings.add("cached_tokens_not_numeric");
+                }
+            }
+
+            // A backend in the llama.cpp family (llama.cpp, maya) reports the prefix-cache share in
+            // its own timings as cache_n - it has no prompt_tokens_details at all. Read it before
+            // the /metrics fallback: it is a per-request number, the counter delta is a global one.
+            // Consequence of not doing it: cachedTokensKnown=false, i.e. usage.cacheHit "unknown" in
+            // the prefix fork and ppUncachedTPS=0 in the statistics file, although the backend told
+            // us the number.
+            if (!cachedTokensKnown && timingsNode != null && timingsNode.isObject()
+                    && timingsNode.has("cache_n")) {
+                JsonNode cacheNNode = timingsNode.get("cache_n");
+                if (!cacheNNode.isNumber()) {
+                    usageWarnings.add("cache_n_not_numeric");
+                } else {
+                    long reportedCacheN = cacheNNode.asLong();
+                    if (reportedCacheN < 0) {
+                        usageWarnings.add("negative_cached_tokens");
+                    } else if (usageNode.has("prompt_tokens") && reportedCacheN > promptTokens) {
+                        // Same marker the prompt_tokens_details path produces: the value cannot be
+                        // trusted, so it must not enter the record as a confirmed cache share.
+                        usageWarnings.add("cached_tokens_gt_prompt_tokens");
+                    } else {
+                        cachedTokens = reportedCacheN;
+                        cachedTokensKnown = true;
+                    }
                 }
             }
 
@@ -2240,16 +2273,21 @@ public class WebUiProxy {
         // without a single one needs an explanation of its own: either the backend never reported
         // per-chunk counters (stream_options.continuous_usage_stats not in effect at the endpoint
         // the proxy talks to) or every rate was screened out above.
+        // A backend that brings its own timings (llama.cpp, maya) never lands here: those chunks are
+        // forwarded unchanged, which the counter names - it keeps "nothing synthesized" apart from
+        // "nothing synthesized because there was nothing to synthesize".
         if (rewriteFlashReasoning && vllmTiming.timingsChunks == 0) {
             LOG.info("No timings synthesized for the Web UI in this vLLM stream: {} data line(s), {}"
-                            + " carrying usage counters, {} skipped as implausible (model='{}'). Without"
-                            + " per-chunk usage there is nothing to compute a live token/s rate from.",
-                    lineCount, vllmTiming.usageChunks, vllmTiming.implausibleGenerationRates,
-                    getModelName());
+                            + " carrying usage counters, {} kept as backend timings, {} skipped as"
+                            + " implausible (model='{}'). Without per-chunk usage there is nothing to"
+                            + " compute a live token/s rate from.",
+                    lineCount, vllmTiming.usageChunks, vllmTiming.serverTimingsChunks,
+                    vllmTiming.implausibleGenerationRates, getModelName());
         } else if (rewriteFlashReasoning) {
             LOG.debug("Synthesized timings in {} of {} vLLM data line(s) ({} carried usage counters,"
-                            + " model='{}').", vllmTiming.timingsChunks, lineCount,
-                    vllmTiming.usageChunks, getModelName());
+                            + " {} kept as backend timings, model='{}').",
+                    vllmTiming.timingsChunks, lineCount,
+                    vllmTiming.usageChunks, vllmTiming.serverTimingsChunks, getModelName());
         }
     }
 
@@ -2519,6 +2557,16 @@ public class WebUiProxy {
      * past the ceiling without being an artefact. The reasoning rewrite of
      * {@link #rewriteReasoningField} is still applied in the same parse pass.</p>
      *
+     * <p>A chunk that already carries a {@code timings} node is left alone: a backend in the
+     * llama.cpp family (llama.cpp itself, maya) reports its own - with the real
+     * {@code predicted_ms}, with {@code cache_n} and with per-chunk values when the client asked
+     * for {@code timings_per_token} - and a wall-clock estimate could only be worse. This matters
+     * beyond accuracy: such a backend sends {@code usage} exactly once, in the very last chunk, so
+     * the synthesis would open and close the generation phase within that one chunk and report
+     * {@code predicted_ms = 0} - the Web UI divides by it, shows no token/s and hides the whole
+     * statistics block of the finished answer. The guard therefore holds even when the backend is
+     * configured as {@code vllm}.</p>
+     *
      * <p>Package-private instead of private so the unit test (same package) can drive the
      * enrichment without a running backend.</p>
      *
@@ -2541,6 +2589,14 @@ public class WebUiProxy {
         }
 
         boolean changed = rewriteReasoningNode(node);
+
+        // Ein Backend, das llama.cpp-Timings selbst liefert (llama.cpp, maya), ist autoritativ:
+        // die Wanduhr-Schätzung unten ist nur die Notlösung für Backends ohne timings.
+        JsonNode serverTimings = node.get("timings");
+        if (serverTimings != null && serverTimings.isObject()) {
+            timing.serverTimingsChunks++;
+            return changed ? jsonMapper.writeValueAsString(node) : dataLine;
+        }
 
         JsonNode usageNode = node.get("usage");
         if (usageNode != null && usageNode.isObject() && usageNode.has("completion_tokens")) {
@@ -2655,6 +2711,11 @@ public class WebUiProxy {
         boolean genStarted = false;
         /** Data lines that carried a {@code usage} object with completion counters. */
         int usageChunks = 0;
+        /**
+         * Data lines whose {@code timings} node came from the backend itself (llama.cpp, maya) and
+         * was therefore forwarded unchanged - the synthesis must never replace it.
+         */
+        int serverTimingsChunks = 0;
         /** Data lines whose synthesized {@code timings} node was forwarded to the client. */
         int timingsChunks = 0;
         /** Chunks whose synthesized {@code prompt_per_second} was dropped as implausible. */
