@@ -50,9 +50,15 @@ import java.util.zip.ZipInputStream;
  *   <li>{@code search.help()} - help text</li>
  *   <li>{@code search.grep(pattern, target[, options])} - formatted text output</li>
  *   <li>{@code search.find(pattern, target[, options])} - structured result object</li>
- *   <li>{@code search.files(pattern, target[, options])} - array of matching display paths</li>
+ *   <li>{@code search.files(pattern, target[, options])} - display paths of files whose
+ *       content matches</li>
  *   <li>{@code search.hexgrep(hexPattern, target[, options])} - hex pattern, byte search</li>
  * </ul>
+ * <p>
+ * Every call searches file <em>content</em>: the pattern is never a file name and never a
+ * glob (a path filter is {@code include}/{@code exclude}). File names are listed by
+ * {@code fs.readdir()}/{@code fs.listFiles()}.
+ * </p>
  *
  * <h3>Design</h3>
  * <p>
@@ -3643,10 +3649,13 @@ public final class JsSearch {
             "Nothing is ever extracted to disk.",
             "",
             "--- API ---",
+            "Every search.* call searches file CONTENT. The pattern is never a file name and",
+            "never a glob (a path filter is include/exclude); file names are listed by",
+            "fs.readdir() / fs.listFiles().",
             "search.help()                              - this text",
             "search.grep(pattern, target[, options])    - formatted text output (String)",
             "search.find(pattern, target[, options])    - structured result (Object)",
-            "search.files(pattern, target[, options])   - array of display paths with matches",
+            "search.files(pattern, target[, options])   - display paths of files whose CONTENT matches",
             "search.hexgrep(hex, target[, options])     - hex pattern such as \"4d5a . 9000\"",
             "",
             "--- Patterns ---",
@@ -3724,6 +3733,8 @@ public final class JsSearch {
             "            archiveEntriesScanned, skipped, excluded, errors, bytesScanned },",
             "  truncated: boolean, truncatedReason: \"maxMatches\"|null,",
             "  warnings: [string] }",
+            "grep(), files() and hexgrep() output is silent about skipped and excluded sources:",
+            "search.find().counts and .warnings tell how far a scan really reached.",
             "Paths are sorted by Unicode code point, line numbers are 1-based.",
             "Byte search instead: { displayPath, byteOffset, length, hex, text, line: null,",
             "before: [], after: [] } plus previewHex/previewAscii when preview > 0; with",
@@ -3761,7 +3772,5 @@ public final class JsSearch {
             "- archives are recognized by extension only (an extensionless ZIP is plain text),",
             "- no 7z / rar / xz support, no file-type filters (like -t java),",
             "- recursive scanning never stops for a single bad file: problems are counted in",
-            "  counts.skipped / counts.errors and reported in warnings (max " + MAX_WARNINGS + " messages).",
-            "",
-            "See docs/js/search.md for the full specification.");
+            "  counts.skipped / counts.errors and reported in warnings (max " + MAX_WARNINGS + " messages).");
 }
