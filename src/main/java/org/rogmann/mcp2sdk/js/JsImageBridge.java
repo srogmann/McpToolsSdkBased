@@ -3,11 +3,14 @@ package org.rogmann.mcp2sdk.js;
 import org.graalvm.polyglot.Value;
 import org.graalvm.polyglot.proxy.ProxyExecutable;
 import org.graalvm.polyglot.proxy.ProxyObject;
+import org.rogmann.mcp2sdk.image.ImageClient;
 import org.rogmann.mcp2sdk.image.JsImage;
 import org.rogmann.mcp2sdk.image.VisionClient;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -34,13 +37,16 @@ public class JsImageBridge implements JsModuleInterface {
 
     /** Whether a vision model is configured; only then is {@code image.vision} advertised. */
     private final boolean visionConfigured;
+    /** Whether a diffusion endpoint + model is configured ({@code image.generate}). */
+    private final boolean generationConfigured;
 
     /**
-     * Creates the bridge and reads the vision configuration (the summary then advertises
-     * {@code image.vision} only when a gateway URL is set).
+     * Creates the bridge and reads the capability configuration (the summary then advertises
+     * only what this environment can actually do).
      */
     public JsImageBridge() {
         this.visionConfigured = VisionClient.isConfigured();
+        this.generationConfigured = ImageClient.isConfigured();
     }
 
     @Override
@@ -50,16 +56,31 @@ public class JsImageBridge implements JsModuleInterface {
 
     @Override
     public String getSummary() {
-        String summary = "`image.help()` explains image metadata, colour/texture analysis"
-                + " (kind guess), bitmap generation and annotation";
-        return visionConfigured
-                ? summary + ", plus `image.vision()` for a visual-LLM question"
-                : summary;
+        StringBuilder sb = new StringBuilder("`image.help()` explains image metadata,"
+                + " colour/texture analysis (kind guess), bitmap generation and annotation, and"
+                + " the PDF-picture route (`pdf.stream` + `image.fromRaw`)");
+        if (visionConfigured) {
+            sb.append(", `image.describe()`/`image.ocr()`/`image.vision()` for one-shot"
+                    + " visual-LLM answers");
+        }
+        if (generationConfigured) {
+            sb.append(", and `image.generate()`/`image.edit()` against the configured diffusion"
+                    + " endpoint");
+        }
+        return sb.toString();
     }
 
     @Override
     public String getHelpTip() {
-        return "image.help() (images: analysis, drawing)";
+        StringBuilder sb = new StringBuilder("image.help() (images: analysis, drawing, PDF"
+                + " samples");
+        if (visionConfigured) {
+            sb.append(", describe/ocr");
+        }
+        if (generationConfigured) {
+            sb.append(", generate/edit");
+        }
+        return sb.append(")").toString();
     }
 
     @Override
@@ -89,21 +110,21 @@ public class JsImageBridge implements JsModuleInterface {
 
         methods.put("info", (ProxyExecutable) args -> {
             requireArgs(args, "info(pathOrBytes, options?)");
-            PathOrBytes pb = pathOrBytes(box, args[0]);
+            PathOrBytes pb = pathOrBytes(box, args[0], "info");
             return GraalProxies.toProxyObject(box.info(pb.bytes, pb.display,
                     optionsMap("info", arg(args, 1))));
         });
 
         methods.put("analyze", (ProxyExecutable) args -> {
             requireArgs(args, "analyze(pathOrBytes, options?)");
-            PathOrBytes pb = pathOrBytes(box, args[0]);
+            PathOrBytes pb = pathOrBytes(box, args[0], "analyze");
             return GraalProxies.toProxyObject(box.analyze(pb.bytes, pb.display,
                     optionsMap("analyze", arg(args, 1))));
         });
 
         methods.put("open", (ProxyExecutable) args -> {
             requireArgs(args, "open(pathOrBytes, options?)");
-            PathOrBytes pb = pathOrBytes(box, args[0]);
+            PathOrBytes pb = pathOrBytes(box, args[0], "open");
             return box.open(pb.bytes, pb.display, optionsMap("open", arg(args, 1)));
         });
 
@@ -226,7 +247,7 @@ public class JsImageBridge implements JsModuleInterface {
 
         methods.put("preview", (ProxyExecutable) args -> {
             requireArgs(args, 1, "preview(pathOrBytes, options?)");
-            PathOrBytes pb = pathOrBytes(box, args[0]);
+            PathOrBytes pb = pathOrBytes(box, args[0], "preview");
             return box.preview(pb.bytes, pb.display, optionsMap("preview", arg(args, 1)));
         });
 
@@ -247,6 +268,65 @@ public class JsImageBridge implements JsModuleInterface {
         methods.put("fonts", (ProxyExecutable) args ->
                 GraalProxies.toProxyArray(box.fonts()));
 
+        methods.put("fromRaw", (ProxyExecutable) args -> {
+            requireArgs(args, 1, "fromRaw({samples, width, height, colorSpace,"
+                    + " bitsPerComponent}, {format, quality, background}?)");
+            byte[] bytes = box.fromRaw(rawOptions("fromRaw", args[0]),
+                    optionsMap("fromRaw", arg(args, 1)));
+            return GraalProxies.toUint8Array(uint8ArrayCtor, bytes);
+        });
+
+        methods.put("describe", (ProxyExecutable) args -> {
+            requireArgs(args, 1, "describe(source, options?)");
+            Map<String, Object> options = optionsMap("describe", arg(args, 1));
+            if (args[0].isString()) {
+                return GraalProxies.toProxyObject(box.describe(args[0].asString(), options));
+            }
+            ImageSource source = sourceOf(box, args[0], "describe");
+            return GraalProxies.toProxyObject(box.describe(source.bytes(), source.display(),
+                    options));
+        });
+
+        methods.put("ocr", (ProxyExecutable) args -> {
+            requireArgs(args, 1, "ocr(source, options?)");
+            Map<String, Object> options = optionsMap("ocr", arg(args, 1));
+            if (args[0].isString()) {
+                return GraalProxies.toProxyObject(box.ocr(args[0].asString(), options));
+            }
+            ImageSource source = sourceOf(box, args[0], "ocr");
+            return GraalProxies.toProxyObject(box.ocr(source.bytes(), source.display(), options));
+        });
+
+        methods.put("generate", (ProxyExecutable) args -> {
+            requireArgs(args, 1, "generate({prompt, model?, size?, seed?, steps?, format?,"
+                    + " output?, path?, includeBytes?})");
+            return GraalProxies.toProxyObject(box.generate(optionsMap("generate", args[0])));
+        });
+
+        methods.put("edit", (ProxyExecutable) args -> {
+            requireArgs(args, 2, "edit(source, {prompt, …})");
+            List<ImageSource> sources = new ArrayList<>();
+            if (args[0] != null && args[0].hasArrayElements() && !isByteArray(args[0])
+                    && args[0].getArraySize() > 0) {
+                for (long i = 0; i < args[0].getArraySize(); i++) {
+                    sources.add(sourceOf(box, args[0].getArrayElement(i), "edit"));
+                }
+            } else {
+                sources.add(sourceOf(box, args[0], "edit"));
+            }
+            List<byte[]> images = new ArrayList<>(sources.size());
+            for (ImageSource source : sources) {
+                images.add(source.bytes());
+            }
+            String display = sources.size() == 1 ? sources.get(0).display()
+                    : sources.get(0).display() + " (+" + (sources.size() - 1) + ")";
+            return GraalProxies.toProxyObject(box.edit(images, display,
+                    optionsMap("edit", arg(args, 1))));
+        });
+
+        methods.put("status", (ProxyExecutable) args ->
+                GraalProxies.toProxyObject(box.status()));
+
         methods.put("help", (ProxyExecutable) args -> box.help());
 
         return ProxyObject.fromMap(methods);
@@ -256,19 +336,122 @@ public class JsImageBridge implements JsModuleInterface {
     private record PathOrBytes(byte[] bytes, String display) {
     }
 
+    /** One picture argument of {@code describe}/{@code ocr}/{@code edit}. */
+    private record ImageSource(byte[] bytes, String display) {
+    }
+
     /**
-     * Interprets the source argument: a path (or archive display path, read through the
-     * controlled rules) or raw bytes (Uint8Array, the unified byte contract).
+     * Interprets a picture argument: a path (or archive display path or {@code data:} URL), raw
+     * bytes (Uint8Array) or the MCP content shape {@code {type: 'image', data, mimeType}}.
      * @param box the per-call toolbox (path resolution)
      * @param value the JS argument
+     * @param fn function name for messages
+     * @return the bytes plus a display name
+     */
+    private static ImageSource sourceOf(JsImage box, Value value, String fn) {
+        if (value == null || value.isNull()) {
+            throw new IllegalArgumentException("Usage: image." + fn + "(source, options?) - the"
+                    + " source must not be null");
+        }
+        if (value.isString()) {
+            String text = value.asString();
+            if (text.regionMatches(true, 0, "data:", 0, 5)) {
+                return new ImageSource(box.readSourceBytes(text), "<data URL>");
+            }
+            return new ImageSource(box.readSourceBytes(text), text);
+        }
+        if (isByteArray(value)) {
+            return new ImageSource(GraalProxies.toByteArray(value), "<bytes>");
+        }
+        if (value.hasMembers()) {
+            Value type = value.getMember("type");
+            String typeName = type != null && type.isString() ? type.asString() : null;
+            if (typeName != null && !"image".equals(typeName)) {
+                throw new IllegalArgumentException("image." + fn + ": content of type '"
+                        + typeName + "' is not a picture - expected {type: 'image', data,"
+                        + " mimeType}");
+            }
+            Value data = value.getMember("data");
+            if (data == null || data.isNull()) {
+                throw new IllegalArgumentException("image." + fn + ": the content object needs a"
+                        + " 'data' member (Uint8Array)");
+            }
+            Value mime = value.getMember("mimeType");
+            String mimeType = mime != null && mime.isString() ? mime.asString() : "image/unknown";
+            return new ImageSource(GraalProxies.toByteArray(data), "<content " + mimeType + ">");
+        }
+        throw new IllegalArgumentException("image." + fn + ": the source must be a path, a"
+                + " data: URL, a Uint8Array or {type: 'image', data, mimeType}");
+    }
+
+    /**
+     * Whether a JS value is a byte array (typed array or array of numbers) as opposed to an
+     * array of pictures.
+     * @param value the JS value
+     * @return true for a byte-like array
+     */
+    private static boolean isByteArray(Value value) {
+        if (value == null || !value.hasArrayElements()) {
+            return false;
+        }
+        if (value.getArraySize() == 0) {
+            return true;
+        }
+        Value first = value.getArrayElement(0);
+        return first != null && first.isNumber();
+    }
+
+    /**
+     * Converts the raw-sample options of {@code image.fromRaw} - like {@link #optionsMap} but the
+     * {@code samples} member is a {@code Uint8Array} (every other nested value is rejected).
+     * @param fn function name for messages
+     * @param value the JS options argument
+     * @return the map, {@code samples} as {@code byte[]}
+     */
+    private static Map<String, Object> rawOptions(String fn, Value value) {
+        if (value == null || value.isNull() || !value.hasMembers() || value.hasArrayElements()) {
+            throw new IllegalArgumentException("Usage: image." + fn + "({samples: Uint8Array,"
+                    + " width, height, colorSpace, bitsPerComponent}, {format}?)");
+        }
+        Map<String, Object> options = new LinkedHashMap<>();
+        for (String key : value.getMemberKeys()) {
+            Value member = value.getMember(key);
+            if (member == null || member.isNull()) {
+                continue;
+            }
+            if ("samples".equals(key)) {
+                if (!member.hasArrayElements()) {
+                    throw new IllegalArgumentException("image." + fn + ": 'samples' must be a"
+                            + " Uint8Array (e.g. pdf.stream(path, objNum))");
+                }
+                options.put(key, GraalProxies.toByteArray(member));
+            } else if (member.isBoolean()) {
+                options.put(key, member.asBoolean());
+            } else if (member.isNumber()) {
+                options.put(key, GraalProxies.fromValue(member));
+            } else if (member.isString()) {
+                options.put(key, member.asString());
+            } else {
+                throw new IllegalArgumentException("image." + fn + ": option '" + key
+                        + "' must be a flat value (string, number, boolean) - got an object"
+                        + " or array");
+            }
+        }
+        return options;
+    }
+
+    /**
+     * Interprets the source argument of the analysis functions: a path (or archive display path
+     * or {@code data:} URL), raw bytes (Uint8Array) or the MCP content shape
+     * {@code {type: 'image', data, mimeType}}.
+     * @param box the per-call toolbox (path resolution)
+     * @param value the JS argument
+     * @param fn function name for messages
      * @return raw bytes plus display name
      */
-    private static PathOrBytes pathOrBytes(JsImage box, Value value) {
-        if (value != null && value.isString()) {
-            String path = value.asString();
-            return new PathOrBytes(box.readSourceBytes(path), path);
-        }
-        return new PathOrBytes(GraalProxies.toByteArray(value), "<bytes>");
+    private static PathOrBytes pathOrBytes(JsImage box, Value value, String fn) {
+        ImageSource source = sourceOf(box, value, fn);
+        return new PathOrBytes(source.bytes(), source.display());
     }
 
     /**

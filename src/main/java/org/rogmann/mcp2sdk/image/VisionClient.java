@@ -102,6 +102,18 @@ public class VisionClient {
     /** The Spring environment, injected by McpConfig (same pattern as the other tools). */
     private static volatile Environment environment;
 
+    /**
+     * Per-call overrides of the configured request - what {@code image.describe}/{@code image.ocr}
+     * pass through (the configured values stay the defaults).
+     * @param model model name to use instead of the configured one, or {@code null}
+     * @param maxTokens upper bound of the answer in tokens ({@code max_tokens} /
+     *                  {@code max_output_tokens}), or {@code null} to send nothing
+     * @param timeoutSeconds read timeout instead of {@code webui.vision.timeoutSeconds}, or
+     *                       {@code null}
+     */
+    public record AskOptions(String model, Integer maxTokens, Integer timeoutSeconds) {
+    }
+
     private final boolean enabled;
     private final boolean hasVision;
     private final String apiMode;
@@ -209,6 +221,19 @@ public class VisionClient {
      *         hint for a non-vision model mapped onto the message)
      */
     public Map<String, Object> ask(String prompt, String imageDataUrl) {
+        return ask(prompt, imageDataUrl, null);
+    }
+
+    /**
+     * Sends one vision request with per-call overrides and parses the single JSON response.
+     * @param prompt the question about the image
+     * @param imageDataUrl the image as {@code data:image/...;base64,...}
+     * @param overrides model/maxTokens/timeout of this call, or {@code null} for the properties
+     * @return map {@code {text, model, usage: {inputTokens, outputTokens, totalTokens}}}
+     * @throws JsUserRuntimeException on configuration, transport or protocol errors (with the
+     *         hint for a non-vision model mapped onto the message)
+     */
+    public Map<String, Object> ask(String prompt, String imageDataUrl, AskOptions overrides) {
         if (!enabled) {
             throw new JsUserRuntimeException("image.vision: the feature is switched off ("
                     + PROP_ENABLED + "=false) - remove the property or set it to 'true'");
@@ -224,12 +249,17 @@ public class VisionClient {
                     + PROP_URL + " (the current model's gateway) or " + PROP_VISION_URL
                     + "; see docs/js/image.md §7");
         }
-        String requestBody = buildRequest(prompt, imageDataUrl);
-        LOG.debug("Vision request to {} (api {}, model {}, image {} chars)", endpointUrl, apiMode,
-                model, imageDataUrl.length());
+        String modelName = overrides != null && overrides.model() != null
+                && !overrides.model().isBlank() ? overrides.model().trim() : model;
+        Integer maxTokens = overrides != null ? overrides.maxTokens() : null;
+        int requestTimeout = overrides != null && overrides.timeoutSeconds() != null
+                ? overrides.timeoutSeconds() : timeoutSeconds;
+        String requestBody = buildRequest(prompt, imageDataUrl, modelName, maxTokens);
+        LOG.debug("Vision request to {} (api {}, model {}, maxTokens {}, image {} chars)",
+                endpointUrl, apiMode, modelName, maxTokens, imageDataUrl.length());
 
-        String responseBody = post(requestBody);
-        return parseResponse(responseBody);
+        String responseBody = post(requestBody, requestTimeout);
+        return parseResponse(responseBody, modelName);
     }
 
     /**
@@ -241,10 +271,14 @@ public class VisionClient {
      * @param imageDataUrl the base64 data URL
      * @return the JSON string
      */
-    private String buildRequest(String prompt, String imageDataUrl) {
+    private String buildRequest(String prompt, String imageDataUrl, String modelName,
+                                Integer maxTokens) {
         ObjectNode request = jsonMapper.createObjectNode();
-        request.put("model", model);
+        request.put("model", modelName);
         if ("responses".equals(apiMode)) {
+            if (maxTokens != null) {
+                request.put("max_output_tokens", maxTokens.intValue());
+            }
             ArrayNode input = request.putArray("input");
             ObjectNode message = input.addObject();
             message.put("role", "user");
@@ -268,6 +302,9 @@ public class VisionClient {
             ObjectNode imageUrl = imagePart.putObject("image_url");
             imageUrl.put("url", imageDataUrl);
         }
+        if (maxTokens != null && !"responses".equals(apiMode)) {
+            request.put("max_tokens", maxTokens.intValue());
+        }
         request.put("stream", false);
         return jsonMapper.writeValueAsString(request);
     }
@@ -277,9 +314,10 @@ public class VisionClient {
      * {@link JsUserRuntimeException} (the error body is quoted and logged, a non-vision model
      * gets the configuration hint).
      * @param requestBody JSON request
+     * @param timeoutSeconds read timeout of this request
      * @return response body
      */
-    private String post(String requestBody) {
+    private String post(String requestBody, int timeoutSeconds) {
         HttpURLConnection connection;
         try {
             URL url = URI.create(endpointUrl).toURL();
@@ -367,9 +405,10 @@ public class VisionClient {
      * first, with the Responses-API shape ({@code output[].message}) as a tolerant fallback;
      * {@code usage} accepts both token namings.
      * @param responseBody the response body
+     * @param modelName the model the request named (reported when the answer names none)
      * @return map {@code {text, model, usage: {inputTokens, outputTokens, totalTokens}}}
      */
-    private Map<String, Object> parseResponse(String responseBody) {
+    private Map<String, Object> parseResponse(String responseBody, String modelName) {
         JsonNode root;
         try {
             root = jsonMapper.readTree(responseBody);
@@ -421,7 +460,7 @@ public class VisionClient {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("text", text.toString());
         String reportedModel = root.path("model").asString();
-        result.put("model", reportedModel.isEmpty() ? model : reportedModel);
+        result.put("model", reportedModel.isEmpty() ? modelName : reportedModel);
         result.put("usage", usage);
         return result;
     }

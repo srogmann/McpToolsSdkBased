@@ -6,6 +6,9 @@ import org.rogmann.mcp2sdk.js.JsUserRuntimeException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
+
 import javax.imageio.IIOException;
 import javax.imageio.IIOImage;
 import javax.imageio.ImageIO;
@@ -30,10 +33,13 @@ import java.awt.geom.Path2D;
 import java.awt.geom.Rectangle2D;
 import java.awt.image.AffineTransformOp;
 import java.awt.image.BufferedImage;
+import java.awt.image.Raster;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
@@ -46,6 +52,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -66,36 +73,48 @@ import java.util.Set;
  * <ul>
  *   <li>paths go through {@link JsArchive#entryBytes(String)} (project base, no traversal,
  *       archive display paths {@code a.zip#pic.png} read per level from memory) and are
- *       additionally capped at {@value #MAX_FILE_BYTES} bytes,</li>
+ *       additionally capped at {@link ImageLimits#maxInputBytes()} bytes (property
+ *       {@code mcp.js.image.maxInputBytes}),</li>
  *   <li>decompression-bomb guard: the image dimensions are read from the format header
- *       <em>before</em> the raster is decoded; more than {@value #MAX_PIXELS} pixels are
- *       rejected by every decoding function ({@code open}/{@code analyze}) - {@code info()}
+ *       <em>before</em> the raster is decoded; more than {@link ImageLimits#maxPixels()} pixels
+ *       are rejected by every decoding function ({@code open}/{@code analyze}) - {@code info()}
  *       keeps reporting the claimed header dimensions, so the diagnosis "what does this file
  *       claim?" stays possible,</li>
- *   <li>the sum of all open rasters per call is capped at {@value #RASTER_BUDGET_BYTES}
- *       bytes (32-bit ARGB raster + raw file bytes).</li>
+ *   <li>the sum of all open rasters per call is capped at
+ *       {@link ImageLimits#rasterBudgetBytes()} bytes (32-bit ARGB raster + raw file bytes),
+ *       the result of a call at {@link ImageLimits#maxOutputBytes()}.</li>
  * </ul>
+ * <p>
+ * The numbers are properties ({@link ImageLimits}, resolved once at startup by
+ * {@code McpConfig}) and are printed by {@code image.help()} and {@code image.status()} - a
+ * limit the code obeys and one the help names cannot drift apart that way.
+ * </p>
  */
 public class JsImage implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(JsImage.class);
 
-    /** Maximum accepted encoded input size (64 MiB). */
-    public static final long MAX_FILE_BYTES = 64L * 1024 * 1024;
-    /** Maximum decoded pixels per image - open/analyze reject the bomb, info reports the claim. */
-    public static final long MAX_PIXELS = 32L * 1024 * 1024;
     /** Maximum side length of a created/opened image. */
     public static final int MAX_SIDE = 32768;
-    /** Raster budget per call: sum over open handles of (ARGB raster + raw file bytes). */
-    public static final long RASTER_BUDGET_BYTES = 256L * 1024 * 1024;
     /** Default analysis budget in pixels; larger images are sampled by a grid stride. */
     public static final int DEFAULT_ANALYSIS_BUDGET = 4 * 1024 * 1024;
     /** Full-resolution structure window (one quadrant) budget in pixels. */
     private static final int STRUCTURE_TILE_BUDGET = 1024 * 1024;
-    /** Maximum region size of one getPixels/putPixels transfer. */
-    private static final long MAX_TRANSFER_PIXELS = 16L * 1024 * 1024;
     /** Allowed histogram bin counts. */
     private static final Set<Integer> HISTOGRAM_BINS = Set.of(16, 32, 64, 128, 256);
+    /** Longest prompt {@code image.generate}/{@code image.edit} accepts (characters). */
+    private static final int MAX_PROMPT_CHARS = 800;
+    /** Source pictures one {@code image.edit} sends (the reference server accepts several). */
+    private static final int MAX_EDIT_SOURCES = 4;
+
+    /** The web server {@code output: 'demo'} publishes to (registered once at startup). */
+    private static volatile LocalWebServerConfig localWebServer;
+
+    /** JSON reader of {@code describe} (Jackson 3, like {@code VisionClient}). */
+    private static final JsonMapper JSON_MAPPER = JsonMapper.builder().build();
+
+    /** The limits in effect: read per call, so a test can install its own. */
+    private final ImageLimits limits;
 
     /** The per-call open images, handle name -&gt; entry. Insertion-ordered for messages. */
     private final LinkedHashMap<String, OpenedImage> images = new LinkedHashMap<>();
@@ -113,7 +132,31 @@ public class JsImage implements AutoCloseable {
      * Creates the toolbox.
      */
     public JsImage() {
-        // per-call state only
+        this.limits = ImageLimits.current();
+    }
+
+    /**
+     * Registers the web server {@code output: 'demo'} publishes pictures to (called once from
+     * {@code McpConfig}). Static on purpose: a {@code JsImage} instance lives for one script
+     * call, the configuration outlives it (see {@link LocalWebServerConfig}).
+     * @param config the server, or {@code null} to switch the demo output off
+     */
+    public static void setLocalWebServer(LocalWebServerConfig config) {
+        localWebServer = config;
+    }
+
+    /**
+     * @return the registered web server, or {@code null}
+     */
+    public static LocalWebServerConfig localWebServer() {
+        return localWebServer;
+    }
+
+    /**
+     * @return the limits this instance works with
+     */
+    public ImageLimits limits() {
+        return limits;
     }
 
     // ========================================================================
@@ -248,10 +291,10 @@ public class JsImage implements AutoCloseable {
             throw new JsUserRuntimeException(
                     "image.create: width and height are required (e.g. {width: 640, height: 400})");
         }
-        if ((long) width * height > MAX_PIXELS) {
+        if ((long) width * height > limits.maxPixels()) {
             throw new JsUserRuntimeException(String.format(
                     "image.create: %dx%d = %d pixels exceeds the limit of %d pixels",
-                    width, height, (long) width * height, MAX_PIXELS));
+                    width, height, (long) width * height, limits.maxPixels()));
         }
         String colorSpec = stringOpt(fn, options, "background", "transparent");
         int background = parseColor(fn, "background", colorSpec);
@@ -297,7 +340,9 @@ public class JsImage implements AutoCloseable {
                     "image.encode: format must be one of 'png', 'jpeg', 'gif', 'bmp' (got '%s')",
                     format));
         }
-        return writeImage(img, format, quality, opened.display());
+        byte[] bytes = writeImage(img, format, quality, opened.display());
+        checkOutputBytes(fn, bytes);
+        return bytes;
     }
 
     /**
@@ -381,10 +426,111 @@ public class JsImage implements AutoCloseable {
                   //    sent as base64 data URL.
                   image.fonts()                           // installed font families (debug aid)
 
-                Limits: files up to 64 MiB, images up to 33554432 pixels (decompression-bomb guard;
-                info() reports the claimed dimensions without decoding), analysis samples large
-                images down to 4194304 pixels ({sample: 1} forces full). See docs/js/image.md.
-                """;
+                Raw samples - the PDF way (pdf.stream() delivers a JPEG unchanged, other filters
+                as decoded samples; nothing needs RGBA expansion in the script):
+                  var it = pdf.placement("doc.pdf", {what: ['images']}).pages[0].items[0];
+                  // pdf.placement() caps a page at maxItems (default 1000): compare
+                  // summary.beyondBudget / walk.itemsBeyondBudget before trusting "no image"
+                  var bytes = pdf.stream("doc.pdf", it.objNum);
+                  if (it.filter === 'DCTDecode') {
+                      image.info(bytes);                  // a complete JPEG already
+                      image.describe(bytes, {format: 'json'});
+                  } else {
+                      var png = image.fromRaw({samples: bytes, width: it.width, height: it.height,
+                                               colorSpace: it.colourSpace,
+                                               bitsPerComponent: it.bitsPerComponent},
+                                              {format: 'png'});
+                      image.describe(png, {format: 'json'});
+                  }
+
+                Reading a picture - one shot, structured answer (needs webui.hasVision=true):
+                  image.describe(src, {format: 'json', language: 'de'})
+                  // -> {format: 'json', title, description, keywords, model, usage};
+                  //    an answer that is not valid JSON falls back to
+                  //    {format: 'text', text, parseError: true}
+                  image.ocr("scan.png", {language: 'de'})
+                  // -> {text, language, model, usage}
+                  // src: handle, path, archive path, Uint8Array, data: URL or
+                  // {type: 'image', data, mimeType}; scaled to max side 1568, never returned
+
+                Generating and editing (diffusion endpoint; both keep the picture out of the
+                conversation unless you ask for bytes):
+                  image.generate({prompt: 'a dragon over the Green Mountains', output: 'demo'})
+                  // -> {width, height, format, bytes, model, seed, url, imageUrl, path}
+                  image.edit("photo.png", {prompt: 'make the sky a sunset'})
+                  image.edit([a, b], {prompt: 'merge both scenes'})   // up to 4 sources
+                  // output: 'none' (default: metadata only) | 'demo' (gallery page);
+                  // includeBytes: true adds data (Uint8Array) - only to pass it on inside this
+                  // script, never to paste it into an answer
+                  // negativePrompt is accepted but never sent (the endpoint has no such
+                  // field); the answer says negativePromptIgnored: true
+
+                Showing a picture in an answer: as a Markdown LINK, nothing else -
+                  [generated image](<url>) or [annotated file](<path>).
+                  No HTML, no <img>, no base64 image in the answer text.
+
+                {{limits}}
+                """.replace("{{limits}}", limitsParagraph())
+                + dynamicHelp();
+    }
+
+    /**
+     * The limits paragraph of the help text, rendered from {@link ImageLimits} - a number the
+     * code obeys and one the help names cannot drift apart that way.
+     * @return the paragraph
+     */
+    private String limitsParagraph() {
+        StringBuilder sb = new StringBuilder("Limits (properties, validated at startup; ");
+        sb.append("image.status() prints them):\n");
+        sb.append("  ").append(ImageLimits.PROP_MAX_INPUT_BYTES).append(" = ")
+                .append(limits.maxInputBytes()).append(" bytes (input: file, bytes, data URL)\n");
+        sb.append("  ").append(ImageLimits.PROP_MAX_OUTPUT_BYTES).append(" = ")
+                .append(limits.maxOutputBytes()).append(" bytes (encode/fromRaw/toDataUrl)\n");
+        sb.append("  ").append(ImageLimits.PROP_MAX_PIXELS).append(" = ")
+                .append(limits.maxPixels()).append(" pixels (decompression-bomb guard; info()\n")
+                .append("  reports the claimed dimensions without decoding), analysis samples\n")
+                .append("  down to ").append(DEFAULT_ANALYSIS_BUDGET).append(" pixels ({sample: 1}")
+                .append(" forces full)\n");
+        sb.append("  ").append(ImageLimits.PROP_RASTER_BUDGET_BYTES).append(" = ")
+                .append(limits.rasterBudgetBytes()).append(" bytes of raster per call, ")
+                .append(ImageLimits.PROP_MAX_TRANSFER_PIXELS).append(" = ")
+                .append(limits.maxTransferPixels()).append(" pixels per getPixels/putPixels\n");
+        sb.append("  ").append(ImageLimits.PROP_TIMEOUT_SECONDS).append(" = ")
+                .append(limits.timeoutSeconds()).append(" s HTTP timeout for generate/edit -")
+                .append(" raise it AND the script's\n  timeoutSeconds when a diffusion run needs")
+                .append(" longer. See docs/js/image.md.");
+        return sb.toString();
+    }
+
+    /**
+     * The capability paragraph: what is configured here, with the reason when something is off.
+     * Same facts as {@link #status()}, so the help never advertises an endpoint that is not
+     * configured.
+     * @return the paragraph
+     */
+    private static String dynamicHelp() {
+        StringBuilder sb = new StringBuilder("\n\nThis environment:\n");
+        sb.append("  webui.hasVision / gateway: ").append(VisionClient.isConfigured()
+                ? "vision-capable model configured - describe/ocr/vision available"
+                : "off - set webui.hasVision=true and webui.model.url for describe/ocr/vision");
+        sb.append('\n').append("  image.generate/edit: ").append(ImageClient.isConfigured()
+                ? "endpoint configured (" + ImageClient.PROP_GEN_MODEL + " is set)"
+                : "off - set " + ImageClient.PROP_GEN_MODEL + " (e.g. 'Qwen/Qwen-Image-2.1')"
+                        + " and the gateway");
+        LocalWebServerConfig server = localWebServer;
+        sb.append('\n').append("  output 'demo': ");
+        if (server == null) {
+            sb.append("off - no web server registered (use output: 'none' with path: '…')");
+        } else {
+            sb.append(server.getWebServerDir());
+            if (server.isActive()) {
+                sb.append(" (server active)");
+            } else {
+                String reason = server.unavailableReason();
+                sb.append(" (no URL").append(reason == null ? "" : ": " + reason).append(")");
+            }
+        }
+        return sb.toString();
     }
 
     /**
@@ -404,19 +550,94 @@ public class JsImage implements AutoCloseable {
     }
 
     /**
-     * Reads the bytes behind a path or archive display path
+     * Reads the bytes behind a path, an archive display path or a {@code data:} URL
      * (project base, no traversal, per-level in-memory archive access).
-     * @param path path relative to the project base, or an archive display path
+     * @param path path relative to the project base, an archive display path, or a
+     *             {@code data:image/...} URL
      * @return raw bytes
      */
     public byte[] readSourceBytes(String path) {
-        byte[] data = JsArchive.entryBytes(path);
-        if (data.length > MAX_FILE_BYTES) {
-            throw new JsUserRuntimeException(String.format(
-                    "image: '%s' has %d bytes, exceeding the image limit of %d bytes",
-                    path, data.length, MAX_FILE_BYTES));
+        byte[] data = path != null && path.regionMatches(true, 0, "data:", 0, 5)
+                ? decodeDataUrl(path) : JsArchive.entryBytes(path);
+        if (data.length > limits.maxInputBytes()) {
+            throw new JsUserRuntimeException(String.format(Locale.ROOT,
+                    "image: '%s' has %d bytes, exceeding the input limit of %d bytes (property"
+                            + " %s)", displayOf(path), data.length, limits.maxInputBytes(),
+                    ImageLimits.PROP_MAX_INPUT_BYTES));
         }
         return data;
+    }
+
+    /**
+     * Decodes a {@code data:} URL - base64 ({@code data:image/png;base64,…}) or
+     * percent-encoded. The MIME type is not needed: the format is sniffed from the bytes.
+     * <p>
+     * The percent-decoding is done here and not through {@code java.net.URLDecoder}: that class
+     * returns a {@code String} (and treats {@code +} as a space, which a data URL does not), while
+     * a data URL carries <em>bytes</em> - an image payload percent-encoded byte by byte must come
+     * out unchanged.
+     * </p>
+     * @param dataUrl the URL
+     * @return the decoded bytes
+     */
+    static byte[] decodeDataUrl(String dataUrl) {
+        int comma = dataUrl.indexOf(',');
+        if (comma < 0) {
+            throw new JsUserRuntimeException("image: a data URL must look like"
+                    + " 'data:image/png;base64,…' (no comma found)");
+        }
+        String meta = dataUrl.substring(5, comma).toLowerCase(Locale.ROOT);
+        String payload = dataUrl.substring(comma + 1);
+        if (meta.contains(";base64")) {
+            try {
+                return Base64.getMimeDecoder().decode(payload);
+            } catch (IllegalArgumentException e) {
+                throw new JsUserRuntimeException("image: the data URL could not be decoded: "
+                        + e.getMessage(), e);
+            }
+        }
+        return percentDecode(payload);
+    }
+
+    /**
+     * Decodes {@code %XX} escapes into bytes; everything else is UTF-8 text (RFC 2397 data URLs
+     * are ASCII apart from explicit escapes).
+     * @param payload the part after the comma
+     * @return the bytes
+     */
+    private static byte[] percentDecode(String payload) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(payload.length());
+        for (int i = 0; i < payload.length(); i++) {
+            char c = payload.charAt(i);
+            if (c == '%' && i + 2 < payload.length()) {
+                int hi = Character.digit(payload.charAt(i + 1), 16);
+                int lo = Character.digit(payload.charAt(i + 2), 16);
+                if (hi >= 0 && lo >= 0) {
+                    out.write((hi << 4) | lo);
+                    i += 2;
+                    continue;
+                }
+            }
+            if (c < 0x80) {
+                out.write(c);
+            } else {
+                out.writeBytes(String.valueOf(c).getBytes(StandardCharsets.UTF_8));
+            }
+        }
+        return out.toByteArray();
+    }
+
+    /**
+     * A short, loggable form of a source: a data URL would flood every message with its payload.
+     * @param path the source string
+     * @return the display form
+     */
+    private static String displayOf(String path) {
+        if (path != null && path.regionMatches(true, 0, "data:", 0, 5)) {
+            int comma = path.indexOf(',');
+            return comma > 0 ? path.substring(0, comma) + ",…" : "data:…";
+        }
+        return String.valueOf(path);
     }
 
     /**
@@ -498,12 +719,84 @@ public class JsImage implements AutoCloseable {
     }
 
     /**
+     * Converts a 4-band (CMYK) raster to RGB.
+     * <p>
+     * The JDK's JPEG reader hands the samples out as they are stored. An <em>Adobe</em> CMYK JPEG
+     * ({@code APP14} marker, {@code transform 0}) stores them inverted - 0 means full ink -, and
+     * the reader's own conversion {@code (1−c)(1−k)} then turns a white newspaper background into
+     * a 100 % black area (measured on a title page: a 337×65 logo came out as mean rgb (0,0,0)).
+     * The samples are therefore un-inverted first, and the ink is converted the way the print
+     * formula has it: {@code R = (255−C)(255−K)/255} (likewise G/M, B/Y).
+     * </p>
+     * @param raster a raster with four bands (C, M, Y, K)
+     * @param invertedSamples whether the four channels are stored inverted (Adobe convention)
+     * @return an opaque {@code TYPE_INT_RGB} raster
+     */
+    static BufferedImage cmykToRgb(Raster raster, boolean invertedSamples) {
+        int width = raster.getWidth();
+        int height = raster.getHeight();
+        BufferedImage rgb = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
+        int[] row = new int[width];
+        int[] pixel = new int[4];
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                raster.getPixel(x, y, pixel);
+                int c = pixel[0];
+                int m = pixel[1];
+                int yellow = pixel[2];
+                int k = pixel[3];
+                if (invertedSamples) {
+                    c = 255 - c;
+                    m = 255 - m;
+                    yellow = 255 - yellow;
+                    k = 255 - k;
+                }
+                row[x] = 0xFF000000
+                        | ((255 - c) * (255 - k) / 255) << 16
+                        | ((255 - m) * (255 - k) / 255) << 8
+                        | ((255 - yellow) * (255 - k) / 255);
+            }
+            rgb.setRGB(0, y, width, 1, row, 0, width);
+        }
+        return rgb;
+    }
+
+    /**
+     * Whether a JPEG carries the {@code APP14} "Adobe" marker with {@code transform 0} - the
+     * convention under which a four-channel (CMYK) JPEG stores its samples inverted.
+     * <p>
+     * Only the marker segments in front of the first {@code SOS} are looked at, so a byte
+     * sequence inside the compressed data cannot be mistaken for the marker.
+     * </p>
+     * @param data the JPEG bytes
+     * @return true for an Adobe CMYK JPEG
+     */
+    static boolean isAdobeCmykJpeg(byte[] data) {
+        if (data == null || data.length < 18) {
+            return false;
+        }
+        for (int i = 0; i + 16 < data.length; i++) {
+            int marker = ((data[i] & 0xFF) << 8) | (data[i + 1] & 0xFF);
+            if (marker == 0xFFDA) {
+                return false;                       // start of scan: no marker behind this point
+            }
+            // Table B.5: length (2) "Adobe" (5) version (2) flags0 (2) flags1 (2) transform (1)
+            if (marker == 0xFFEE && (data[i + 2] & 0xFF) == 0x00 && (data[i + 3] & 0xFF) == 0x0E
+                    && data[i + 4] == 'A' && data[i + 5] == 'd' && data[i + 6] == 'o'
+                    && data[i + 7] == 'b' && data[i + 8] == 'e') {
+                return (data[i + 15] & 0xFF) == 0;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Decodes the raster after the header-level pixel guard.
      * @param data raw bytes
      * @param display display path for messages
      * @return the decoded image
      */
-    private static BufferedImage decodeCapped(byte[] data, String display) {
+    private BufferedImage decodeCapped(byte[] data, String display) {
         ByteArrayInputStream bin = new ByteArrayInputStream(data);
         ImageInputStream iis = new MemoryCacheImageInputStream(bin);
         Iterator<ImageReader> readers = ImageIO.getImageReaders(iis);
@@ -518,13 +811,20 @@ public class JsImage implements AutoCloseable {
             int width = reader.getWidth(0);
             int height = reader.getHeight(0);
             long pixels = (long) width * height;
-            if (pixels > MAX_PIXELS) {
+            if (pixels > limits.maxPixels()) {
                 throw new JsUserRuntimeException(String.format(
                         "image: '%s' claims %dx%d = %d pixels, exceeding the limit of %d pixels"
                                 + " (decompression-bomb guard)", display, width, height, pixels,
-                        MAX_PIXELS));
+                        limits.maxPixels()));
             }
-            return reader.read(0);
+            BufferedImage decoded = reader.read(0);
+            if (decoded.getRaster().getNumBands() == 4 && !decoded.getColorModel().hasAlpha()) {
+                // CMYK (the JDK reads it as four bands without alpha; an RGBA image always has
+                // alpha, so it never lands here). An Adobe JPEG stores the samples inverted, so
+                // the reader's own conversion would turn white into black.
+                return cmykToRgb(decoded.getRaster(), isAdobeCmykJpeg(data));
+            }
+            return decoded;
         } catch (IIOException e) {
             throw new JsUserRuntimeException("image: decode of '" + display + "' failed ("
                     + safeFormatName(reader) + "): " + e.getMessage() + " (file truncated or"
@@ -1702,10 +2002,10 @@ public class JsImage implements AutoCloseable {
                     "image.%s: region %d,%d %dx%d leaves the raster of %dx%d",
                     fn, x, y, width, height, img.getWidth(), img.getHeight()));
         }
-        if ((long) width * height > MAX_TRANSFER_PIXELS) {
+        if ((long) width * height > limits.maxTransferPixels()) {
             throw new JsUserRuntimeException(String.format(Locale.ROOT,
                     "image.%s: region %dx%d = %d pixels exceeds the transfer limit of %d pixels",
-                    fn, width, height, (long) width * height, MAX_TRANSFER_PIXELS));
+                    fn, width, height, (long) width * height, limits.maxTransferPixels()));
         }
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("width", width);
@@ -1814,10 +2114,10 @@ public class JsImage implements AutoCloseable {
                         / oldWidth));
             }
         }
-        if ((long) newWidth * newHeight > MAX_PIXELS) {
+        if ((long) newWidth * newHeight > limits.maxPixels()) {
             throw new JsUserRuntimeException(String.format(Locale.ROOT,
                     "image.resize: %dx%d = %d pixels exceeds the limit of %d pixels",
-                    newWidth, newHeight, (long) newWidth * newHeight, MAX_PIXELS));
+                    newWidth, newHeight, (long) newWidth * newHeight, limits.maxPixels()));
         }
         boolean smooth = switch (stringOpt(fn, options, "hint", "smooth")) {
             case "smooth" -> true;
@@ -1857,7 +2157,8 @@ public class JsImage implements AutoCloseable {
             return toDataUrl(opened.image(), opened.display(), options);
         }
         byte[] data = readSourceBytes(handleOrPath);
-        return toDataUrl(decodeCapped(data, handleOrPath), handleOrPath, options);
+        return toDataUrl(decodeCapped(data, displayOf(handleOrPath)), displayOf(handleOrPath),
+                options);
     }
 
     /**
@@ -1881,8 +2182,26 @@ public class JsImage implements AutoCloseable {
      */
     private String toDataUrl(BufferedImage img, String display, Map<String, Object> options) {
         EncodedImage encoded = encodeForDataUrl("toDataUrl", img, display, options);
-        return "data:image/" + encoded.format() + ";base64,"
+        String url = "data:image/" + encoded.format() + ";base64,"
                 + Base64.getEncoder().encodeToString(encoded.bytes());
+        checkOutputBytes("toDataUrl", url.getBytes(StandardCharsets.UTF_8));
+        return url;
+    }
+
+    /**
+     * Rejects a result above {@link ImageLimits#maxOutputBytes()} - one place for every
+     * function that hands bytes (or a data URL) back.
+     * @param fn function name for the message
+     * @param bytes the result
+     */
+    private void checkOutputBytes(String fn, byte[] bytes) {
+        if (bytes.length > limits.maxOutputBytes()) {
+            throw new JsUserRuntimeException(String.format(Locale.ROOT,
+                    "image.%s: the result has %d bytes, exceeding the output limit of %d bytes"
+                            + " (property %s) - use a smaller image, {quality: …} or format"
+                            + " 'jpeg'", fn, bytes.length, limits.maxOutputBytes(),
+                    ImageLimits.PROP_MAX_OUTPUT_BYTES));
+        }
     }
 
     /**
@@ -1966,7 +2285,8 @@ public class JsImage implements AutoCloseable {
             return vision(opened.image(), opened.display(), prompt, options);
         }
         byte[] data = readSourceBytes(handleOrPath);
-        return vision(decodeCapped(data, handleOrPath), handleOrPath, prompt, options);
+        return vision(decodeCapped(data, displayOf(handleOrPath)), displayOf(handleOrPath),
+                prompt, options);
     }
 
     /**
@@ -2034,6 +2354,929 @@ public class JsImage implements AutoCloseable {
         result.put("image", imageInfo);
         return result;
     }
+
+    // ========================================================================
+    // Raw samples (PDF images: image.fromRaw)
+    // ========================================================================
+
+    /** A colour space the raw-sample reader understands: name plus components per pixel. */
+    private record ColourSpace(String name, int components) {
+    }
+
+    /**
+     * Builds an image from raw samples - the second half of the PDF image chain
+     * ({@code pdf.stream(path, objNum)} delivers a JPEG for {@code /DCTDecode} and the decoded
+     * samples for {@code /FlateDecode}). No RGBA expansion in the script: the samples,
+     * {@code width}, {@code height}, {@code colorSpace} and {@code bitsPerComponent} go in as
+     * {@code pdf.placement()} reports them.
+     * <p>
+     * Supported: 8-bit {@code /DeviceGray} ({@code /G}), {@code /DeviceRGB} ({@code /RGB}),
+     * {@code /DeviceCMYK} ({@code /CMYK}), straight RGBA, {@code /CalGray}, {@code /CalRGB} and
+     * {@code /ICCBased} with an explicit {@code components: 1|3|4}; 1-bit bilevel (gray).
+     * Everything else is refused with a message that names the space - a guessed expansion would
+     * produce a plausible wrong picture, which is worse than none.
+     * </p>
+     * @param raw {@code {samples, width, height, colorSpace, bitsPerComponent, predictor?,
+     *            rowBytes?, components?}}
+     * @param options {@code {format} ({@code 'png'} default, {@code 'jpeg'}, {@code 'gif'},
+     *                {@code 'bmp'}), {@code quality}, {@code background}}
+     * @return encoded image bytes
+     */
+    public byte[] fromRaw(Map<String, Object> raw, Map<String, Object> options) {
+        String fn = "fromRaw";
+        requireKnown(fn, raw, "samples", "width", "height", "colorSpace", "bitsPerComponent",
+                "predictor", "rowBytes", "components");
+        requireKnown(fn, options, "format", "quality", "background");
+        Object samplesValue = raw == null ? null : raw.get("samples");
+        if (!(samplesValue instanceof byte[] samples)) {
+            throw new JsUserRuntimeException("image.fromRaw: 'samples' must be a Uint8Array"
+                    + " (e.g. the result of pdf.stream(path, objNum))");
+        }
+        int width = intOpt(fn, raw, "width", 0, 1, MAX_SIDE);
+        int height = intOpt(fn, raw, "height", 0, 1, MAX_SIDE);
+        if (width == 0 || height == 0) {
+            throw new JsUserRuntimeException("image.fromRaw: 'width' and 'height' are required"
+                    + " (take them from pdf.placement() items)");
+        }
+        if ((long) width * height > limits.maxPixels()) {
+            throw new JsUserRuntimeException(String.format(Locale.ROOT,
+                    "image.fromRaw: %dx%d = %d pixels exceeds the limit of %d pixels", width,
+                    height, (long) width * height, limits.maxPixels()));
+        }
+        int bitsPerComponent = intOpt(fn, raw, "bitsPerComponent", 0, 1, 16);
+        if (bitsPerComponent == 0) {
+            throw new JsUserRuntimeException("image.fromRaw: 'bitsPerComponent' is required"
+                    + " (pdf.placement() items name it)");
+        }
+        String colourSpaceSpec = stringOpt(fn, raw, "colorSpace", null);
+        if (colourSpaceSpec == null || colourSpaceSpec.isBlank()) {
+            throw new JsUserRuntimeException("image.fromRaw: 'colorSpace' is required"
+                    + " (e.g. '/DeviceRGB' or '/DeviceGray')");
+        }
+        Object predictor = raw == null ? null : raw.get("predictor");
+        if (predictor != null && !isNoPredictor(predictor)) {
+            throw new JsUserRuntimeException("image.fromRaw: only predictor 1 (none) is"
+                    + " supported - pdf.stream(..., {decode: true}) applies the predictor"
+                    + " already, so the bytes it returns need none");
+        }
+        Integer componentsOption = raw != null && raw.get("components") != null
+                ? intOpt(fn, raw, "components", 0, 1, 4) : null;
+        ColourSpace colourSpace = colourSpaceOf(fn, colourSpaceSpec, componentsOption);
+        int rowBytes = rowBytesOf(fn, raw, samples.length, width, height, colourSpace,
+                bitsPerComponent);
+        BufferedImage img = samplesToImage(fn, samples, width, height, colourSpace,
+                bitsPerComponent, rowBytes);
+        String format = stringOpt(fn, options, "format", "png").toLowerCase(Locale.ROOT);
+        double quality = doubleOpt(fn, options, "quality", -1.0, 0.0, 1.0);
+        BufferedImage toEncode = img;
+        switch (format) {
+            case "png", "gif" -> {
+                // alpha keeps its own channel
+            }
+            case "jpeg", "jpg", "bmp" -> toEncode = flatten(img, parseColor(fn, "background",
+                    stringOpt(fn, options, "background", "#ffffff")));
+            default -> throw badValue(fn, "format", "'png', 'jpeg', 'gif' or 'bmp'");
+        }
+        byte[] bytes = writeImage(toEncode, "jpg".equals(format) ? "jpeg" : format, quality,
+                String.format(Locale.ROOT, "<raw %dx%d>", width, height));
+        checkOutputBytes(fn, bytes);
+        return bytes;
+    }
+
+    /** Whether a {@code predictor} option means "the bytes are already un-predicted". */
+    private static boolean isNoPredictor(Object predictor) {
+        if (predictor instanceof Number number) {
+            return number.longValue() == 1;
+        }
+        if (predictor instanceof String text) {
+            String t = text.trim().toLowerCase(Locale.ROOT);
+            return "1".equals(t) || "none".equals(t);
+        }
+        return false;
+    }
+
+    /**
+     * Resolves a PDF colour-space name (and its inline abbreviations) to components.
+     * @param fn function name for messages
+     * @param spec the value from the PDF (e.g. {@code /DeviceRGB}, {@code /G}, {@code /ICCBased})
+     * @param components explicit component count for {@code /ICCBased}, may be null
+     * @return the colour space
+     */
+    private static ColourSpace colourSpaceOf(String fn, String spec, Integer components) {
+        String name = spec.trim().toUpperCase(Locale.ROOT);
+        if (name.startsWith("/")) {
+            name = name.substring(1);
+        }
+        switch (name) {
+            case "G", "GRAY", "DEVICEGRAY", "CALGRAY" -> {
+                return new ColourSpace("gray", 1);
+            }
+            case "RGB", "DEVICERGB", "CALRGB" -> {
+                return new ColourSpace("rgb", 3);
+            }
+            case "RGBA" -> {
+                return new ColourSpace("rgba", 4);
+            }
+            case "CMYK", "DEVICECMYK" -> {
+                return new ColourSpace("cmyk", 4);
+            }
+            default -> {
+                if (name.startsWith("ICC") && components != null) {
+                    return switch (components) {
+                        case 1 -> new ColourSpace("gray", 1);
+                        case 3 -> new ColourSpace("rgb", 3);
+                        case 4 -> new ColourSpace("cmyk", 4);
+                        default -> throw new JsUserRuntimeException("image." + fn + ":"
+                                + " {components: " + components + "} is not supported -"
+                                + " use 1 (gray), 3 (rgb) or 4 (cmyk)");
+                    };
+                }
+            }
+        }
+        throw new JsUserRuntimeException(String.format(Locale.ROOT,
+                "image.%s: colour space '%s' is not supported - known: /DeviceGray (/G),"
+                        + " /DeviceRGB (/RGB), /DeviceCMYK (/CMYK), /RGBA, /CalGray, /CalRGB and"
+                        + " /ICCBased with {components: 1|3|4}; /Indexed, /Separation, /DeviceN"
+                        + " and /Pattern are not", fn, spec));
+    }
+
+    /**
+     * Works out the stride of the samples: the computed one, an explicit {@code rowBytes}, or
+     * the producer's padding (a row length that divides the buffer evenly).
+     * @param fn function name for messages
+     * @param raw the raw options
+     * @param length number of sample bytes
+     * @param width pixels per row
+     * @param height rows
+     * @param colourSpace the colour space
+     * @param bitsPerComponent bits per component
+     * @return the stride in bytes
+     */
+    private static int rowBytesOf(String fn, Map<String, Object> raw, int length, int width,
+                                  int height, ColourSpace colourSpace, int bitsPerComponent) {
+        long bitsPerRow = (long) width * colourSpace.components() * bitsPerComponent;
+        int computed = (int) ((bitsPerRow + 7) / 8);
+        int rowBytes = raw != null && raw.get("rowBytes") != null
+                ? intOpt(fn, raw, "rowBytes", 0, 1, Integer.MAX_VALUE) : computed;
+        if (rowBytes < computed) {
+            throw new JsUserRuntimeException(String.format(Locale.ROOT,
+                    "image.%s: rowBytes %d is smaller than %d (width %d x %d component(s) x"
+                            + " %d bpc)", fn, rowBytes, computed, width, colourSpace.components(),
+                    bitsPerComponent));
+        }
+        long expected = (long) rowBytes * height;
+        if (length == expected) {
+            return rowBytes;
+        }
+        if (length > expected && length % height == 0 && length / height >= computed) {
+            return length / height;
+        }
+        throw new JsUserRuntimeException(String.format(Locale.ROOT,
+                "image.%s: %d sample bytes do not match %dx%d, %d component(s) at %d bpc -"
+                        + " expected %d bytes (%d per row); pass {rowBytes: …} when the rows are"
+                        + " padded differently", fn, length, width, height,
+                colourSpace.components(), bitsPerComponent, expected, rowBytes));
+    }
+
+    /**
+     * Turns raw samples into a raster.
+     * @param fn function name for messages
+     * @param samples the samples
+     * @param width pixels per row
+     * @param height rows
+     * @param colourSpace the colour space
+     * @param bitsPerComponent bits per component
+     * @param rowBytes stride in bytes
+     * @return the raster
+     */
+    private static BufferedImage samplesToImage(String fn, byte[] samples, int width, int height,
+                                                ColourSpace colourSpace, int bitsPerComponent,
+                                                int rowBytes) {
+        String name = colourSpace.name();
+        if ("gray".equals(name) && bitsPerComponent == 8) {
+            BufferedImage img = new BufferedImage(width, height, BufferedImage.TYPE_BYTE_GRAY);
+            img.getRaster().setDataElements(0, 0, width, height,
+                    packRows(samples, width, rowBytes, height));
+            return img;
+        }
+        if ("gray".equals(name) && bitsPerComponent == 1) {
+            BufferedImage img = new BufferedImage(width, height, BufferedImage.TYPE_BYTE_GRAY);
+            img.getRaster().setDataElements(0, 0, width, height,
+                    expandBilevel(samples, width, height, rowBytes));
+            return img;
+        }
+        if (bitsPerComponent != 8) {
+            throw new JsUserRuntimeException(String.format(Locale.ROOT,
+                    "image.%s: %d bit%s per component with colour space %s is not supported -"
+                            + " supported are 8-bit gray/rgb/rgba/cmyk and 1-bit bilevel (gray)",
+                    fn, bitsPerComponent, bitsPerComponent == 1 ? "" : "s", name));
+        }
+        BufferedImage img = "rgba".equals(name)
+                ? new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB)
+                : new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
+        for (int y = 0; y < height; y++) {
+            int row = y * rowBytes;
+            for (int x = 0; x < width; x++) {
+                int i = row + x * colourSpace.components();
+                int argb = switch (name) {
+                    case "rgb" -> 0xFF000000 | (samples[i] & 0xFF) << 16
+                            | (samples[i + 1] & 0xFF) << 8 | (samples[i + 2] & 0xFF);
+                    case "rgba" -> (samples[i + 3] & 0xFF) << 24
+                            | (samples[i] & 0xFF) << 16 | (samples[i + 1] & 0xFF) << 8
+                            | (samples[i + 2] & 0xFF);
+                    case "cmyk" -> {
+                        // The same print formula as cmykToRgb: R = (255-C)(255-K)/255. The samples
+                        // of a PDF /DeviceCMYK stream are ink values (no Adobe inversion - that is
+                        // a JPEG storage convention, handled in decodeCapped).
+                        int k = samples[i + 3] & 0xFF;
+                        int r = (255 - (samples[i] & 0xFF)) * (255 - k) / 255;
+                        int g = (255 - (samples[i + 1] & 0xFF)) * (255 - k) / 255;
+                        int b = (255 - (samples[i + 2] & 0xFF)) * (255 - k) / 255;
+                        yield 0xFF000000 | r << 16 | g << 8 | b;
+                    }
+                    default -> throw new JsUserRuntimeException("image." + fn + ": colour space '"
+                            + name + "' cannot be expanded");
+                };
+                img.setRGB(x, y, argb);
+            }
+        }
+        return img;
+    }
+
+    /** Copies sample rows into a packed (unpadded) buffer. */
+    private static byte[] packRows(byte[] samples, int packedRowBytes, int rowBytes, int height) {
+        if (rowBytes == packedRowBytes) {
+            return samples;
+        }
+        byte[] packed = new byte[packedRowBytes * height];
+        for (int y = 0; y < height; y++) {
+            System.arraycopy(samples, y * rowBytes, packed, y * packedRowBytes, packedRowBytes);
+        }
+        return packed;
+    }
+
+    /** Expands 1-bit samples (MSB first) to one byte per pixel (0 or 255). */
+    private static byte[] expandBilevel(byte[] samples, int width, int height, int rowBytes) {
+        byte[] packed = new byte[width * height];
+        for (int y = 0; y < height; y++) {
+            int row = y * rowBytes;
+            for (int x = 0; x < width; x++) {
+                int bit = (samples[row + (x >> 3)] >> (7 - (x & 7))) & 1;
+                packed[y * width + x] = (byte) (bit == 0 ? 0x00 : 0xFF);
+            }
+        }
+        return packed;
+    }
+
+    // ========================================================================
+    // describe / ocr - structured answers from the vision model
+    // ========================================================================
+
+    /**
+     * Describes an image through the vision model - one shot, structured answer
+     * ({@code format: 'json'} by default).
+     * @param handleOrPath handle from {@link #open(byte[], String, Map)}/{@link #create(Map)},
+     *                     a path, an archive display path or a {@code data:} URL
+     * @param options {@code {prompt?, format? ('json'|'text'), language?, model?, maxTokens?,
+     *                maxWidth?, maxHeight?, payloadFormat?, quality?, timeoutSeconds?}}
+     * @return {@code {format, title, description, keywords, text?, model, usage}} for JSON, or
+     *         {@code {format: 'text', text, parseError?, model, usage}}
+     */
+    public Map<String, Object> describe(String handleOrPath, Map<String, Object> options) {
+        OpenedImage opened = images.get(handleOrPath);
+        if (opened != null) {
+            return describe(opened.image(), opened.display(), options);
+        }
+        byte[] data = readSourceBytes(handleOrPath);
+        return describe(decodeCapped(data, displayOf(handleOrPath)), displayOf(handleOrPath),
+                options);
+    }
+
+    /**
+     * Describes raw image bytes (see {@link #describe(String, Map)}).
+     * @param data raw image bytes
+     * @param display display path for messages
+     * @param options options map, see {@link #describe(String, Map)}
+     * @return the describe result
+     */
+    public Map<String, Object> describe(byte[] data, String display,
+                                        Map<String, Object> options) {
+        return describe(decodeCapped(data, display), display, options);
+    }
+
+    /**
+     * Common body of both {@code describe} variants.
+     * @param img the raster
+     * @param display display path for messages
+     * @param options options map, see {@link #describe(String, Map)}
+     * @return the describe result
+     */
+    private Map<String, Object> describe(BufferedImage img, String display,
+                                         Map<String, Object> options) {
+        String fn = "describe";
+        requireKnown(fn, options, "prompt", "format", "language", "model", "maxTokens",
+                "maxWidth", "maxHeight", "payloadFormat", "quality", "timeoutSeconds");
+        String format = stringOpt(fn, options, "format", "json");
+        if (!"json".equals(format) && !"text".equals(format)) {
+            throw badValue(fn, "format", "'json' or 'text'");
+        }
+        String language = stringOpt(fn, options, "language", null);
+        String prompt = stringOpt(fn, options, "prompt", null);
+        if (prompt == null || prompt.isBlank()) {
+            prompt = describePrompt(format, language);
+        } else if (language != null) {
+            prompt = prompt + "\n" + languageSentence(language);
+        }
+        Map<String, Object> answer = askVision(fn, img, display, options, prompt);
+        String text = answer.get("text") == null ? "" : answer.get("text").toString();
+        Map<String, Object> parsed = "json".equals(format) ? parseDescribe(text) : null;
+        Map<String, Object> result = new LinkedHashMap<>();
+        if (parsed != null) {
+            result.put("format", "json");
+            result.putAll(parsed);
+        } else {
+            result.put("format", "text");
+            result.put("text", text);
+            if ("json".equals(format)) {
+                result.put("parseError", true);
+            }
+        }
+        result.put("model", answer.get("model"));
+        result.put("usage", answer.get("usage"));
+        return result;
+    }
+
+    /**
+     * Transcribes the text of an image (OCR) - one shot, plain text.
+     * @param handleOrPath handle, path, archive display path or {@code data:} URL
+     * @param options {@code {prompt?, language?, model?, maxTokens?, maxWidth?, maxHeight?,
+     *                payloadFormat?, quality?, timeoutSeconds?}}
+     * @return {@code {text, language?, model, usage}}
+     */
+    public Map<String, Object> ocr(String handleOrPath, Map<String, Object> options) {
+        OpenedImage opened = images.get(handleOrPath);
+        if (opened != null) {
+            return ocr(opened.image(), opened.display(), options);
+        }
+        byte[] data = readSourceBytes(handleOrPath);
+        return ocr(decodeCapped(data, displayOf(handleOrPath)), displayOf(handleOrPath), options);
+    }
+
+    /**
+     * Transcribes raw image bytes (see {@link #ocr(String, Map)}).
+     * @param data raw image bytes
+     * @param display display path for messages
+     * @param options options map, see {@link #ocr(String, Map)}
+     * @return the OCR result
+     */
+    public Map<String, Object> ocr(byte[] data, String display, Map<String, Object> options) {
+        return ocr(decodeCapped(data, display), display, options);
+    }
+
+    /**
+     * Common body of both {@code ocr} variants.
+     * @param img the raster
+     * @param display display path for messages
+     * @param options options map, see {@link #ocr(String, Map)}
+     * @return the OCR result
+     */
+    private Map<String, Object> ocr(BufferedImage img, String display,
+                                    Map<String, Object> options) {
+        String fn = "ocr";
+        requireKnown(fn, options, "prompt", "language", "model", "maxTokens", "maxWidth",
+                "maxHeight", "payloadFormat", "quality", "timeoutSeconds");
+        String language = stringOpt(fn, options, "language", null);
+        String prompt = stringOpt(fn, options, "prompt", null);
+        if (prompt == null || prompt.isBlank()) {
+            prompt = ocrPrompt(language);
+        } else if (language != null) {
+            prompt = prompt + "\n" + "The text is in '" + language + "'; keep the original"
+                    + " wording.";
+        }
+        Map<String, Object> answer = askVision(fn, img, display, options, prompt);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("text", answer.get("text") == null ? "" : answer.get("text").toString());
+        if (language != null) {
+            result.put("language", language);
+        }
+        result.put("model", answer.get("model"));
+        result.put("usage", answer.get("usage"));
+        return result;
+    }
+
+    /**
+     * The shared vision call of {@code describe} and {@code ocr}: the gates of
+     * {@code image.vision} (enabled, vision-capable model, endpoint), the {@code toDataUrl}
+     * pipeline for the payload and the per-call model/maxTokens/timeout overrides.
+     * @param fn function name for messages ({@code describe} or {@code ocr})
+     * @param img the raster
+     * @param display display path for messages
+     * @param options the caller's options (the payload keys are passed on)
+     * @param prompt the prompt to send
+     * @return the model's answer map
+     */
+    private Map<String, Object> askVision(String fn, BufferedImage img, String display,
+                                          Map<String, Object> options, String prompt) {
+        VisionClient client = new VisionClient(); // strict property validation happens here
+        if (!client.isEnabled()) {
+            throw new JsUserRuntimeException("image." + fn + ": the vision path is switched off"
+                    + " (webui.vision.enabled=false) - remove the property or set it to 'true'");
+        }
+        if (!client.hasVisionEnabled()) {
+            throw new JsUserRuntimeException("image." + fn + ": the current model is not marked"
+                    + " as vision-capable (webui.hasVision=false) - mark it only if it supports"
+                    + " input_image, or use image.analyze() / image.preview() instead");
+        }
+        if (!client.hasEndpoint()) {
+            throw new JsUserRuntimeException("image." + fn + ": no vision model configured - set"
+                    + " webui.model.url (the current model's gateway) or webui.vision.url");
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        copyOption(options, payload, "maxWidth");
+        copyOption(options, payload, "maxHeight");
+        copyOption(options, payload, "quality");
+        if (options != null && options.get("payloadFormat") != null) {
+            payload.put("format", options.get("payloadFormat"));
+        }
+        EncodedImage encoded = encodeForDataUrl(fn, img, display, payload);
+        if (encoded.bytes().length > client.maxImageBytes()) {
+            throw new JsUserRuntimeException(String.format(Locale.ROOT,
+                    "image.%s: the encoded image has %d bytes, exceeding the limit of %d bytes"
+                            + " - pass smaller maxWidth/maxHeight or payloadFormat 'jpeg'"
+                            + " (property webui.vision.maxImageBytes)", fn,
+                    encoded.bytes().length, client.maxImageBytes()));
+        }
+        String dataUrl = "data:image/" + encoded.format() + ";base64,"
+                + Base64.getEncoder().encodeToString(encoded.bytes());
+        VisionClient.AskOptions overrides = new VisionClient.AskOptions(
+                stringOpt(fn, options, "model", null),
+                intOrNull(fn, options, "maxTokens", 1, 1_000_000),
+                intOrNull(fn, options, "timeoutSeconds", 1, 3600));
+        return client.ask(prompt, dataUrl, overrides);
+    }
+
+    /** Copies one option into another map when it is present. */
+    private static void copyOption(Map<String, Object> from, Map<String, Object> to, String key) {
+        if (from != null && from.get(key) != null) {
+            to.put(key, from.get(key));
+        }
+    }
+
+    /**
+     * Reads an optional numeric option (absent means "not set", unlike {@code intOpt} which
+     * needs a fallback).
+     * @param fn function name for messages
+     * @param options the options map
+     * @param key the option name
+     * @param min smallest accepted value
+     * @param max largest accepted value
+     * @return the value, or {@code null} when the option is absent
+     */
+    private static Integer intOrNull(String fn, Map<String, Object> options, String key,
+                                     int min, int max) {
+        Object value = options == null ? null : options.get(key);
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Number number) {
+            long v = number.longValue();
+            if (v < min || v > max) {
+                throw new JsUserRuntimeException(String.format(Locale.ROOT,
+                        "image.%s: option '%s' must be between %d and %d (got %d)", fn, key,
+                        min, max, v));
+            }
+            return (int) v;
+        }
+        throw new JsUserRuntimeException(String.format(Locale.ROOT,
+                "image.%s: option '%s' must be a number (got %s)", fn, key, describe(value)));
+    }
+
+    /** The default prompt of {@code describe}. */
+    private static String describePrompt(String format, String language) {
+        String base;
+        if ("json".equals(format)) {
+            base = "Describe this image. Answer with one JSON object and nothing else, with"
+                    + " exactly these members: \"title\" (short, at most 80 characters),"
+                    + " \"description\" (2 to 4 sentences), \"keywords\" (5 to 12 short"
+                    + " lower-case terms) and, when the image shows readable text, \"text\""
+                    + " (that text, verbatim).";
+        } else {
+            base = "Describe this image in a few sentences: what is shown, the layout, notable"
+                    + " details and any readable text.";
+        }
+        return language == null ? base : base + " " + languageSentence(language);
+    }
+
+    /** The default prompt of {@code ocr}: the text as it stands, order kept. */
+    private static String ocrPrompt(String language) {
+        String base = "Transcribe every text of this image exactly as it appears, in reading"
+                + " order, line by line. Add no comments, do not translate, keep the original"
+                + " line breaks and punctuation.";
+        return language == null ? base
+                : base + " The text is in '" + language + "'; keep the original wording.";
+    }
+
+    /** The sentence that steers the answer language. */
+    private static String languageSentence(String language) {
+        return "Answer in the language '" + language + "'.";
+    }
+
+    /**
+     * Reads the JSON object out of an answer, tolerating a {@code ```json} fence and prose
+     * around it. Returns null when the answer does not carry the required members - the caller
+     * then falls back to {@code format: 'text'} with {@code parseError: true}.
+     * @param text the raw answer
+     * @return the validated map, or null
+     */
+    private Map<String, Object> parseDescribe(String text) {
+        String candidate = jsonCandidate(text);
+        if (candidate == null) {
+            return null;
+        }
+        JsonNode root;
+        try {
+            root = JSON_MAPPER.readTree(candidate);
+        } catch (RuntimeException e) {
+            return null;
+        }
+        if (root == null || !root.isObject()) {
+            return null;
+        }
+        String title = nonBlankString(root.path("title"), 300);
+        String description = nonBlankString(root.path("description"), 4000);
+        List<Object> keywords = keywordList(root.path("keywords"));
+        if (title == null || description == null || keywords.isEmpty()) {
+            return null;
+        }
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put("title", title);
+        map.put("description", description);
+        map.put("keywords", keywords);
+        String body = nonBlankString(root.path("text"), 20000);
+        if (body != null) {
+            map.put("text", body);
+        }
+        return map;
+    }
+
+    /**
+     * Strips a Markdown code fence and everything outside the outermost braces.
+     * @param text the answer
+     * @return the JSON candidate, or null
+     */
+    static String jsonCandidate(String text) {
+        if (text == null) {
+            return null;
+        }
+        String s = text.trim();
+        if (s.startsWith("```")) {
+            int lineEnd = s.indexOf('\n');
+            if (lineEnd > 0) {
+                s = s.substring(lineEnd + 1);
+            }
+            int fence = s.lastIndexOf("```");
+            if (fence >= 0) {
+                s = s.substring(0, fence);
+            }
+            s = s.trim();
+        }
+        int start = s.indexOf('{');
+        int end = s.lastIndexOf('}');
+        if (start < 0 || end <= start) {
+            return null;
+        }
+        return s.substring(start, end + 1);
+    }
+
+    /** A non-blank string member (truncated to {@code max} characters), or null. */
+    private static String nonBlankString(JsonNode node, int max) {
+        if (node == null || !node.isString()) {
+            return null;
+        }
+        String value = node.asString().trim();
+        if (value.isEmpty()) {
+            return null;
+        }
+        return value.length() > max ? value.substring(0, max) : value;
+    }
+
+    /** The keywords of an answer: non-blank strings, at most 32. */
+    private static List<Object> keywordList(JsonNode node) {
+        List<Object> keywords = new ArrayList<>();
+        if (node == null || !node.isArray()) {
+            return keywords;
+        }
+        for (JsonNode item : node) {
+            String keyword = nonBlankString(item, 120);
+            if (keyword != null && keywords.size() < 32) {
+                keywords.add(keyword);
+            }
+        }
+        return keywords;
+    }
+
+    // ========================================================================
+    // generate / edit - the diffusion endpoint, and the demo gallery
+    // ========================================================================
+
+    /**
+     * Generates a picture with the configured diffusion endpoint.
+     * @param options {@code {prompt (required, ≤ 800 chars), negativePrompt? (accepted, not
+     *                sent), model?, size? ('WxH'), width?, height?, seed?, steps?, format?,
+     *                output? ('none'|'demo'), demoClear?, path?, overwrite?, includeBytes?,
+     *                timeoutSeconds?}}
+     * @return {@code {width, height, format, bytes, model, seed, path?, url?, imageUrl?,
+     *         webServerActive?, hint?, data? (includeBytes), requestId?}}
+     */
+    public Map<String, Object> generate(Map<String, Object> options) {
+        String fn = "generate";
+        requireKnown(fn, options, "prompt", "negativePrompt", "model", "size", "width",
+                "height", "seed", "steps", "format", "output", "demoClear", "path", "overwrite",
+                "includeBytes", "timeoutSeconds");
+        String prompt = requirePrompt(fn, options);
+        ImageClient client = new ImageClient(); // strict property validation happens here
+        ImageClient.Result result = client.generate(new ImageClient.GenerateRequest(prompt,
+                stringOpt(fn, options, "model", null), sizeOption(fn, options),
+                intOrNull(fn, options, "seed", 0, Integer.MAX_VALUE),
+                intOrNull(fn, options, "steps", 1, 1000),
+                formatOption(fn, options),
+                intOrNull(fn, options, "timeoutSeconds", 1, 3600)));
+        return finishGenerated(fn, prompt, result, options);
+    }
+
+    /**
+     * Edits one or more pictures with the configured endpoint (the sources go as base64 into a
+     * multipart form; a {@code negativePrompt} is not sent - the endpoint has no such field).
+     * @param sources the source pictures (1..4)
+     * @param display display path for messages (the first source)
+     * @param options same as {@link #generate(Map)}
+     * @return the same result as {@link #generate(Map)}
+     */
+    public Map<String, Object> edit(List<byte[]> sources, String display,
+                                    Map<String, Object> options) {
+        String fn = "edit";
+        requireKnown(fn, options, "prompt", "negativePrompt", "model", "size", "width",
+                "height", "seed", "steps", "format", "output", "demoClear", "path", "overwrite",
+                "includeBytes", "timeoutSeconds");
+        if (sources == null || sources.isEmpty()) {
+            throw new JsUserRuntimeException("image.edit: a source picture is required (path,"
+                    + " archive path, Uint8Array, data URL or {type: 'image', data, mimeType})");
+        }
+        if (sources.size() > MAX_EDIT_SOURCES) {
+            throw new JsUserRuntimeException(String.format(Locale.ROOT, "image.edit: %d source"
+                    + " pictures are too many - at most %d", sources.size(), MAX_EDIT_SOURCES));
+        }
+        for (byte[] source : sources) {
+            if (source.length > limits.maxInputBytes()) {
+                throw new JsUserRuntimeException(String.format(Locale.ROOT, "image.edit: a source"
+                        + " picture has %d bytes, exceeding the input limit of %d bytes"
+                        + " (property %s)", source.length, limits.maxInputBytes(),
+                        ImageLimits.PROP_MAX_INPUT_BYTES));
+            }
+        }
+        String prompt = requirePrompt(fn, options);
+        ImageClient client = new ImageClient();
+        ImageClient.Result result = client.edit(new ImageClient.EditRequest(prompt,
+                stringOpt(fn, options, "model", null), sizeOption(fn, options),
+                intOrNull(fn, options, "seed", 0, Integer.MAX_VALUE),
+                intOrNull(fn, options, "steps", 1, 1000),
+                formatOption(fn, options), sources,
+                intOrNull(fn, options, "timeoutSeconds", 1, 3600)));
+        return finishGenerated(fn, prompt, result, options);
+    }
+
+    /**
+     * The shared tail of {@code generate}/{@code edit}: the picture is measured (header only),
+     * written where the caller asks for it and published when asked - but it only enters the
+     * result as bytes when {@code includeBytes} says so (the conversation stays text).
+     * @param fn function name
+     * @param prompt the prompt (file-name slug, gallery)
+     * @param result what the endpoint delivered
+     * @param options the caller's options
+     * @return the result map
+     */
+    private Map<String, Object> finishGenerated(String fn, String prompt,
+                                                ImageClient.Result result,
+                                                Map<String, Object> options) {
+        byte[] bytes = result.bytes();
+        checkOutputBytes(fn, bytes);
+        String format = result.format();
+        Integer width = result.width();
+        Integer height = result.height();
+        try {
+            Map<String, Object> probe = info(bytes, "<generated>", Map.of());
+            if (probe.get("format") instanceof String probed) {
+                format = probed.toLowerCase(Locale.ROOT);
+            }
+            if (probe.get("width") instanceof Integer probedWidth) {
+                width = probedWidth;
+            }
+            if (probe.get("height") instanceof Integer probedHeight) {
+                height = probedHeight;
+            }
+        } catch (JsUserRuntimeException e) {
+            // e.g. webp: no reader in the JRE - keep what the endpoint reported, and say so in
+            // the documentation instead of failing a picture we did receive
+            LOG.debug("image.{}: the result cannot be read by ImageIO ({}), keeping the"
+                    + " endpoint's numbers", fn, e.getMessage());
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("width", width);
+        out.put("height", height);
+        out.put("format", format == null ? "png" : format);
+        out.put("bytes", bytes.length);
+        out.put("model", result.model());
+        out.put("seed", result.seed());
+        if (result.requestId() != null) {
+            out.put("requestId", result.requestId());
+        }
+        if (options != null && options.get("negativePrompt") != null) {
+            // Accepted for the fork's scripts, never sent: the reference endpoint has no such
+            // field. Saying that in the answer is better than dropping it in silence.
+            out.put("negativePromptIgnored", true);
+        }
+        String path = stringOpt(fn, options, "path", null);
+        if (path != null) {
+            if (!boolOpt(fn, options, "overwrite", false) && JsFileSystem.exists(path)) {
+                throw new JsUserRuntimeException("image." + fn + ": '" + path + "' exists"
+                        + " already - pass {overwrite: true} to replace it");
+            }
+            JsFileSystem.writeBytes(path, bytes);
+            out.put("path", path);
+        }
+        String output = stringOpt(fn, options, "output", "none");
+        if ("demo".equals(output)) {
+            demoOutput(fn, prompt, bytes, out.get("format").toString(), options, out);
+        } else if (!"none".equals(output)) {
+            throw badValue(fn, "output", "'none' or 'demo'");
+        }
+        if (boolOpt(fn, options, "includeBytes", false)) {
+            out.put("data", bytes);
+        }
+        return out;
+    }
+
+    /**
+     * Publishes a generated picture: file under {@code <dir>/images/}, gallery
+     * {@code <dir>/images.html} rewritten (newest first), URLs from the registered server.
+     * @param fn function name
+     * @param prompt the prompt (slug of the file name)
+     * @param bytes the picture
+     * @param format file extension
+     * @param options the caller's options ({@code demoClear})
+     * @param out the result map to extend
+     */
+    private void demoOutput(String fn, String prompt, byte[] bytes, String format,
+                            Map<String, Object> options, Map<String, Object> out) {
+        LocalWebServerConfig server = localWebServer;
+        if (server == null) {
+            throw new JsUserRuntimeException("image." + fn + ": output 'demo' needs a registered"
+                    + " web server and none is configured - use {path: '…'} to write the picture"
+                    + " into the project, or let the operator register one");
+        }
+        Path demoDir;
+        try {
+            demoDir = JsFileSystem.resolveSafePath(server.getWebServerDir().toString());
+        } catch (JsUserRuntimeException e) {
+            throw new JsUserRuntimeException("image." + fn + ": the registered web server"
+                    + " directory '" + server.getWebServerDir() + "' is not usable - "
+                    + e.getMessage(), e);
+        }
+        if (boolOpt(fn, options, "demoClear", false)) {
+            ImageDemoGallery.clear(demoDir);
+        }
+        Path file = ImageDemoGallery.addImage(demoDir, prompt, format, bytes);
+        Path gallery = ImageDemoGallery.galleryFile(demoDir);
+        Optional<URI> galleryUri = server.uriFor(gallery);
+        Optional<URI> imageUri = server.uriFor(file);
+        if (galleryUri.isEmpty() || imageUri.isEmpty()) {
+            throw new JsUserRuntimeException("image." + fn + ": the web server could not map '"
+                    + JsFileSystem.toRelative(file) + "' to a URL - its directory and the served"
+                    + " path do not match");
+        }
+        if (out.get("path") == null) {
+            out.put("path", JsFileSystem.toRelative(file));
+        } else {
+            // the caller already named a file with path: - keep it, and name the demo file apart
+            out.put("demoPath", JsFileSystem.toRelative(file));
+        }
+        out.put("url", galleryUri.get().toString());
+        out.put("imageUrl", imageUri.get().toString());
+        out.put("webServerActive", server.isActive());
+        if (!server.isActive()) {
+            String reason = server.unavailableReason();
+            out.put("hint", "the picture and the gallery were written, but they have no URL"
+                    + (reason == null ? "" : " (" + reason + ")") + " - open "
+                    + JsFileSystem.toRelative(file) + " directly");
+        }
+    }
+
+    /** The prompt of {@code generate}/{@code edit}: required, at most 800 characters. */
+    private static String requirePrompt(String fn, Map<String, Object> options) {
+        String prompt = stringOpt(fn, options, "prompt", null);
+        if (prompt == null || prompt.isBlank()) {
+            throw new JsUserRuntimeException("image." + fn + ": 'prompt' is required");
+        }
+        if (prompt.length() > MAX_PROMPT_CHARS) {
+            throw new JsUserRuntimeException(String.format(Locale.ROOT, "image.%s: the prompt has"
+                    + " %d characters, exceeding the limit of %d", fn, prompt.length(),
+                    MAX_PROMPT_CHARS));
+        }
+        return prompt;
+    }
+
+    /**
+     * The {@code format} of a generation request: {@code png} (default), {@code jpeg},
+     * {@code webp} - validated here, where the function name is known (the client only
+     * normalises what it is handed).
+     * @param fn function name for the message
+     * @param options the caller's options
+     * @return the value, or {@code null} for "let the endpoint decide"
+     */
+    private static String formatOption(String fn, Map<String, Object> options) {
+        String format = stringOpt(fn, options, "format", null);
+        if (format == null || format.isBlank()) {
+            return null;
+        }
+        String f = format.trim().toLowerCase(Locale.ROOT);
+        if ("jpg".equals(f)) {
+            return "jpeg";
+        }
+        if (!"png".equals(f) && !"jpeg".equals(f) && !"webp".equals(f)) {
+            throw badValue(fn, "format", "'png', 'jpeg' or 'webp'");
+        }
+        return f;
+    }
+
+    /**
+     * The {@code size} of a generation request: {@code size} or {@code width}+{@code height}.
+     * @param fn function name
+     * @param options the caller's options
+     * @return the {@code WxH} string, or null for "let the endpoint decide"
+     */
+    private static String sizeOption(String fn, Map<String, Object> options) {
+        String size = stringOpt(fn, options, "size", null);
+        Integer width = intOrNull(fn, options, "width", 1, 100_000);
+        Integer height = intOrNull(fn, options, "height", 1, 100_000);
+        if (size != null) {
+            if (width != null || height != null) {
+                throw new JsUserRuntimeException("image." + fn + ": pass either 'size' or"
+                        + " 'width'/'height', not both");
+            }
+            return ImageClient.size(fn, size);
+        }
+        if (width != null && height != null) {
+            return ImageClient.size(fn, width + "x" + height);
+        }
+        if (width != null || height != null) {
+            throw new JsUserRuntimeException("image." + fn + ": 'width' and 'height' belong"
+                    + " together (or use 'size: \"1024x1024\"')");
+        }
+        return null;
+    }
+
+    /**
+     * What this environment offers and what it does not - the machine-readable twin of the
+     * capability paragraph of {@link #help()}.
+     * @return {@code {limits: {…}, capabilities: {vision, generation, demo}}}
+     */
+    public Map<String, Object> status() {
+        Map<String, Object> limitMap = new LinkedHashMap<>();
+        limitMap.put("maxInputBytes", limits.maxInputBytes());
+        limitMap.put("maxOutputBytes", limits.maxOutputBytes());
+        limitMap.put("maxPixels", limits.maxPixels());
+        limitMap.put("rasterBudgetBytes", limits.rasterBudgetBytes());
+        limitMap.put("maxTransferPixels", limits.maxTransferPixels());
+        limitMap.put("timeoutSeconds", limits.timeoutSeconds());
+        Map<String, Object> capabilities = new LinkedHashMap<>();
+        boolean vision = VisionClient.isConfigured();
+        Map<String, Object> visionMap = new LinkedHashMap<>();
+        visionMap.put("available", vision);
+        visionMap.put("reason", vision ? null : "webui.hasVision=false or no gateway"
+                + " (webui.model.url)");
+        capabilities.put("vision", visionMap);
+        boolean generation = ImageClient.isConfigured();
+        Map<String, Object> generationMap = new LinkedHashMap<>();
+        generationMap.put("available", generation);
+        generationMap.put("reason", generation ? null : ImageClient.PROP_GEN_MODEL
+                + " is not set or no gateway (webui.model.url)");
+        capabilities.put("generation", generationMap);
+        LocalWebServerConfig server = localWebServer;
+        Map<String, Object> demoMap = new LinkedHashMap<>();
+        demoMap.put("configured", server != null);
+        demoMap.put("active", server != null && server.isActive());
+        demoMap.put("reason", server == null ? null : server.unavailableReason());
+        demoMap.put("dir", server == null ? null : server.getWebServerDir().toString());
+        capabilities.put("demo", demoMap);
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put("limits", limitMap);
+        map.put("capabilities", capabilities);
+        return map;
+    }
+
+    // ========================================================================
+    // Preview
+    // ========================================================================
 
     /**
      * Renders a coarse text preview of the image - the "Grobansicht" a script can show the
@@ -2224,10 +3467,10 @@ public class JsImage implements AutoCloseable {
                     fn, x, y, width, height, img.getWidth(), img.getHeight(),
                     img.getWidth(), img.getHeight()));
         }
-        if ((long) width * height > MAX_TRANSFER_PIXELS) {
+        if ((long) width * height > limits.maxTransferPixels()) {
             throw new JsUserRuntimeException(String.format(Locale.ROOT,
                     "image.%s: region %dx%d = %d pixels exceeds the transfer limit of %d pixels",
-                    fn, width, height, (long) width * height, MAX_TRANSFER_PIXELS));
+                    fn, width, height, (long) width * height, limits.maxTransferPixels()));
         }
         return img;
     }
@@ -2459,11 +3702,12 @@ public class JsImage implements AutoCloseable {
         long used = images.values().stream().mapToLong(o ->
                 (long) o.image().getWidth() * o.image().getHeight() * 4
                         + (o.raw() != null ? o.raw().length : 0)).sum();
-        if (used + bytes > RASTER_BUDGET_BYTES) {
-            throw new JsUserRuntimeException(String.format(
+        if (used + bytes > limits.rasterBudgetBytes()) {
+            throw new JsUserRuntimeException(String.format(Locale.ROOT,
                     "image.%s: %d bytes of raster memory would exceed the per-call budget of"
                             + " %d bytes - close is automatic at call end, but fewer open images"
-                            + " or smaller ones are needed", fn, bytes, RASTER_BUDGET_BYTES));
+                            + " or smaller ones are needed", fn, bytes,
+                    limits.rasterBudgetBytes()));
         }
     }
 
