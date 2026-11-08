@@ -341,10 +341,31 @@ public final class XObjectOps {
         return Optional.of(route.get().map(box, space));
     }
 
-    /** The named answer for one {@code Do} — what the plan calls "benennen". */
+    /**
+     * The named answer for one {@code Do} without a resolver: dictionary values that stand behind
+     * an indirect reference stay {@code null} (a test or a caller without a document).
+     */
+    public static Map<String, Object> item(Target target, Optional<PdfQuad> quad, String space,
+                                           int depth, String inName,
+                                           PdfContentInterpreter.Operation operation) {
+        return item(target, quad, space, depth, inName, operation, value -> value);
+    }
+
+    /**
+     * The named answer for one {@code Do} — what the plan calls "benennen".
+     * <p>
+     * An image item also names its dictionary's {@code /ColorSpace}, {@code /BitsPerComponent} and
+     * its codec filter: the three values a caller needs to turn the stream's bytes into a picture
+     * ({@code pdf.stream(path, objNum)} delivers them decoded, and {@code image.fromRaw} takes
+     * them). Dictionary values, never pixels - the "never its pixels" rule of {@code ['images']}
+     * stays untouched.
+     * </p>
+     * @param read resolves an indirect reference (the caller's document, or identity in a test)
+     */
     public static Map<String, Object> item(Target target, Optional<PdfQuad> quad, String space,
                                            int depth, String inName, PdfContentInterpreter.Operation
-                                                   operation) {
+                                                   operation, java.util.function.Function<Object,
+                                                   Object> read) {
         Map<String, Object> item = new LinkedHashMap<>();
         item.put("kind", target.isImage() ? "image" : "xobject");
         item.put("offset", (long) operation.offset());
@@ -364,6 +385,12 @@ public final class XObjectOps {
             item.put("inline", false);
             item.put("width", target.width() == null ? null : (long) (int) target.width());
             item.put("height", target.height() == null ? null : (long) (int) target.height());
+            // The dictionary of the image stream: what a reader needs to interpret its samples.
+            Map<String, Object> imageDict = target.dict() == null ? Map.of() : target.dict();
+            item.put("colourSpace", nameOrFirst(read.apply(imageDict.get("ColorSpace"))));
+            item.put("bitsPerComponent",
+                    integerOf(read.apply(imageDict.get("BitsPerComponent"))));
+            item.put("filter", filterCodec(read.apply(imageDict.get("Filter"))));
         }
         if (quad != null && quad.isPresent()) {
             PdfQuad q = quad.get();
@@ -543,6 +570,38 @@ public final class XObjectOps {
             return null;
         }
         return null;
+    }
+
+    /**
+     * A dictionary value that names something: a {@code /Name} as written, or the first name of
+     * an array (an {@code /ICCBased} colour space is {@code [/ICCBased 5 0 R]}).
+     * @param value the (dereferenced) value
+     * @return the name as text, or null
+     */
+    static String nameOrFirst(Object value) {
+        if (value instanceof PdfName name) {
+            return name.toString();
+        }
+        if (value instanceof String text) {
+            return text;
+        }
+        if (value instanceof List<?> list && !list.isEmpty()) {
+            return nameOrFirst(list.get(0));
+        }
+        return null;
+    }
+
+    /**
+     * The codec of an image stream: the last name of {@code /Filter} (filters are listed in the
+     * order they are applied, so the one that turns the data into samples stands last).
+     * @param value the (dereferenced) {@code /Filter} value
+     * @return the filter name as written, or null
+     */
+    static String filterCodec(Object value) {
+        if (value instanceof List<?> list) {
+            return list.isEmpty() ? null : nameOrFirst(list.get(list.size() - 1));
+        }
+        return nameOrFirst(value);
     }
 
     /** A rectangle written as four numbers, or null (a foreign kind, a short array, a lost object). */

@@ -7,6 +7,7 @@ import org.graalvm.polyglot.proxy.ProxyObject;
 import org.rogmann.mcp2sdk.pdf.PdfDocumentStructure;
 import org.rogmann.mcp2sdk.pdf.PdfException;
 import org.rogmann.mcp2sdk.pdf.PdfFilters;
+import org.rogmann.mcp2sdk.pdf.PdfFormFields;
 import org.rogmann.mcp2sdk.pdf.PdfStructTree;
 import org.rogmann.mcp2sdk.pdf.PdfTextDecoder;
 
@@ -58,7 +59,9 @@ import java.util.Set;
  * pdf.cmap("doc/report.pdf", {font: 4}, {codes: "41 0B"}); // what those glyph codes mean
  * pdf.decodeString("doc/report.pdf", 4, "<0B41>");          // -> "ffA", with the source per code
  * pdf.glyphMetrics("doc/report.pdf", 4, "41", {fontSize: 10}); // width, its text-space value, box
- * pdf.document("doc/report.pdf");                         // catalog, pages, tagging, form
+ * pdf.document("doc/report.pdf");                         // catalog, pages, tagging, form summary
+ * pdf.formFields("doc/report.pdf");                       // the form field by field: names, values
+ *                                                          // and the object numbers pdfedit fills by
  * pdf.pages("doc/report.pdf", {resources: true});         // boxes, labels, annotations
  * pdf.outlines("doc/report.pdf");                         // bookmarks, destinations resolved
  * pdf.structTree("doc/report.pdf");                       // tagged-PDF structure tree
@@ -117,6 +120,10 @@ public class JsPdfBridge implements JsModuleInterface {
     /** Supported options of {@code pdf.document} (strict). */
     private static final Set<String> DOCUMENT_OPTIONS = Set.of("maxPages");
 
+    /** Supported options of {@code pdf.formFields} (strict). */
+    private static final Set<String> FORM_OPTIONS =
+            Set.of("page", "maxFields", "maxDepth", "maxValueChars");
+
     /** Supported options of {@code pdf.pages} (strict). */
     private static final Set<String> PAGES_OPTIONS =
             Set.of("maxPages", "resources", "annotations", "maxItems");
@@ -160,14 +167,14 @@ public class JsPdfBridge implements JsModuleInterface {
                 + " and pictures stand, every number in a named space, with the walk's findings in a"
                 + " diagnostics block), fonts (dictionary, encoding, widths, the tables of an embedded"
                 + " font program, CMap, the width and box of a glyph in text space, every string of a"
-                + " page read through its font) and document structure (page tree, outlines,"
-                + " tagged PDF)";
+                + " page read through its font), document structure (page tree, outlines, tagged"
+                + " PDF) and the interactive form field by field (pdf.formFields())";
     }
 
     @Override
     public String getHelpTip() {
         return "pdf.help() (PDF file structure, objects, streams, content streams and placement,"
-                + " fonts and glyph codes, document and tag structure)";
+                + " fonts and glyph codes, document and tag structure, form fields)";
     }
 
     @Override
@@ -391,6 +398,18 @@ public class JsPdfBridge implements JsModuleInterface {
             Options options = Options.parse(argOrNull(args, 1), DOCUMENT_OPTIONS, "document");
             return GraalProxies.toProxyObject(JsPdf.document(source(args[0]),
                     options.getInt("maxPages", JsPdf.DEFAULT_MAX_PAGES)));
+        });
+
+        methods.put("formFields", (ProxyExecutable) args -> {
+            requireArgs(args, 1, "formFields(pathOrBytes[, {page, maxFields, maxDepth,"
+                    + " maxValueChars}])");
+            Options options = Options.parse(argOrNull(args, 1), FORM_OPTIONS, "formFields");
+            Object page = options.get("page");
+            Integer pageIndex = page == null ? null : (int) longValue(page, "page");
+            return GraalProxies.toProxyObject(JsPdf.formFields(source(args[0]), pageIndex,
+                    options.getInt("maxFields", PdfFormFields.DEFAULT_MAX_FIELDS),
+                    options.getInt("maxDepth", PdfFormFields.DEFAULT_MAX_DEPTH),
+                    options.getInt("maxValueChars", PdfFormFields.DEFAULT_MAX_VALUE_CHARS)));
         });
 
         methods.put("pages", (ProxyExecutable) args -> {
@@ -1014,6 +1033,12 @@ public class JsPdfBridge implements JsModuleInterface {
                         document does not have is refused by naming its length ("the document has
                         876 page(s)"); a tree whose /Count promises more than the walk reaches says
                         both numbers, because those are different facts.
+                        THE TEXT IS PER PAGE: pages[i].text. There is no `text` on the top level -
+                        reading one there yields undefined and looks like "this page has no text".
+                        For a word search, strip the whitespace first
+                        (pages[0].text.replace(/\s+/g, '')): many producers set ONE GLYPH PER
+                        SHOW-OPERATOR, so the page text reads "S p a t e n s t i c h" and a
+                        substring search for "Spatenstich" fails on a page that does contain it.
                         wordGaps {threshold: -120, numbers, spaces, ignoredOpenings,
                                  widestIgnoredOpening?, note?} - present on a page whose spaces came
                         from a TJ array, and only there. Where a word gap begins is not decided by
@@ -1368,7 +1393,7 @@ public class JsPdfBridge implements JsModuleInterface {
                                  then carry depth and share maxItems with the page's own, and a form
                                  that names itself again is reported as the cycle it is.
                           {kind: 'image', offset, op, space, inline, objNum, subtype, width, height,
-                           colourSpace?, bitsPerComponent?, dataBytes?, sampleBytes?, bbox,
+                           colourSpace?, bitsPerComponent?, filter?, dataBytes?, sampleBytes?, bbox,
                            bboxSource, at, state?}
                                  the box a picture covers: the unit square of image space, mapped
                                  ("All images are 1 unit wide by 1 unit high in user space", S. 203)
@@ -1381,7 +1406,19 @@ public class JsPdfBridge implements JsModuleInterface {
                                  data without decoding the sample stream, which stays out). Neither
                                  number is a sample count from /W, /H and /BPC: that product is a
                                  decode, not a measurement. An /Image XObject arrives through Do with
-                                 its objNum.
+                                 its objNum, its /ColorSpace (a name, or the first name of an array
+                                 such as /ICCBased), its /BitsPerComponent and the codec of its
+                                 /Filter (the last name, `/DCTDecode` or `/FlateDecode`) - the three
+                                 dictionary values that turn pdf.stream(path, objNum) into a picture
+                                 (image.fromRaw); the bytes are the stream's, not this item's.
+                        BUDGET: maxItems bounds the ITEMS of a page answer (default 1000, text
+                        included) - one item is one operator, and a producer that writes one glyph
+                        per show-operator spends that budget very fast (a newspaper page carries
+                        thousands). The page says whether it was cut: summary.beyondBudget and
+                        walk.itemsBeyondBudget are what did not fit, truncated is the flag, and
+                        walk.showOperators is how many text-show operators the walk really saw.
+                        "No item of this kind" is only a statement while those numbers agree;
+                        otherwise raise maxItems and ask again.
                         state   on every kind, when you ask for it (`state` is not a text-only
                                  option - "womit ist hier gemalt worden" is answered by the fill
                                  colour of a painted box, not by a Tf):
@@ -1463,6 +1500,32 @@ public class JsPdfBridge implements JsModuleInterface {
                          namedDestinations?, pageLabels?, metadata?, viewerPreferences?, notes?}
                         'entries' lists every key of the catalogue - the summaries below it
                         interpret the important ones, nothing is hidden.
+                   pdf.formFields(pathOrBytes[, {page, maxFields: 2000, maxDepth: 16,
+                                                 maxValueChars: 200}])
+                     -> {present, objNum?, fields: [{name, objNum?, type, partialName?, value,
+                         rawValue, defaultValue?, rawDefaultValue?, flags?, flagsParsed?, maxLen?,
+                         defaultAppearance?, quadding?, options?, optionsDisplay?,
+                         page?, rect?, widgetObjNums?, widgets?, pages?, hasAppearance,
+                         appearanceState?, onValues?}], count, total?, truncated?, xfa?,
+                         needAppearances?, defaultAppearance?, calculationOrder?, notes?}
+                        The form field by field - what pdf.document().form only summarises. name is
+                        the FULLY QUALIFIED name (the /T chain joined with '.'), objNum the object
+                        number of the field dictionary, widgetObjNums those of its widgets (a field
+                        may appear on several pages: widgets/pages list them). type is text,
+                        checkbox, radio, pushbutton, choice, signature - or non-terminal for a
+                        branch, which is reported as what it is instead of guessing a type from its
+                        children. value is /V prepared for a reader (a choice shows the display
+                        text of its [export display] option, a button its export name, names keep
+                        their slash), rawValue the value as written; a field without /V answers
+                        value: null and /DV is reported separately as defaultValue.
+                        /FT, /Ff, /V, /DV, /DA, /Q, /Opt, /MaxLen are inherited from the parent
+                        field (a radio group names its type once, at the top), /T is concatenated.
+                        flagsParsed translates the flag bits (readOnly, required, noExport,
+                        multiline, password, comb, radio, pushbutton, combo, edit, multiSelect, ...).
+                        Nothing is executed: /AA actions are counted and named. An XFA form
+                        answers an empty field list plus the note that its fields stand in the
+                        packet - filling such a form is refused by pdfedit (code 'xfa').
+                        Filling is pdfedit's form.fill, and this is the list it addresses.
                    pdf.pages(pathOrBytes[, {maxPages: 200, resources: false, annotations: true,
                                             maxItems: 100}])
                      -> per page {page, objNum, boxes: {mediaBox, cropBox, ...}, widthPt,

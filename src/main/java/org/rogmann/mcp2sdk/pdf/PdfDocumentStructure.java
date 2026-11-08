@@ -604,7 +604,8 @@ public final class PdfDocumentStructure {
         List<String> uris = new ArrayList<>();
         Set<Integer> unreadable = new LinkedHashSet<>();
         for (PageEntry page : pages) {
-            for (Map<String, Object> annot : annotationDicts(page, unreadable)) {
+            for (Map<String, Object> annot : annotationDicts(page, unreadable,
+                    new ArrayList<>())) {
                 total++;
                 PdfName subtype = PdfName.ofDict(annot, "Subtype");
                 subtypes.merge(subtype != null ? subtype.toString() : "/(none)", 1L, Long::sum);
@@ -649,7 +650,8 @@ public final class PdfDocumentStructure {
     private Map<String, Object> pageAnnotations(PageEntry page, int maxAnnotations,
                                                 Map<Integer, Integer> pageNumbers,
                                                 List<String> notes, Set<Integer> unreadable) {
-        List<Map<String, Object>> dicts = annotationDicts(page, unreadable);
+        List<Integer> objNums = new ArrayList<>();
+        List<Map<String, Object>> dicts = annotationDicts(page, unreadable, objNums);
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("count", (long) dicts.size());
         if (unreadable.contains(page.page())) {
@@ -668,7 +670,7 @@ public final class PdfDocumentStructure {
                         + " annotation(s) are listed (raise maxItems)");
                 break;
             }
-            items.add(annotSummary(dicts.get(i), pageNumbers, notes));
+            items.add(annotSummary(dicts.get(i), objNums.get(i), pageNumbers, notes));
         }
         result.put("items", items);
         return result;
@@ -684,7 +686,8 @@ public final class PdfDocumentStructure {
      * @param unreadable collects the page numbers of the pages that could not be read fully
      * @return the readable annotation dictionaries, in file order
      */
-    private List<Map<String, Object>> annotationDicts(PageEntry page, Set<Integer> unreadable) {
+    private List<Map<String, Object>> annotationDicts(PageEntry page, Set<Integer> unreadable,
+                                                     List<Integer> objNums) {
         List<Map<String, Object>> result = new ArrayList<>();
         if (page.dict().get("Annots") == null) {
             return result;
@@ -696,11 +699,13 @@ public final class PdfDocumentStructure {
         }
         for (Object item : items) {
             Map<String, Object> dict = dictValue(item, DISCARD_NOTES);
+            Integer objNum = refOf(item);
             if (dict == null) {
                 unreadable.add(page.page());
                 continue;
             }
             result.add(dict);
+            objNums.add(objNum != null ? objNum : -1);
         }
         return result;
     }
@@ -735,13 +740,19 @@ public final class PdfDocumentStructure {
     /**
      * One annotation of a page listing.
      */
-    private Map<String, Object> annotSummary(Map<String, Object> annot,
+    private Map<String, Object> annotSummary(Map<String, Object> annot, Integer objNum,
                                              Map<Integer, Integer> pageNumbers,
                                              List<String> notes) {
         Map<String, Object> item = new LinkedHashMap<>();
+        if (objNum != null && objNum >= 0) {
+            item.put("objNum", (long) (int) objNum);
+        }
         if (annot.get("Subtype") instanceof PdfName subtype) {
             item.put("subtype", subtype.toString());
         }
+        // Whether a viewer has a picture to draw is the first thing a filler wants to know: an
+        // annotation without /AP is a note the file carries and the viewer may not show.
+        item.put("hasAppearance", annot.get("AP") != null);
         List<Object> rect = numbers(annot.get("Rect"));
         if (rect != null) {
             item.put("rect", rect);

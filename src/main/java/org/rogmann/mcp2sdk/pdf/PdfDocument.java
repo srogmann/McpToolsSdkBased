@@ -70,6 +70,13 @@ public final class PdfDocument {
     /** Upper bound for the objects a single object stream may declare. */
     private static final int MAX_OBJECTS_PER_STREAM = 2_000_000;
 
+    /**
+     * How many indirect references {@code /Contents} may be wrapped in. One is the normal case
+     * ({@code 217 0 R} pointing at {@code [219 0 R 220 0 R]}); the limit stops a file whose
+     * references run in a circle.
+     */
+    private static final int MAX_CONTENTS_REFERENCE_DEPTH = 8;
+
     private final String displayName;
     private final byte[] data;
     private final PdfFileStructure structure;
@@ -755,11 +762,13 @@ public final class PdfDocument {
     // ===================================================================
 
     /**
-     * One page of the document: its object number plus the objects holding its content.
+     * One page of the document: its object number plus the objects named by its content.
      *
      * @param page 1-based page number
      * @param objNum page object number
-     * @param contentObjNums the objects of {@code /Contents} (usually one)
+     * @param contentObjNums the objects {@code /Contents} names, unread: a content stream, or an
+     *                       object that holds the array of them - {@link #contentStreamObjects}
+     *                       resolves that where the content is read
      */
     public record Page(int page, int objNum, List<Integer> contentObjNums) {
     }
@@ -964,7 +973,15 @@ public final class PdfDocument {
     }
 
     /**
-     * Collects the object numbers behind {@code /Contents} (a reference or an array of them).
+     * Collects the object numbers named by {@code /Contents} of one page.
+     * <p>
+     * The value is a stream or an array of them (12.5.2) - and in both cases it may be an indirect
+     * reference to that thing, so the number collected here is not necessarily a stream object:
+     * {@code /Contents 217 0 R} with 217 holding {@code [219 0 R 220 0 R]} is one of the shapes a
+     * producer writes. Resolving that is <em>not</em> done here: this walk lists pages, and
+     * parsing every content stream for a listing that never looks at it would be work nobody
+     * asked for - {@link #contentStreamObjects} does it where the content is read.
+     * </p>
      */
     private List<Integer> contentObjects(Object contentsValue, List<String> notes) {
         List<Integer> objNums = new ArrayList<>();
@@ -989,6 +1006,75 @@ public final class PdfDocument {
         notes.add("/Contents is " + PdfParser.kindOf(contentsValue)
                 + " instead of a stream reference or an array of them");
         return objNums;
+    }
+
+    /**
+     * The content streams of a page as object numbers, with the indirections 12.5.2 allows
+     * resolved.
+     * <p>
+     * {@code /Contents} names a stream or an array of streams, and either of the two may stand
+     * behind an indirect reference: {@code /Contents 217 0 R}, where 217 is
+     * {@code [219 0 R 220 0 R]}, is what a producer writes when a page carried more than one
+     * content stream - and what PDFBox keeps on a full save. Following that reference belongs
+     * here and not into the page walk ({@link #contentObjects}); {@code pdf.pages()} does not read
+     * content, and a page whose entry cannot be read is <em>named and skipped</em> instead of
+     * failing the whole read.
+     * </p>
+     * @param page the page
+     * @param notes note/warning sink
+     * @return the object numbers of the streams, in the order they have to be concatenated
+     */
+    public List<Integer> contentStreamObjects(Page page, List<String> notes) {
+        List<Integer> result = new ArrayList<>();
+        for (Integer objNum : page.contentObjNums()) {
+            Object value = null;
+            int current = objNum;
+            int depth = 0;
+            boolean skipped = false;
+            while (true) {
+                try {
+                    value = objectValue(current);
+                } catch (PdfException e) {
+                    notes.add("Object " + current + " of " + displayName + " could not be read ("
+                            + e.getMessage() + ") - the page's content skips it");
+                    skipped = true;
+                    break;
+                }
+                if (!(value instanceof PdfReference reference)) {
+                    break;
+                }
+                if (depth++ >= MAX_CONTENTS_REFERENCE_DEPTH) {
+                    notes.add("/Contents of page " + page.page() + " is a chain of more than "
+                            + MAX_CONTENTS_REFERENCE_DEPTH + " indirect references - it was not"
+                            + " followed any further");
+                    skipped = true;
+                    break;
+                }
+                current = reference.objNum();
+            }
+            if (skipped) {
+                continue;
+            }
+            if (value instanceof PdfStream) {
+                result.add(current);
+            } else if (value instanceof List<?> list) {
+                for (Object item : list) {
+                    if (item instanceof PdfReference reference) {
+                        result.add(reference.objNum());
+                    } else {
+                        notes.add("A /Contents item is " + PdfParser.kindOf(item)
+                                + " instead of a reference - it was skipped");
+                    }
+                }
+            } else if (value == null) {
+                notes.add("/Contents of page " + page.page() + " names object " + current
+                        + ", which is null - the page is read without it");
+            } else {
+                notes.add("/Contents of page " + page.page() + " is " + PdfParser.kindOf(value)
+                        + " instead of a stream reference or an array of them");
+            }
+        }
+        return result;
     }
 
     /**
@@ -1023,17 +1109,18 @@ public final class PdfDocument {
             Map<String, Object> item = new LinkedHashMap<>();
             item.put("page", (long) page.page());
             item.put("pageObjNum", (long) page.objNum());
-            List<Object> contentObjNums = new ArrayList<>();
-            for (Integer objNum : page.contentObjNums()) {
-                contentObjNums.add((long) objNum);
-            }
-            item.put("contentObjNums", contentObjNums);
             // Like pdf.text(): a page explains itself. What its fonts have to say goes into the
             // page entry, so the trailing {page: null, notes} entry keeps holding only what the
             // *walk* could not do - and a healthy document stays one entry per page.
             List<String> pageNotes = new ArrayList<>();
+            List<Integer> streamObjects = contentStreamObjects(page, pageNotes);
+            List<Object> contentObjNums = new ArrayList<>();
+            for (Integer objNum : streamObjects) {
+                contentObjNums.add((long) objNum);
+            }
+            item.put("contentObjNums", contentObjNums);
             try {
-                byte[] content = pageContent(page, pageNotes);
+                byte[] content = pageContent(page, streamObjects, pageNotes);
                 item.put("decodedBytes", (long) content.length);
                 Map<String, Object> analysis = PdfContentStream.analyse(content, 40);
                 item.put("operators", analysis.get("histogram"));
@@ -1082,14 +1169,25 @@ public final class PdfDocument {
      * @return the content bytes
      */
     public byte[] pageContent(Page page, List<String> notes) {
-        if (page.contentObjNums().isEmpty()) {
+        return pageContent(page, contentStreamObjects(page, notes), notes);
+    }
+
+    /**
+     * Concatenates the given content streams of a page.
+     * @param page the page (for the message)
+     * @param streamObjects the content stream objects, as {@link #contentStreamObjects} resolved them
+     * @param notes note/warning sink
+     * @return the content bytes
+     */
+    private byte[] pageContent(Page page, List<Integer> streamObjects, List<String> notes) {
+        if (streamObjects.isEmpty()) {
             notes.add("Page " + page.page() + " (object " + page.objNum()
                     + ") has no /Contents");
             return new byte[0];
         }
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         boolean first = true;
-        for (Integer objNum : page.contentObjNums()) {
+        for (Integer objNum : streamObjects) {
             byte[] decoded = stream(objNum).data();
             if (!first && out.size() > 0) {
                 // ISO 32000-1: the streams of one page behave as if they were concatenated
@@ -1322,9 +1420,10 @@ public final class PdfDocument {
             item.put("pageObjNum", (long) page.objNum());
             List<String> pageNotes = new ArrayList<>();
             try {
-                byte[] content = pageContent(page, pageNotes);
-                if (page.contentObjNums().size() > 1) {
-                    pageNotes.add("The offsets are offsets in the " + page.contentObjNums().size()
+                List<Integer> streamObjects = contentStreamObjects(page, pageNotes);
+                byte[] content = pageContent(page, streamObjects, pageNotes);
+                if (streamObjects.size() > 1) {
+                    pageNotes.add("The offsets are offsets in the " + streamObjects.size()
                             + " content streams of this page concatenated (the way the text extract"
                             + " reads them), not in one stream object");
                 }

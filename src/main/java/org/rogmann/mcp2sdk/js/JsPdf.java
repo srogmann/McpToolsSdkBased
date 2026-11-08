@@ -14,6 +14,7 @@ import org.rogmann.mcp2sdk.pdf.PdfFont;
 import org.rogmann.mcp2sdk.pdf.PdfFontProgram;
 import org.rogmann.mcp2sdk.pdf.PdfFontScope;
 import org.rogmann.mcp2sdk.pdf.PdfFontWidths;
+import org.rogmann.mcp2sdk.pdf.PdfFormFields;
 import org.rogmann.mcp2sdk.pdf.PdfGlyphMapper;
 import org.rogmann.mcp2sdk.pdf.PdfGlyphNames;
 import org.rogmann.mcp2sdk.pdf.PdfName;
@@ -526,13 +527,13 @@ public final class JsPdf {
      * from a documented limit, and it is why {@code pdf.contentStreams()} and {@code
      * pdf.operations()} answer exactly what they answered before.
      *
-     * Two kinds are deliberately not items here. A marked-content span stays with {@code
+     * <p>Two kinds are deliberately not items here. A marked-content span stays with {@code
      * pdf.markedContent()}, which is also the function that reads the {@code /ParentTree} a {@code
      * BDC} operand does not carry; as soon as a page opened sequences its {@code notes} say so,
      * because otherwise {@code summary.marks: 0} would read as "this page marked nothing". And no
      * word gap moves into this answer from {@code pdf.text()}: positions are computed here while the
      * text extract keeps its documented rule of thumb, now with its own {@code wordGaps} count
-     * (plan decision 10, closed by D7 on the measurement D5 wrote down).
+     * (plan decision 10, closed by D7 on the measurement D5 wrote down).</p>
      *
      * @param source          the PDF source
      * @param pageIndex       1-based page number, or {@code null} to walk up to {@code maxPages}
@@ -611,7 +612,7 @@ public final class JsPdf {
         if (bbox == null || bbox.isEmpty()) {
             return null;
         }
-        if (bbox.size() != 4 || bbox.stream().anyMatch(v -> v == null)) {
+        if (bbox.size() != 4 || bbox.stream().anyMatch(Objects::isNull)) {
             throw new PdfException("pdf.placement: bbox is four numbers in page space,"
                     + " [x1, y1, x2, y2] - not " + bbox);
         }
@@ -698,21 +699,14 @@ public final class JsPdf {
         if (value == null || value.isBlank()) {
             return "summary";
         }
-        switch (value.toLowerCase(java.util.Locale.ROOT)) {
-            case "summary":
-                return "summary";
-            case "tables":
-                return "tables";
-            case "bytes":
-                return "bytes";
-            case "off":
-            case "false":
-            case "none":
-                return "off";
-            default:
-                throw new PdfException("pdf.font: option 'program' is '" + value
-                        + "' - it reads 'summary', 'tables', 'bytes' or false");
-        }
+        return switch (value.toLowerCase(Locale.ROOT)) {
+            case "summary" -> "summary";
+            case "tables" -> "tables";
+            case "bytes" -> "bytes";
+            case "off", "false", "none" -> "off";
+            default -> throw new PdfException("pdf.font: option 'program' is '" + value
+                    + "' - it reads 'summary', 'tables', 'bytes' or false");
+        };
     }
 
     /**
@@ -724,19 +718,13 @@ public final class JsPdf {
         if (value == null || value.isBlank()) {
             return fallback;
         }
-        switch (value.toLowerCase(java.util.Locale.ROOT)) {
-            case "summary":
-                return "summary";
-            case "full":
-                return "full";
-            case "off":
-            case "false":
-            case "none":
-                return "off";
-            default:
-                throw new PdfException("pdf.font: option '" + what + "' is '" + value
-                        + "' - it reads 'summary', 'full' or false");
-        }
+        return switch (value.toLowerCase(Locale.ROOT)) {
+            case "summary" -> "summary";
+            case "full" -> "full";
+            case "off", "false", "none" -> "off";
+            default -> throw new PdfException("pdf.font: option '" + what + "' is '" + value
+                    + "' - it reads 'summary', 'full' or false");
+        };
     }
 
     /**
@@ -759,7 +747,7 @@ public final class JsPdf {
         PdfDocument document = open(source);
         List<Object> notes = new ArrayList<>();
         List<String> crossChecks = new ArrayList<>();
-        Integer objNum = null;
+        Integer objNum;
         String kind = "cmap";
         Map<String, Object> head = new LinkedHashMap<>();
         if (fontObjNum != null) {
@@ -826,9 +814,9 @@ public final class JsPdf {
                 warnings.addAll(crossChecks);
             }
         }
-        if (!notes.isEmpty()) {
-            result.put("notes", notes);
-        }
+        // No "notes" block here: the two sentences of this call belong to the early return above
+        // (a font without /ToUnicode), and a block that can never fire is a promise that is not
+        // kept. What the reading itself could not match is answered in "warnings".
         return result;
     }
 
@@ -876,9 +864,7 @@ public final class JsPdf {
             throw new PdfException("pdf.cmap: " + out.size() + " codes are more than the "
                     + MAX_CODE_ITEMS + " a single call answers");
         }
-        for (int i = 0; i < out.size(); i++) {
-            out.set(i, cmap.requireCode(out.get(i)));
-        }
+        out.replaceAll(cmap::requireCode);
         return out.isEmpty() ? null : out;
     }
 
@@ -1126,7 +1112,7 @@ public final class JsPdf {
         }
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < spaces.size() && i < LISTED_CODE_SPACES; i++) {
-            if (sb.length() > 0) {
+            if (!sb.isEmpty()) {
                 sb.append(' ');
             }
             PdfCMap.CodeSpace space = spaces.get(i);
@@ -1144,14 +1130,11 @@ public final class JsPdf {
         if (value == null || value.isBlank() || "both".equals(value)) {
             return "both";
         }
-        switch (value) {
-            case "unicode":
-            case "codes":
-                return value;
-            default:
-                throw new PdfException("pdf.decodeString: option 'as' is '" + value
-                        + "' - it reads 'both', 'unicode' or 'codes'");
-        }
+        return switch (value) {
+            case "unicode", "codes" -> value;
+            default -> throw new PdfException("pdf.decodeString: option 'as' is '" + value
+                    + "' - it reads 'both', 'unicode' or 'codes'");
+        };
     }
 
     // ===================================================================
@@ -1285,12 +1268,12 @@ public final class JsPdf {
         String firstComposite = null;
         String firstGlyphless = null;
         boolean cut = false;
-        for (int i = 0; i < wanted.size(); i++) {
+        for (String s : wanted) {
             if (maxItems > 0 && glyphs.size() >= maxItems) {
                 cut = true;
                 break;
             }
-            String hex = wanted.get(i);
+            String hex = s;
             long code = Long.parseLong(hex, 16);
             Map<String, Object> glyph = new LinkedHashMap<>();
             glyph.put("hex", hex);
@@ -1467,7 +1450,7 @@ public final class JsPdf {
         out.put("codeBytes", mapper.codeBytes() == null ? null : (long) (int) mapper.codeBytes());
         if (embedded != null && embedded.objNum() != null) {
             Map<String, Object> program = new LinkedHashMap<>();
-            program.put("objNum", (long) embedded.objNum().intValue());
+            program.put("objNum", (long) embedded.objNum());
             program.put("kind", embedded.kind());
             out.put("program", program);
         }
@@ -1604,7 +1587,7 @@ public final class JsPdf {
             }
             sb.append(Character.toUpperCase(c));
         }
-        if (sb.length() == 0) {
+        if (sb.isEmpty()) {
             throw new PdfException("pdf.glyphMetrics: '" + token + "' holds no hex digit");
         }
         if (sb.length() % 2 != 0 || sb.length() > 8) {
@@ -1670,26 +1653,26 @@ public final class JsPdf {
         if (rounded == Math.rint(rounded)) {
             // A whole number stays whole (612, not 612.0) - deliberately two statements, because a
             // conditional expression would promote both branches to double.
-            return Long.valueOf((long) rounded);
+            return (long) rounded;
         }
-        return Double.valueOf(rounded);
+        return rounded;
     }
 
     /** A scaling factor, shown to six decimals (the {@code *Pt} values use the exact ratio). */
     private static Number factor(double value) {
         double rounded = round(value, 6);
         if (rounded == Math.rint(rounded)) {
-            return Long.valueOf((long) rounded);
+            return (long) rounded;
         }
-        return Double.valueOf(rounded);
+        return rounded;
     }
 
     /** A number that is allowed to be whole: a font size of 10 reads as 10, not 10.0. */
     private static Number exact(double value) {
         if (!Double.isInfinite(value) && !Double.isNaN(value) && value == Math.rint(value)) {
-            return Long.valueOf((long) value);
+            return (long) value;
         }
-        return Double.valueOf(value);
+        return value;
     }
 
     /** The value rounded to {@code decimals} places, as a double. */
@@ -1809,6 +1792,52 @@ public final class JsPdf {
     }
 
     /**
+     * The interactive form, field by field: the fully qualified name, the object number of the
+     * field dictionary, the widgets that draw it - and the value each field holds.
+     *
+     * <h2>What it answers that {@code pdf.document().form} cannot</h2>
+     *
+     * {@code pdf.document()} summarises a form (how many fields, which types,
+     * {@code /NeedAppearances}, {@code /DA}, whether an XFA packet is there). A <em>filler</em>
+     * needs addresses: the name a value is addressed by, the object that holds the field, and the
+     * widgets (one per place the field appears - the same field may sit on two pages). This is
+     * the read {@code pdfedit}'s {@code form.fill} builds on, and it stays where the doctrine puts
+     * it: reading is {@code pdf}, writing is {@code pdfedit}.
+     *
+     * <h2>The rules behind the entries (ISO 32000-1, 12.7.4)</h2>
+     *
+     * {@code name} is the fully qualified name (the {@code /T} chain joined with '.'),
+     * {@code objNum} the object number of the field dictionary, {@code widgetObjNums} those of its
+     * widgets. {@code type} is {@code text}, {@code checkbox}, {@code radio}, {@code pushbutton},
+     * {@code choice}, {@code signature} - or {@code non-terminal} for a branch, which is reported
+     * as what it is instead of guessing a type from its children. {@code value} is {@code /V}
+     * prepared for a reader (a choice shows the display text of its {@code /Opt} pair, a button its
+     * export name), {@code rawValue} the value as written; a field without {@code /V} answers
+     * {@code value: null} - {@code /DV} is reported separately and is not a value.
+     *
+     * <h2>What it does not do</h2>
+     *
+     * Nothing is executed: {@code /AA} actions are counted and named; an <b>XFA</b> form answers
+     * an empty field list plus the note that its fields stand in the packet, not in the AcroForm.
+     * The listing is bounded ({@code maxFields}, {@code maxDepth}, {@code maxValueChars}) and a cut
+     * is marked while {@code count} keeps the full number.
+     *
+     * @param source        the PDF source
+     * @param pageIndex     1-based page number to filter by (fields with a widget on that page),
+     *                      or {@code null} for every field
+     * @param maxFields     fields reported (0 = {@link PdfFormFields#DEFAULT_MAX_FIELDS})
+     * @param maxDepth      nesting depth of the field tree (0 = the default)
+     * @param maxValueChars characters of a value shown per entry (0 = the default)
+     * @return {@code {present, objNum?, fields, count, total?, truncated?, xfa?,
+     *         needAppearances?, defaultAppearance?, calculationOrder?, notes?}}
+     */
+    public static Map<String, Object> formFields(Source source, Integer pageIndex, int maxFields,
+                                                 int maxDepth, int maxValueChars) {
+        return new PdfFormFields(open(source)).listing(requirePage(pageIndex, "pdf.formFields"),
+                maxFields, maxDepth, maxValueChars);
+    }
+
+    /**
      * Status of the module: limits and scope.
      * @return status map
      */
@@ -1819,8 +1848,10 @@ public final class JsPdf {
                 + " and the declarations of an embedded Type 1 or CFF program, the width and box of"
                 + " a glyph in text space, every string of a page read through its font), document"
                 + " structure (catalog, page tree, outlines,"
-                + " annotations, form, name trees), the named resources of a stream (every category"
-                + " of PDF 1.7 Table 3.30: the name a content stream writes resolved to its object),"
+                + " annotations, the interactive form field by field - names, values, widgets,"
+                + " pdf.formFields() - and name trees), the named resources of a stream (every"
+                + " category of PDF 1.7 Table 3.30: the name a content stream writes resolved to its"
+                + " object),"
                 + " the graphics state a content stream builds (CTM, q/Q, text state, path, clip)"
                 + " read as the state machine it is, and the tagged-PDF structure tree with its"
                 + " marked content");
@@ -1902,6 +1933,9 @@ public final class JsPdf {
             map.put("glyphListError", PdfGlyphNames.builtin().loadError());
         }
         map.put("defaultMaxElements", (long) PdfStructTree.DEFAULT_MAX_ELEMENTS);
+        map.put("defaultMaxFields", (long) PdfFormFields.DEFAULT_MAX_FIELDS);
+        map.put("maxFieldDepth", (long) PdfFormFields.DEFAULT_MAX_DEPTH);
+        map.put("defaultMaxValueChars", (long) PdfFormFields.DEFAULT_MAX_VALUE_CHARS);
         map.put("maxOutlineDepth", (long) PdfDocumentStructure.MAX_OUTLINE_DEPTH);
         map.put("maxStructureDepth", (long) PdfStructTree.MAX_STRUCTURE_DEPTH);
         map.put("maxPlainNodes", (long) PdfValues.DEFAULT_MAX_NODES);
@@ -1935,7 +1969,8 @@ public final class JsPdf {
                         + " ICC profile, no rendering intent, no CMYK-to-RGB, no follow-through of a"
                         + " page's DefaultGray/DefaultRGB/DefaultCMYK resources (4.5.4, S. 257/258 -"
                         + " such a space is named in the page's notes, never applied), no alpha"
-                        + " composed with the state's CA/ca",
+                        + " composed with the state's CA/ca, and no colour name: 'that is IBM blue'"
+                        + " is a statement about a colour this module does not compute",
                 "the components behind a scn/SCN in a space this module did not read: 4.5.7, S. 288"
                         + " makes their number and meaning a property of the colour space, so the"
                         + " answer keeps the operands as text, names the pattern's resource name and"
@@ -1974,9 +2009,11 @@ public final class JsPdf {
                         + " (pdf.fonts(path, {formXObjects: true}) at least lists the fonts an"
                         + " XObject would need)",
                 "decryption of encrypted documents (the encryption is described, not applied)",
-                "page rendering and form filling",
-                "XFA form packets (the AcroForm fields are read, the XFA stream is not"
-                        + " interpreted)",
+                "page rendering (pdf.formFields() reads the AcroForm fields; filling a form is"
+                        + " pdfedit's form.fill - what a viewer draws is not computed here)",
+                "XFA form packets (pdf.formFields() answers an empty field list for such a form,"
+                        + " because its fields stand in the packet and not in the AcroForm; the"
+                        + " packet itself is a stream, not interpreted)",
                 "digital signatures (their structure is listed, the cryptographic state is not"
                         + " verified)"));
         map.put("rawBytes", "for byte-level questions use fs.readBytes / fs.readHex - pdf never"

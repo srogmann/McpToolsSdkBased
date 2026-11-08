@@ -925,8 +925,7 @@ public final class PlacementSink implements PdfContentSink {
         item.put("op", operation.name());
         item.put("space", space);
         item.put("subpaths", (long) path.subpaths());
-        Map<String, Object> segments = new LinkedHashMap<>();
-        path.counts().forEach((kind, count) -> segments.put(kind, count));
+        Map<String, Object> segments = new LinkedHashMap<>(path.counts());
         item.put("segments", segments);
         if (options.drawing()) {
             // D8b: the numbers behind those counts, in the space this item reports in.
@@ -952,16 +951,22 @@ public final class PlacementSink implements PdfContentSink {
         item.put("bbox", box == null ? null : numbers(box));
         item.put("bboxSource", box == null ? "none"
                 : ("control-polygon".equals(path.bboxSource()) ? "control-polygon" : "path-points"));
-        if (box == null && singularRoute(path, space)) {
-            // Decision 9: a matrix without an inverse gets a sentence, not a coordinate.
-            item.put("singularNote", singularRouteOf(path, space).singularNote());
+        if (box == null) {
+            // Decision 9: a matrix without an inverse gets a sentence, not a coordinate. Asked
+            // once - singularRouteOf() walks every segment of the path, and a key without a
+            // statement (singularNote: null) would be one more field nobody can read.
+            PdfMatrix singular = singularRouteOf(path, space);
+            String note = singular == null ? null : singular.singularNote();
+            if (note != null) {
+                item.put("singularNote", note);
+            }
         }
         // A line width is a distance, not a point (4.3.2, S. 215): it travels the linear part only,
         // and a CTM that scales the two axes differently makes it a direction, not a number.
         item.put("lineWidth", round(operation.stateBefore().lineWidth()));
         if (space.equals(PdfSpace.PAGE) && !singularRoute(path, space)) {
             double[] span = operation.stateBefore().widthSpanIn(widthRoute(operation.ctm()));
-            if (span != null && Math.abs(span[0] - span[1]) > 1e-9) {
+            if (Math.abs(span[0] - span[1]) > 1e-9) {
                 item.put("lineWidthSpan", List.of(round(span[0]), round(span[1])));
             }
         }
@@ -1090,8 +1095,9 @@ public final class PlacementSink implements PdfContentSink {
         String space = spaceName();
         java.util.Optional<PdfQuad> quad = XObjectOps.bboxInSpace(target, operation.ctm(),
                 pageRouteOrNull(), space);
-        Map<String, Object> item = XObjectOps.item(target, quad, space, depth, inName, operation);
-        if (!insideFilter(null, quad.isPresent() ? numbersOf(quad.get().bbox()) : null)) {
+        Map<String, Object> item = XObjectOps.item(target, quad, space, depth, inName, operation,
+                this::deref);
+        if (!insideFilter(null, quad.map(pdfQuad -> numbersOf(pdfQuad.bbox())).orElse(null))) {
             filteredOut++;
             return;
         }
@@ -1196,12 +1202,12 @@ public final class PlacementSink implements PdfContentSink {
         }
         java.util.Optional<PdfQuad> unit = XObjectOps.imageUnitIn(operation.ctm(), pageRouteOrNull(),
                 space);
-        item.put("bbox", unit.isPresent() ? numbersOf(unit.get().bbox()) : null);
+        item.put("bbox", unit.map(pdfQuad -> numbersOf(pdfQuad.bbox())).orElse(null));
         item.put("bboxSource", unit.isPresent() ? "image-space" : "none");
-        if (!unit.isPresent() && operation.ctm().isSingular()) {
+        if (unit.isEmpty() && operation.ctm().isSingular()) {
             item.put("singularNote", operation.ctm().singularNote());
         }
-        if (!insideFilter(null, unit.isPresent() ? numbersOf(unit.get().bbox()) : null)) {
+        if (!insideFilter(null, unit.map(pdfQuad -> numbersOf(pdfQuad.bbox())).orElse(null))) {
             filteredOut++;
             return;
         }
@@ -1280,7 +1286,7 @@ public final class PlacementSink implements PdfContentSink {
                 font.put("objNum", (long) (int) objNum);
             }
         } else if (text.fontObjNum() != null) {
-            font.put("objNum", (long) (int) text.fontObjNum().intValue());
+            font.put("objNum", (long) text.fontObjNum());
         } else {
             font.put("resourceName", null);
         }
@@ -1626,11 +1632,29 @@ public final class PlacementSink implements PdfContentSink {
         return toPage == null ? ctm : ctm.multiply(toPage);
     }
 
-    /** A user-space point of a path or a state in the space the answer reports in. */
+    /**
+     * A user-space point of a path or a state in the space the answer reports in.
+     * <p>
+     * The page branch is only ever reached with a frame: {@link #spaceName()} answers
+     * {@code page} exactly when the page space is usable, which is the same condition as
+     * {@link PdfPageSpace#defaultUserToPage()} being present ({@code isUsable()} is
+     * {@code defect == null}, and a defect is what empties the optional). The check below is not
+     * arithmetic on a guess - it turns a disagreement between those two into a sentence instead
+     * of a NullPointerException inside {@link PdfMatrix#multiply}.
+     * </p>
+     */
     private PdfPoint mapped(PdfPoint userPoint, PdfMatrix ctm, String space) {
-        return space.equals(PdfSpace.PAGE)
-                ? ctm.multiply(pageRouteOrNull()).map(userPoint, PdfSpace.PAGE)
-                : ctm.map(userPoint, PdfSpace.USER);
+        if (!space.equals(PdfSpace.PAGE)) {
+            return ctm.map(userPoint, PdfSpace.USER);
+        }
+        PdfMatrix toPage = pageRouteOrNull();
+        if (toPage == null) {
+            throw new PdfException("pdf.placement: an item was to be reported in page space,"
+                    + " but the page has no frame - the sink's space name and its page matrix"
+                    + " disagree (a defect of the page space must be reported as"
+                    + " pageComputed:false, not as a coordinate)");
+        }
+        return ctm.multiply(toPage).map(userPoint, PdfSpace.PAGE);
     }
 
     /**
