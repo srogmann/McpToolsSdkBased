@@ -11,9 +11,9 @@ import java.util.Map;
  * Bridge between GraalVM JavaScript and the core of {@link JsCrypto}.
  * <p>
  * Creates a {@link ProxyObject} namespace {@code "crypto"} exposing hashing functions
- * ({@code md5}, {@code sha1}, {@code sha256}), HMAC ({@code hmac}), the convenience block
- * ciphers ({@code aesCbcEncrypt}, {@code aesCbcDecrypt}, {@code aesCtrXor}) and the
- * compression primitives ({@code inflate}, {@code deflate}).
+ * ({@code md5}, {@code sha1}, {@code sha256}, {@code sha512}), HMAC ({@code hmac}), the
+ * convenience block ciphers ({@code aesCbcEncrypt}, {@code aesCbcDecrypt}, {@code aesCtrXor})
+ * and the compression primitives ({@code inflate}, {@code deflate}).
  * </p>
  * <p>
  * Hashing: a single string argument is treated as a file path (streamed); a byte array
@@ -73,6 +73,7 @@ public class JsCryptoBridge implements JsModuleInterface {
         methods.put("md5", (ProxyExecutable) args -> hash("md5", args));
         methods.put("sha1", (ProxyExecutable) args -> hash("sha1", args));
         methods.put("sha256", (ProxyExecutable) args -> hash("sha256", args));
+        methods.put("sha512", (ProxyExecutable) args -> hash("sha512", args));
 
         methods.put("aesCbcEncrypt", (ProxyExecutable) args -> {
             requireArgs(args, 3, "aesCbcEncrypt(key, iv, data)");
@@ -161,7 +162,9 @@ public class JsCryptoBridge implements JsModuleInterface {
             return switch (name) {
                 case "md5" -> JsCrypto.md5(path);
                 case "sha1" -> JsCrypto.sha1(path);
-                default -> JsCrypto.sha256(path);
+                case "sha256" -> JsCrypto.sha256(path);
+                case "sha512" -> JsCrypto.sha512(path);
+                default -> throw unknownHashFunction(name);
             };
         }
         byte[] data;
@@ -176,8 +179,21 @@ public class JsCryptoBridge implements JsModuleInterface {
         return switch (name) {
             case "md5" -> JsCrypto.md5(data);
             case "sha1" -> JsCrypto.sha1(data);
-            default -> JsCrypto.sha256(data);
+            case "sha256" -> JsCrypto.sha256(data);
+            case "sha512" -> JsCrypto.sha512(data);
+            default -> throw unknownHashFunction(name);
         };
+    }
+
+    /**
+     * Builds the error for a hash name the bridge does not bind (a new name must be added
+     * here explicitly, so a typo can never silently fall back to another digest).
+     * @param name the requested member name
+     * @return the exception to throw
+     */
+    private static IllegalArgumentException unknownHashFunction(String name) {
+        return new IllegalArgumentException("Unknown hash function 'crypto." + name
+                + "' (supported: md5, sha1, sha256, sha512)");
     }
 
     /**

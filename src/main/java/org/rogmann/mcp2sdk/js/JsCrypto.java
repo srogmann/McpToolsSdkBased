@@ -24,8 +24,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Core cryptographic functions operating on byte arrays: hashing (MD5, SHA-1, SHA-256), HMAC,
- * AES-CBC/CTR convenience operations, the raw AES/ECB block engine and deflate/inflate.
+ * Core cryptographic functions operating on byte arrays: hashing (MD5, SHA-1, SHA-256,
+ * SHA-512), HMAC, AES-CBC/CTR convenience operations, the raw AES/ECB block engine and
+ * deflate/inflate.
  * <p>
  * Hashing works on byte arrays in memory or on files by streaming through an
  * {@link InputStream} (constant memory). All file access uses the same security checks as
@@ -117,6 +118,26 @@ public class JsCrypto {
      */
     public static String sha256(String filePath) {
         return digestFile("SHA-256", filePath);
+    }
+
+    /**
+     * Computes the SHA-512 hash of a byte array (FIPS 180-4, 512-bit digest).
+     * @param data bytes to hash
+     * @return lowercase hex string (128 characters)
+     * @throws IllegalArgumentException if data is null
+     */
+    public static String sha512(byte[] data) {
+        return digest("SHA-512", data);
+    }
+
+    /**
+     * Computes the SHA-512 hash of a file (streamed, constant memory).
+     * @param filePath path relative to the base directory
+     * @return lowercase hex string (128 characters)
+     * @throws JsUserRuntimeException if the file does not exist or an I/O error occurs
+     */
+    public static String sha512(String filePath) {
+        return digestFile("SHA-512", filePath);
     }
 
     /**
@@ -637,8 +658,11 @@ public class JsCrypto {
                 1) Hashing of byte arrays or files.
                    A string argument is treated as a file path relative to the project base
                    directory (streamed, constant memory). A byte array (Uint8Array or array of
-                   numbers 0-255) is hashed in memory. Return value is a lowercase hex string.
-                   crypto.md5(pathOrData) / crypto.sha1(pathOrData) / crypto.sha256(pathOrData)
+                   numbers 0-255) is hashed in memory. Return value is a lowercase hex string:
+                   crypto.md5(pathOrData)    -> MD5, 32 hex characters
+                   crypto.sha1(pathOrData)   -> SHA-1, 40 hex characters
+                   crypto.sha256(pathOrData) -> SHA-256, 64 hex characters
+                   crypto.sha512(pathOrData) -> SHA-512 (FIPS 180-4), 128 hex characters
 
                 2) AES-CBC and AES-CTR (normal use: key + IV + data, standard JCA
                    transformations; the IV is 16 bytes):
@@ -662,6 +686,7 @@ public class JsCrypto {
 
                 Examples:
                     var h = crypto.sha256("out.bin");                 // hash a file
+                    var h512 = crypto.sha512(bytes);                  // 128 hex characters
                     var pt = crypto.aesCbcDecrypt(key, iv, ct);       // padded AES-CBC
                     var raw = crypto.inflate(bytes, 'zlib');          // PDF /FlateDecode
                     Reference vectors are validated by the JUnit tests JsCryptoTest and
