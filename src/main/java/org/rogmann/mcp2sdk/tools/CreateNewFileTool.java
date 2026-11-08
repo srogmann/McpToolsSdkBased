@@ -71,7 +71,7 @@ public class CreateNewFileTool {
 
         Map<String, Object> overwriteProp = new HashMap<>();
         overwriteProp.put("type", "boolean");
-        overwriteProp.put("description", "Whether an existing file may be overwritten");
+        overwriteProp.put("description", "Whether an existing file may be overwritten (default is false, use true to overwrite an existing file)");
         properties.put("overwrite", overwriteProp);
 
         List<String> requiredFields = List.of("pathInProject", "text");
