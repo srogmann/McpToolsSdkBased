@@ -459,11 +459,17 @@ public class JsImage implements AutoCloseable {
                   // -> {width, height, format, bytes, model, seed, url, imageUrl, path}
                   image.edit("photo.png", {prompt: 'make the sky a sunset'})
                   image.edit([a, b], {prompt: 'merge both scenes'})   // up to 4 sources
+                  // (the legacy edit dialect carries exactly ONE source in a JSON body; the
+                  // multipart dialect carries up to 4)
                   // output: 'none' (default: metadata only) | 'demo' (gallery page);
                   // includeBytes: true adds data (Uint8Array) - only to pass it on inside this
                   // script, never to paste it into an answer
-                  // negativePrompt is accepted but never sent (the endpoint has no such
-                  // field); the answer says negativePromptIgnored: true
+                  // negativePrompt: sent as negative_prompt by the legacy generation dialect,
+                  // otherwise accepted but not sent (no such field) and reported as
+                  // negativePromptIgnored: true
+                  // wire dialect (properties, default legacy = the variant proven live):
+                  // mcp.js.image.dialect (override mcp.js.image.edit.dialect): legacy | native
+                  // size/steps come from mcp.js.image.size / mcp.js.image.steps when set
 
                 Showing a picture in an answer: as a Markdown LINK, nothing else -
                   [generated image](<url>) or [annotated file](<path>).
@@ -514,9 +520,9 @@ public class JsImage implements AutoCloseable {
                 ? "vision-capable model configured - describe/ocr/vision available"
                 : "off - set webui.hasVision=true and webui.model.url for describe/ocr/vision");
         sb.append('\n').append("  image.generate/edit: ").append(ImageClient.isConfigured()
-                ? "endpoint configured (" + ImageClient.PROP_GEN_MODEL + " is set)"
-                : "off - set " + ImageClient.PROP_GEN_MODEL + " (e.g. 'Qwen/Qwen-Image-2.1')"
-                        + " and the gateway");
+                ? "endpoint configured (" + ImageClient.PROP_MODEL + " is set)"
+                : "off - set " + ImageClient.PROP_MODEL + " (e.g. 'Qwen/Qwen-Image-2.1')"
+                        + " and " + ImageClient.PROP_URL + " (default: the gateway)");
         LocalWebServerConfig server = localWebServer;
         sb.append('\n').append("  output 'demo': ");
         if (server == null) {
@@ -2981,8 +2987,9 @@ public class JsImage implements AutoCloseable {
 
     /**
      * Generates a picture with the configured diffusion endpoint.
-     * @param options {@code {prompt (required, ≤ 800 chars), negativePrompt? (accepted, not
-     *                sent), model?, size? ('WxH'), width?, height?, seed?, steps?, format?,
+     * @param options {@code {prompt (required, ≤ 800 chars), negativePrompt? (sent as
+     *                negative_prompt by the legacy generation dialect, otherwise reported as
+     *                ignored), model?, size? ('WxH'), width?, height?, seed?, steps?, format?,
      *                output? ('none'|'demo'), demoClear?, path?, overwrite?, includeBytes?,
      *                timeoutSeconds?}}
      * @return {@code {width, height, format, bytes, model, seed, path?, url?, imageUrl?,
@@ -2995,18 +3002,22 @@ public class JsImage implements AutoCloseable {
                 "includeBytes", "timeoutSeconds");
         String prompt = requirePrompt(fn, options);
         ImageClient client = new ImageClient(); // strict property validation happens here
+        String negativePrompt = stringOpt(fn, options, "negativePrompt", null);
         ImageClient.Result result = client.generate(new ImageClient.GenerateRequest(prompt,
                 stringOpt(fn, options, "model", null), sizeOption(fn, options),
                 intOrNull(fn, options, "seed", 0, Integer.MAX_VALUE),
                 intOrNull(fn, options, "steps", 1, 1000),
-                formatOption(fn, options),
+                formatOption(fn, options), negativePrompt,
                 intOrNull(fn, options, "timeoutSeconds", 1, 3600)));
-        return finishGenerated(fn, prompt, result, options);
+        return finishGenerated(fn, prompt, result, options,
+                negativePrompt != null && !client.sendsNegativePrompt());
     }
 
     /**
-     * Edits one or more pictures with the configured endpoint (the sources go as base64 into a
-     * multipart form; a {@code negativePrompt} is not sent - the endpoint has no such field).
+     * Edits one or more pictures with the configured endpoint. How the sources travel depends on
+     * the wire dialect: bare base64 in a multipart form (native, 1..4 sources) or one
+     * {@code data:} URL inside a JSON body (legacy, exactly one source). A {@code negativePrompt}
+     * is never sent by the edit; the answer says so when the caller passed one.
      * @param sources the source pictures (1..4)
      * @param display display path for messages (the first source)
      * @param options same as {@link #generate(Map)}
@@ -3042,7 +3053,8 @@ public class JsImage implements AutoCloseable {
                 intOrNull(fn, options, "steps", 1, 1000),
                 formatOption(fn, options), sources,
                 intOrNull(fn, options, "timeoutSeconds", 1, 3600)));
-        return finishGenerated(fn, prompt, result, options);
+        return finishGenerated(fn, prompt, result, options,
+                options != null && options.get("negativePrompt") != null);
     }
 
     /**
@@ -3053,11 +3065,14 @@ public class JsImage implements AutoCloseable {
      * @param prompt the prompt (file-name slug, gallery)
      * @param result what the endpoint delivered
      * @param options the caller's options
+     * @param negativePromptIgnored whether the caller passed a {@code negativePrompt} the request
+     *                              could not carry
      * @return the result map
      */
     private Map<String, Object> finishGenerated(String fn, String prompt,
                                                 ImageClient.Result result,
-                                                Map<String, Object> options) {
+                                                Map<String, Object> options,
+                                                boolean negativePromptIgnored) {
         byte[] bytes = result.bytes();
         checkOutputBytes(fn, bytes);
         String format = result.format();
@@ -3090,9 +3105,9 @@ public class JsImage implements AutoCloseable {
         if (result.requestId() != null) {
             out.put("requestId", result.requestId());
         }
-        if (options != null && options.get("negativePrompt") != null) {
-            // Accepted for the fork's scripts, never sent: the reference endpoint has no such
-            // field. Saying that in the answer is better than dropping it in silence.
+        if (negativePromptIgnored) {
+            // Accepted for the fork's scripts, but the wire dialect in use has no such field.
+            // Saying that in the answer is better than dropping it in silence.
             out.put("negativePromptIgnored", true);
         }
         String path = stringOpt(fn, options, "path", null);
@@ -3258,8 +3273,8 @@ public class JsImage implements AutoCloseable {
         boolean generation = ImageClient.isConfigured();
         Map<String, Object> generationMap = new LinkedHashMap<>();
         generationMap.put("available", generation);
-        generationMap.put("reason", generation ? null : ImageClient.PROP_GEN_MODEL
-                + " is not set or no gateway (webui.model.url)");
+        generationMap.put("reason", generation ? null : ImageClient.PROP_MODEL
+                + " is not set or no URL (" + ImageClient.PROP_URL + " / webui.model.url)");
         capabilities.put("generation", generationMap);
         LocalWebServerConfig server = localWebServer;
         Map<String, Object> demoMap = new LinkedHashMap<>();

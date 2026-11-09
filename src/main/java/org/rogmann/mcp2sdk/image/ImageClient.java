@@ -27,35 +27,70 @@ import java.util.UUID;
 /**
  * One-shot client of an OpenAI-compatible image endpoint: text-to-image
  * ({@code POST /v1/images/generations}, JSON) and image edit
- * ({@code POST /v1/images/edits}, {@code multipart/form-data}) - the counterpart of
- * {@link VisionClient} for the drawing side, with the same rules: one request, no session, no
- * state across calls, plain {@link HttpURLConnection}, no new dependency.
+ * ({@code POST /v1/images/edits}, {@code multipart/form-data} or JSON with a data URL) - the
+ * counterpart of {@link VisionClient} for the drawing side, with the same rules: one request, no
+ * session, no state across calls, plain {@link HttpURLConnection}, no new dependency.
  * <p>
- * The request and response shapes follow the reference server this project talks to
+ * The <em>native</em> request shape follows the reference server this project talks to
  * ({@code server_qwen_image21.py}, mirrored by {@code image_edit_client.py}): the generation
  * body carries {@code model}, {@code prompt}, {@code output_format} and optionally
  * {@code size}, {@code seed} and {@code num_inference_steps}; the edit is a multipart form whose
  * {@code image} fields hold <strong>bare base64 strings</strong> (no {@code filename}, no
  * {@code Content-Type} part - the server parses them as plain form values, and a data URL would
  * be rejected). The answer is {@code {data: [{b64_json}], usage: {width, height, seed}}}; a
- * {@code data[0].url} answer is downloaded here, through the same host rule as the endpoint.
+ * {@code data[0].url} answer is downloaded here (a {@code data:} URL in that field is decoded
+ * inline, see below) - through the host rule, which compares an answered URL with the configured
+ * endpoint's host.
+ * </p>
+ *
+ * <h3>Two wire dialects, and why both are here</h3>
+ * <p>
+ * The <em>legacy</em> dialect is the one a parallel fork of this module used, and the only one
+ * that has been proven against a live gateway: the generation body always carries {@code n},
+ * {@code seed}, {@code steps}, {@code cfg_scale}, {@code disable_safety_checker} and
+ * {@code negative_prompt} (and never {@code output_format}; {@code size} only when the caller
+ * names one), and the edit is a JSON body whose single {@code image} field holds a
+ * {@code data:image/…;base64,…} URL. The two dialects are <strong>not interchangeable</strong>:
+ * each server answers one of them with a rejection of the other (the reference server parses
+ * {@code image} as a plain form value and refuses multipart, and a data URL is not a form value
+ * at all).
+ * </p>
+ * <p>
+ * {@value #PROP_DIALECT} and {@value #PROP_EDIT_DIALECT} pick the dialect per call, and both
+ * <strong>default to {@code legacy}</strong> - the variant that demonstrably works - while
+ * {@code native} stays opt-in until it has had its first live run (docs/js/image.md §11). A
+ * caller that reads the dialect sees it in the messages: options a dialect cannot carry are
+ * refused by name, never dropped in silence.
  * </p>
  *
  * <h3>Configuration (application.yml or {@code -D}, resolved through the Spring
  * {@link Environment})</h3>
  * <ul>
- *   <li>{@value #PROP_GEN_URL} / {@value #PROP_EDIT_URL} - base URL of the endpoints; the
- *       default is the current model's gateway ({@code webui.model.url}), completed with
- *       {@code /v1/images/generations} resp. {@code /v1/images/edits} the way the Web UI proxy
- *       completes its paths,</li>
- *   <li>{@value #PROP_GEN_MODEL} / {@value #PROP_EDIT_MODEL} - the diffusion model; there is
+ *   <li>{@value #PROP_MODEL} / {@value #PROP_EDIT_MODEL} - the diffusion model; there is
  *       deliberately <em>no</em> default (servers differ: {@code Qwen/Qwen-Image-2.1}, flux
- *       variants, …), so an unconfigured model is a clear message and not a wrong guess,</li>
- *   <li>{@value #PROP_GEN_STEPS} / {@value #PROP_EDIT_STEPS} - default for
- *       {@code num_inference_steps}; unset means "send nothing", so the server's own default
- *       applies (4 for a distilled flux, 40 for Qwen - no number of ours can be right for both),</li>
- *   <li>{@value #PROP_ALLOW_EXTERNAL_HOST} - the safety switch: without it the endpoint (and a
- *       {@code url} in the answer) must point at the configured gateway's host,</li>
+ *       variants, …), so an unconfigured model is a clear message and not a wrong guess,
+ *       {@value #PROP_EDIT_MODEL} falls back to {@value #PROP_MODEL},</li>
+ *   <li>{@value #PROP_URL} - base URL of the diffusion endpoint; the default is the current
+ *       model's gateway ({@code webui.model.url}), completed with
+ *       {@code /v1/images/generations} resp. {@code /v1/images/edits} the way the Web UI proxy
+ *       completes its paths. The property is the way to give the diffusion models their own
+ *       server,</li>
+ *   <li>{@value #PROP_SIZE} - default {@code size} ({@code "WxH"}, e.g. {@code 1024x1024}); unset
+ *       means "send no size", so the server's own default applies (the {@code legacy} edit body
+ *       never carries one),</li>
+ *   <li>{@value #PROP_STEPS} - default step count ({@code num_inference_steps} resp.
+ *       {@code steps}); unset means "send nothing", so the server's own default applies (4 for a
+ *       distilled flux, 40 for Qwen - no number of ours can be right for both). The legacy
+ *       generation body always carries {@code steps}, so an unset value means the fork's
+ *       {@value #LEGACY_STEPS} there,</li>
+ *   <li>{@value #PROP_DIALECT} / {@value #PROP_EDIT_DIALECT} - the wire dialect of
+ *       {@code image.generate} resp. {@code image.edit}: {@code legacy} (default) or
+ *       {@code native}; {@value #PROP_EDIT_DIALECT} falls back to {@value #PROP_DIALECT}, any
+ *       other value aborts with the property name,</li>
+ *   <li>{@value #PROP_ALLOW_EXTERNAL_HOST} - the safety switch for a {@code url} in an
+ *       <em>answer</em>: without it that URL must point at the configured endpoint's host (the
+ *       endpoint itself is configuration and is used as set - that is how the diffusion models
+ *       get a server of their own),</li>
  *   <li>{@code webui.llm.token} - optional {@code Authorization: Bearer} header, the same token
  *       the Web UI proxy sends.</li>
  * </ul>
@@ -69,20 +104,26 @@ public class ImageClient {
 
     private static final Logger LOG = LoggerFactory.getLogger(ImageClient.class);
 
-    /** Base URL of the generation endpoint (default: the current model's gateway). */
-    static final String PROP_GEN_URL = "mcp.js.image.gen.url";
-    /** Diffusion model of {@code image.generate}. */
-    static final String PROP_GEN_MODEL = "mcp.js.image.gen.model";
-    /** Default {@code num_inference_steps} of {@code image.generate}. */
-    static final String PROP_GEN_STEPS = "mcp.js.image.gen.steps";
-    /** Allow an endpoint that is not the configured gateway's host. */
-    static final String PROP_ALLOW_EXTERNAL_HOST = "mcp.js.image.gen.allowExternalHost";
-    /** Base URL of the edit endpoint (default: the generation base). */
-    static final String PROP_EDIT_URL = "mcp.js.image.edit.url";
-    /** Diffusion model of {@code image.edit} (default: the generation model). */
+    /** Base URL of the diffusion endpoint (default: the current model's gateway). */
+    static final String PROP_URL = "mcp.js.image.url";
+    /** Diffusion model of {@code image.generate} - no default, servers differ. */
+    static final String PROP_MODEL = "mcp.js.image.model";
+    /** Diffusion model of {@code image.edit} (default: {@value #PROP_MODEL}). */
     static final String PROP_EDIT_MODEL = "mcp.js.image.edit.model";
-    /** Default {@code num_inference_steps} of {@code image.edit}. */
-    static final String PROP_EDIT_STEPS = "mcp.js.image.edit.steps";
+    /** Default {@code size} of a request ("WxH"); unset means "send no size". */
+    static final String PROP_SIZE = "mcp.js.image.size";
+    /** Default step count; unset means "send nothing" ({@code native}) resp. 4 ({@code legacy}). */
+    static final String PROP_STEPS = "mcp.js.image.steps";
+    /** Wire dialect: {@code legacy} (default) or {@code native}. */
+    static final String PROP_DIALECT = "mcp.js.image.dialect";
+    /** Wire dialect of {@code image.edit} (default: {@value #PROP_DIALECT}). */
+    static final String PROP_EDIT_DIALECT = "mcp.js.image.edit.dialect";
+    /** Allow an answered {@code url} that is not on the configured endpoint's host. */
+    static final String PROP_ALLOW_EXTERNAL_HOST = "mcp.js.image.allowExternalHost";
+    /** Dialect value: the fork's wire format (all fields always sent, JSON edit with a data URL). */
+    static final String DIALECT_LEGACY = "legacy";
+    /** Dialect value: the reference server's wire format ({@code output_format}, multipart). */
+    static final String DIALECT_NATIVE = "native";
     /** The current model's gateway - the base the endpoints fall back to. */
     static final String PROP_GATEWAY_URL = "webui.model.url";
     /** Optional API key, sent as an {@code Authorization: Bearer} header. */
@@ -98,28 +139,36 @@ public class ImageClient {
     private static final int ERROR_BODY_QUOTE = 500;
     /** Largest side accepted in a {@code WxH} size string. */
     private static final int MAX_SIDE = 8192;
+    /** {@code steps} the legacy generation dialect sends when nothing else is configured. */
+    private static final int LEGACY_STEPS = 4;
+    /** {@code cfg_scale} of the legacy generation dialect (a distilled model needs no guidance). */
+    private static final double LEGACY_CFG_SCALE = 1.0d;
 
     /** The Spring environment, injected by McpConfig (same pattern as the other tools). */
     private static volatile Environment environment;
 
     private final String genEndpoint;
     private final String editEndpoint;
-    private final String genModel;
+    private final String model;
     private final String editModel;
-    private final Integer genSteps;
-    private final Integer editSteps;
+    private final Integer steps;
+    private final String size;
+    private final boolean legacyGeneration;
+    private final boolean legacyEdit;
     private final boolean allowExternalHost;
-    private final String gatewayHost;
+    private final String endpointHost;
     private final String llmToken;
     private final int defaultTimeoutSeconds;
     private final JsonMapper jsonMapper = JsonMapper.builder().build();
 
     /** One text-to-image request as the caller built it. */
     public record GenerateRequest(String prompt, String model, String size, Integer seed,
-                                  Integer steps, String outputFormat, Integer timeoutSeconds) {
+                                  Integer steps, String outputFormat, String negativePrompt,
+                                  Integer timeoutSeconds) {
     }
 
-    /** One edit request: prompt plus the source pictures (bare base64 in the form). */
+    /** One edit request: prompt plus the source picture(s) - bare base64 in the multipart form,
+     *  a single {@code data:} URL in the legacy JSON body. */
     public record EditRequest(String prompt, String model, String size, Integer seed,
                               Integer steps, String outputFormat, List<byte[]> images,
                               Integer timeoutSeconds) {
@@ -135,19 +184,25 @@ public class ImageClient {
      * validated strictly; an invalid one aborts with the property name and value.
      */
     public ImageClient() {
-        this.genModel = trimToNull(get(PROP_GEN_MODEL));
+        this.model = trimToNull(get(PROP_MODEL));
         this.editModel = trimToNull(get(PROP_EDIT_MODEL));
-        this.genSteps = intProperty(PROP_GEN_STEPS, 1, 1000);
-        this.editSteps = intProperty(PROP_EDIT_STEPS, 1, 1000);
+        this.steps = intProperty(PROP_STEPS, 1, 1000);
+        this.size = sizeProperty(PROP_SIZE);
+        String dialect = dialectProperty(PROP_DIALECT, DIALECT_LEGACY);
+        this.legacyGeneration = DIALECT_LEGACY.equals(dialect);
+        this.legacyEdit = DIALECT_LEGACY.equals(dialectProperty(PROP_EDIT_DIALECT, dialect));
         this.allowExternalHost = booleanProperty(PROP_ALLOW_EXTERNAL_HOST, false);
         this.llmToken = trimToNull(get(PROP_LLM_TOKEN));
         this.defaultTimeoutSeconds = ImageLimits.current().timeoutSeconds();
         String gateway = trimToNull(get(PROP_GATEWAY_URL));
-        this.gatewayHost = hostOf(gateway);
-        String genBase = firstNonBlank(get(PROP_GEN_URL), gateway);
-        this.genEndpoint = genBase == null ? null : endpoint(genBase, GEN_PATH);
-        String editBase = firstNonBlank(get(PROP_EDIT_URL), genBase);
-        this.editEndpoint = editBase == null ? null : endpoint(editBase, EDIT_PATH);
+        String base = firstNonBlank(get(PROP_URL), gateway);
+        // The endpoint is configuration, not caller input - so its host is the one an answered
+        // url has to match; a diffusion server of its own (any host) is just a property.
+        this.endpointHost = hostOf(base);
+        this.genEndpoint = base == null ? null : endpoint(base, GEN_PATH);
+        // Both dialects address the edit below the same base; the legacy one completes the
+        // path the same way (the fork's "complete URL" reading is gone with its property name).
+        this.editEndpoint = base == null ? null : endpoint(base, EDIT_PATH);
     }
 
     /**
@@ -174,24 +229,35 @@ public class ImageClient {
     }
 
     /**
+     * @return whether {@code image.generate} uses the legacy dialect, i.e. whether the request
+     *         carries a {@code negative_prompt} (the native body has no such field)
+     */
+    public boolean sendsNegativePrompt() {
+        return legacyGeneration;
+    }
+
+    /**
+     * @return whether {@code image.edit} uses the legacy dialect (a JSON body with one data URL,
+     *         so exactly one source picture and no {@code size}/{@code seed}/{@code steps}/
+     *         {@code output_format})
+     */
+    public boolean usesLegacyEdit() {
+        return legacyEdit;
+    }
+
+    /**
      * Display-only check for the module summary: is a generation endpoint resolvable and a model
      * configured? Lenient by design (it runs while the tool is being set up - the strict
      * validation happens in the constructor).
      * @return true when {@code image.generate} would be offered
      */
     public static boolean isConfigured() {
-        if (trimToNull(get(PROP_GEN_MODEL)) == null) {
+        if (trimToNull(get(PROP_MODEL)) == null) {
             return false;
         }
-        String base = firstNonBlank(get(PROP_GEN_URL), get(PROP_GATEWAY_URL));
-        if (base == null) {
-            return false;
-        }
-        if ("true".equalsIgnoreCase(trimToNull(get(PROP_ALLOW_EXTERNAL_HOST)))) {
-            return true;
-        }
-        String gateway = hostOf(trimToNull(get(PROP_GATEWAY_URL)));
-        return gateway != null && gateway.equalsIgnoreCase(hostOf(base));
+        // The URL is configuration: a diffusion server of its own is a legitimate setting, so
+        // the availability probe only asks whether one is configured at all.
+        return firstNonBlank(get(PROP_URL), get(PROP_GATEWAY_URL)) != null;
     }
 
     /**
@@ -209,40 +275,62 @@ public class ImageClient {
     }
 
     /**
-     * Why a generation request cannot run - the sentence the module puts into its message.
+     * Why generation is not available here - the sentence the module puts into its message. This
+     * is the configuration probe (no request): a model that only the <em>call</em> names is not
+     * considered here, but {@code generate} does consider it.
      * @param fn function name for the message ({@code null} for a plain probe)
      * @return the reason, or {@code null} when the endpoint may be used
      */
     public String generationUnavailableReason(String fn) {
+        return generationUnavailableReason(fn, null);
+    }
+
+    /**
+     * Why a generation request cannot run - the sentence the module puts into its message.
+     * @param fn function name for the message ({@code null} for a plain probe)
+     * @param requestModel the model the request names, may be null (a per-call model is enough:
+     *                     the message promises {@code {model: '…'}})
+     * @return the reason, or {@code null} when the request may be sent
+     */
+    private String generationUnavailableReason(String fn, String requestModel) {
         String prefix = fn == null ? "image" : "image." + fn;
-        if (genModel == null) {
-            return prefix + ": no image model configured - set " + PROP_GEN_MODEL
+        if (firstNonBlank(requestModel, model) == null) {
+            return prefix + ": no diffusion model configured - set " + PROP_MODEL
                     + " (e.g. 'Qwen/Qwen-Image-2.1') or pass {model: '…'}";
         }
         if (genEndpoint == null) {
             return prefix + ": image generation is not available in this environment - neither "
-                    + PROP_GEN_URL + " nor " + PROP_GATEWAY_URL + " is set";
+                    + PROP_URL + " nor " + PROP_GATEWAY_URL + " is set";
         }
-        return refusalSentence(prefix, genEndpoint);
+        return null;
+    }
+
+    /**
+     * Why editing is not available here (the configuration probe, no request).
+     * @param fn function name for the message ({@code null} for a plain probe)
+     * @return the reason, or {@code null} when the endpoint may be used
+     */
+    public String editUnavailableReason(String fn) {
+        return editUnavailableReason(fn, null);
     }
 
     /**
      * Why an edit request cannot run.
      * @param fn function name for the message ({@code null} for a plain probe)
-     * @return the reason, or {@code null} when the endpoint may be used
+     * @param requestModel the model the request names, may be null
+     * @return the reason, or {@code null} when the request may be sent
      */
-    public String editUnavailableReason(String fn) {
+    private String editUnavailableReason(String fn, String requestModel) {
         String prefix = fn == null ? "image" : "image." + fn;
-        if (firstNonBlank(editModel, genModel) == null) {
-            return prefix + ": no image model configured - set " + PROP_EDIT_MODEL + " or "
-                    + PROP_GEN_MODEL + " (e.g. 'Qwen/Qwen-Image-2.1') or pass {model: '…'}";
+        if (firstNonBlank(requestModel, editModel, model) == null) {
+            return prefix + ": no diffusion model configured - set " + PROP_MODEL + " or "
+                    + PROP_EDIT_MODEL + " (e.g. 'Qwen/Qwen-Image-2.1') or pass {model: '…'}";
         }
         if (editEndpoint == null) {
             return prefix + ": image editing is not available in this environment - neither "
-                    + PROP_EDIT_URL + ", " + PROP_GEN_URL + " nor " + PROP_GATEWAY_URL
-                    + " is set";
+                    + PROP_URL + " nor " + PROP_GATEWAY_URL + " is set";
         }
-        return refusalSentence(prefix, editEndpoint);
+        return null;
     }
 
     /**
@@ -251,69 +339,163 @@ public class ImageClient {
      * @return the result
      */
     public Result generate(GenerateRequest request) {
-        String reason = generationUnavailableReason("generate");
+        String reason = generationUnavailableReason("generate", request.model());
         if (reason != null) {
             throw new JsUserRuntimeException(reason);
         }
-        String model = firstNonBlank(request.model(), genModel);
+        String effectiveModel = firstNonBlank(request.model(), model);
+        Integer effectiveSteps = request.steps() != null ? request.steps() : steps;
+        String effectiveSize = request.size() != null ? request.size() : size;
+        String requestBody = legacyGeneration
+                ? legacyGenerateBody(request, effectiveModel, effectiveSteps, effectiveSize)
+                : nativeGenerateBody(request, effectiveModel, effectiveSteps, effectiveSize);
+        LOG.debug("image.generate: POST {} ({} dialect, model {}, size {}, steps {})", genEndpoint,
+                legacyGeneration ? DIALECT_LEGACY : DIALECT_NATIVE, effectiveModel, effectiveSize,
+                effectiveSteps);
+        HttpResponse response = post("generate", genEndpoint, "application/json",
+                requestBody.getBytes(StandardCharsets.UTF_8), timeoutOf(request.timeoutSeconds()));
+        return parseResponse("generate", response, effectiveModel);
+    }
+
+    /**
+     * The body of the native dialect: {@code model}, {@code prompt}, {@code output_format} and
+     * only those of {@code num_inference_steps}, {@code size}, {@code seed} the caller (or a
+     * property) actually sets - the server's own defaults win over invented numbers.
+     * @param request the request
+     * @param model the model to send
+     * @param steps the effective step count, may be null
+     * @param size the effective size, may be null
+     * @return the JSON body
+     */
+    private String nativeGenerateBody(GenerateRequest request, String model, Integer steps,
+                                      String size) {
         ObjectNode body = jsonMapper.createObjectNode();
         body.put("model", model);
         body.put("prompt", request.prompt());
         body.put("output_format", outputFormat(request.outputFormat()));
-        Integer steps = request.steps() != null ? request.steps() : genSteps;
         if (steps != null) {
             body.put("num_inference_steps", steps.intValue());
         }
-        if (request.size() != null) {
-            body.put("size", request.size());
+        if (size != null) {
+            body.put("size", size);
         }
         if (request.seed() != null) {
             body.put("seed", request.seed().intValue());
         }
-        String requestBody = jsonMapper.writeValueAsString(body);
-        LOG.debug("image.generate: POST {} (model {}, size {}, steps {})", genEndpoint, model,
-                request.size(), steps);
-        HttpResponse response = post("generate", genEndpoint, "application/json",
-                requestBody.getBytes(StandardCharsets.UTF_8), timeoutOf(request.timeoutSeconds()));
-        return parseResponse("generate", response, model);
+        return jsonMapper.writeValueAsString(body);
     }
 
     /**
-     * POSTs one edit request ({@code multipart/form-data}, bare base64 image fields).
+     * The body of the legacy dialect: the fork sent every field every time, with fixed values for
+     * the ones a caller usually leaves alone ({@code n: 1}, {@code cfg_scale: 1.0},
+     * {@code disable_safety_checker: true}, a {@code steps} default of {@value #LEGACY_STEPS},
+     * {@code seed: 0}, an empty {@code negative_prompt}) and no {@code output_format}. The
+     * {@code size} field is sent when the caller or {@value #PROP_SIZE} names one - the old body
+     * always carried a size, and that is what the property is for; without it the field stays out
+     * instead of inventing a value.
+     * @param request the request
+     * @param model the model to send
+     * @param steps the effective step count, may be null
+     * @param size the effective size, may be null
+     * @return the JSON body
+     */
+    private String legacyGenerateBody(GenerateRequest request, String model, Integer steps,
+                                      String size) {
+        requireNoFormat("generate", request.outputFormat(), PROP_DIALECT);
+        ObjectNode body = jsonMapper.createObjectNode();
+        body.put("prompt", request.prompt());
+        body.put("model", model);
+        body.put("n", 1);
+        body.put("seed", request.seed() != null ? request.seed().intValue() : 0);
+        if (size != null) {
+            body.put("size", size);
+        }
+        body.put("steps", steps != null ? steps.intValue() : LEGACY_STEPS);
+        body.put("cfg_scale", LEGACY_CFG_SCALE);
+        body.put("disable_safety_checker", true);
+        String negativePrompt = request.negativePrompt() == null ? "" : request.negativePrompt();
+        body.put("negative_prompt", negativePrompt);
+        return jsonMapper.writeValueAsString(body);
+    }
+
+    /**
+     * POSTs one edit request - the shape depends on the dialect: a JSON body with one
+     * {@code data:} URL (legacy) or a {@code multipart/form-data} body with bare base64 image
+     * fields (native).
      * @param request the request
      * @return the result
      */
     public Result edit(EditRequest request) {
-        String reason = editUnavailableReason("edit");
+        String reason = editUnavailableReason("edit", request.model());
         if (reason != null) {
             throw new JsUserRuntimeException(reason);
         }
-        String model = firstNonBlank(request.model(), editModel, genModel);
-        Map<String, String> fields = new LinkedHashMap<>();
-        fields.put("model", model);
-        fields.put("prompt", request.prompt());
-        fields.put("output_format", outputFormat(request.outputFormat()));
-        if (request.size() != null) {
-            fields.put("size", request.size());
+        String effectiveModel = firstNonBlank(request.model(), editModel, model);
+        Integer effectiveSteps = request.steps() != null ? request.steps() : steps;
+        String effectiveSize = request.size() != null ? request.size() : size;
+        int sources = request.images() == null ? 0 : request.images().size();
+        String contentType;
+        byte[] body;
+        if (legacyEdit) {
+            contentType = "application/json";
+            body = legacyEditBody(request, effectiveModel);
+        } else {
+            Map<String, String> fields = new LinkedHashMap<>();
+            fields.put("model", effectiveModel);
+            fields.put("prompt", request.prompt());
+            fields.put("output_format", outputFormat(request.outputFormat()));
+            if (effectiveSize != null) {
+                fields.put("size", effectiveSize);
+            }
+            if (effectiveSteps != null) {
+                fields.put("num_inference_steps", effectiveSteps.toString());
+            }
+            if (request.seed() != null) {
+                fields.put("seed", request.seed().toString());
+            }
+            // The reference server reads "image" as plain form values (base64, no file name, no
+            // content type) and accepts the field more than once - one value per source picture.
+            String boundary = "----mcpimage" + UUID.randomUUID().toString().replace("-", "");
+            body = multipartBody(boundary, fields, "image",
+                    request.images() == null ? List.of() : request.images());
+            contentType = "multipart/form-data; boundary=" + boundary;
         }
-        Integer steps = request.steps() != null ? request.steps() : editSteps;
-        if (steps != null) {
-            fields.put("num_inference_steps", steps.toString());
-        }
-        if (request.seed() != null) {
-            fields.put("seed", request.seed().toString());
-        }
-        // The reference server reads "image" as plain form values (base64, no file name, no
-        // content type) and accepts the field more than once - one value per source picture.
-        String boundary = "----mcpimage" + UUID.randomUUID().toString().replace("-", "");
-        byte[] body = multipartBody(boundary, fields, "image",
-                request.images() == null ? List.of() : request.images());
-        LOG.debug("image.edit: POST {} (model {}, {} source image(s))", editEndpoint, model,
-                request.images() == null ? 0 : request.images().size());
-        HttpResponse response = post("edit", editEndpoint,
-                "multipart/form-data; boundary=" + boundary, body,
+        LOG.debug("image.edit: POST {} ({} dialect, model {}, {} source image(s))", editEndpoint,
+                legacyEdit ? DIALECT_LEGACY : DIALECT_NATIVE, effectiveModel, sources);
+        HttpResponse response = post("edit", editEndpoint, contentType, body,
                 timeoutOf(request.timeoutSeconds()));
-        return parseResponse("edit", response, model);
+        return parseResponse("edit", response, effectiveModel);
+    }
+
+    /**
+     * The body of the legacy dialect: {@code {prompt, model, image}} with a single
+     * {@code data:image/…;base64,…} URL - the older endpoint had no size, seed, step count or
+     * output format and no second picture, so asking for one of those is refused here instead of
+     * being dropped on the way out. {@value #PROP_SIZE} and {@value #PROP_STEPS} are global
+     * settings, not per-call wishes, so they do not turn into a refusal: this body simply has no
+     * such field (they reach the generation and the native edit).
+     * @param request the request
+     * @param model the model to send
+     * @return the JSON body
+     */
+    private byte[] legacyEditBody(EditRequest request, String model) {
+        requireNoFormat("edit", request.outputFormat(), PROP_EDIT_DIALECT);
+        requireNotSent("edit", "size", request.size() != null);
+        requireNotSent("edit", "steps", request.steps() != null);
+        requireNotSent("edit", "seed", request.seed() != null);
+        List<byte[]> images = request.images() == null ? List.of() : request.images();
+        if (images.size() != 1) {
+            throw new JsUserRuntimeException("image.edit: the " + DIALECT_LEGACY + " dialect"
+                    + " (" + PROP_EDIT_DIALECT + "=" + DIALECT_LEGACY + ") sends exactly one"
+                    + " source picture in a JSON body, but " + images.size() + " were passed -"
+                    + " pass one, or set " + PROP_EDIT_DIALECT + "=" + DIALECT_NATIVE
+                    + " for the multipart form");
+        }
+        ObjectNode body = jsonMapper.createObjectNode();
+        body.put("prompt", request.prompt());
+        body.put("model", model);
+        body.put("image", dataUrl(images.get(0)));
+        return jsonMapper.writeValueAsString(body).getBytes(StandardCharsets.UTF_8);
     }
 
     /** The read timeout of one request in seconds. */
@@ -342,8 +524,121 @@ public class ImageClient {
     }
 
     /**
+     * Refuses {@code format} in a dialect that has no {@code output_format} field - an option
+     * that cannot travel is named, not swallowed.
+     * @param fn function name
+     * @param format the caller's format, may be null
+     * @param dialectProperty the property that would change the dialect
+     */
+    private static void requireNoFormat(String fn, String format, String dialectProperty) {
+        if (format != null && !format.isBlank()) {
+            throw new JsUserRuntimeException("image." + fn + ": 'format' cannot be sent - the"
+                    + " wire dialect in use (" + dialectProperty + "=" + DIALECT_LEGACY
+                    + ") has no output_format field; drop the option or set " + dialectProperty
+                    + "=" + DIALECT_NATIVE);
+        }
+    }
+
+    /**
+     * Refuses an option the legacy edit body cannot carry ({@code size}, {@code seed},
+     * {@code steps}).
+     * @param fn function name
+     * @param option the option name
+     * @param given whether the caller passed it
+     */
+    private static void requireNotSent(String fn, String option, boolean given) {
+        if (given) {
+            throw new JsUserRuntimeException("image." + fn + ": '" + option + "' cannot be sent -"
+                    + " the " + DIALECT_LEGACY + " edit body (" + PROP_EDIT_DIALECT + "="
+                    + DIALECT_LEGACY + ") carries prompt, model and image only; drop the option"
+                    + " or set " + PROP_EDIT_DIALECT + "=" + DIALECT_NATIVE);
+        }
+    }
+
+    /**
+     * The source picture as a {@code data:} URL of the legacy dialect (one line, base64).
+     * @param image the picture
+     * @return {@code data:<type>;base64,<bytes>}
+     */
+    static String dataUrl(byte[] image) {
+        return "data:" + mimeType(image) + ";base64,"
+                + Base64.getEncoder().encodeToString(image);
+    }
+
+    /**
+     * Sniffs the container type of a picture - the data URL needs one, and the caller hands over
+     * bytes only. Unknown containers are sent as {@code image/png} (a server that decodes the
+     * base64 does not depend on the type).
+     * @param image the picture
+     * @return the MIME type
+     */
+    static String mimeType(byte[] image) {
+        if (image.length >= 4 && (image[0] & 0xFF) == 0x89 && image[1] == 'P' && image[2] == 'N'
+                && image[3] == 'G') {
+            return "image/png";
+        }
+        if (image.length >= 2 && (image[0] & 0xFF) == 0xFF && (image[1] & 0xFF) == 0xD8) {
+            return "image/jpeg";
+        }
+        if (startsWithAscii(image, 0, "GIF8")) {
+            return "image/gif";
+        }
+        if (startsWithAscii(image, 0, "RIFF") && startsWithAscii(image, 8, "WEBP")) {
+            return "image/webp";
+        }
+        if (startsWithAscii(image, 0, "BM")) {
+            return "image/bmp";
+        }
+        return "image/png";
+    }
+
+    /** Whether the bytes at an offset are the given ASCII text. */
+    private static boolean startsWithAscii(byte[] bytes, int offset, String text) {
+        if (bytes.length < offset + text.length()) {
+            return false;
+        }
+        for (int i = 0; i < text.length(); i++) {
+            if ((bytes[offset + i] & 0xFF) != text.charAt(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Decodes a {@code data:…;base64,…} URL from the answer - the older dialect handed the
+     * picture back that way, and a server that inlines it must not send the module off to a
+     * {@code GET} on a URL without a host.
+     * @param fn function name for messages
+     * @param url the data URL
+     * @return the decoded bytes
+     */
+    private byte[] decodeDataUrl(String fn, String url) {
+        int comma = url.indexOf(',');
+        String meta = comma < 0 ? "" : url.substring(0, comma);
+        if (comma < 0 || !meta.toLowerCase(Locale.ROOT).endsWith(";base64")) {
+            throw new JsUserRuntimeException("image." + fn + ": the endpoint answered with a data"
+                    + " URL that is not base64-encoded: " + shorten(url));
+        }
+        byte[] bytes;
+        try {
+            bytes = Base64.getDecoder().decode(url.substring(comma + 1).trim());
+        } catch (IllegalArgumentException e) {
+            throw new JsUserRuntimeException("image." + fn + ": the endpoint answered with a data"
+                    + " URL whose base64 cannot be decoded: " + e.getMessage(), e);
+        }
+        long max = ImageLimits.current().maxOutputBytes();
+        if (bytes.length > max) {
+            throw new JsUserRuntimeException("image." + fn + ": the picture in the answer has "
+                    + bytes.length + " bytes, exceeding " + max + " bytes (property "
+                    + ImageLimits.PROP_MAX_OUTPUT_BYTES + ")");
+        }
+        return bytes;
+    }
+
+    /**
      * Parses the answer document: {@code data[0].b64_json} (or {@code data[0].url}, which is
-     * downloaded here) plus {@code usage}.
+     * downloaded here, or decoded inline when it is a {@code data:} URL) plus {@code usage}.
      * @param fn function name for messages
      * @param response the HTTP answer
      * @param model the model the request named
@@ -379,7 +674,8 @@ public class ImageClient {
                 throw new JsUserRuntimeException("image." + fn + ": the endpoint answered with"
                         + " neither b64_json nor url: " + shorten(first.toString()));
             }
-            bytes = download(fn, url);
+            bytes = url.trim().toLowerCase(Locale.ROOT).startsWith("data:")
+                    ? decodeDataUrl(fn, url.trim()) : download(fn, url);
         }
         JsonNode usage = root.path("usage");
         return new Result(bytes, null, model, intOrNull(usage.path("seed")),
@@ -388,8 +684,8 @@ public class ImageClient {
     }
 
     /**
-     * Downloads the picture of a {@code url} answer - through the same host rule as the endpoint
-     * (a gateway that answered with a foreign URL would otherwise turn the tool into a fetcher).
+     * Downloads the picture of a {@code url} answer - through the host rule (a gateway that
+     * answered with a foreign URL would otherwise turn the tool into a fetcher for any host).
      * @param fn function name for messages
      * @param url the URL from the answer
      * @return the bytes
@@ -538,10 +834,13 @@ public class ImageClient {
     }
 
     /**
-     * The host rule: without {@value #PROP_ALLOW_EXTERNAL_HOST} an endpoint (or an answered URL)
-     * must point at the configured gateway's host.
+     * The host rule for a URL that came out of an <em>answer</em>: without
+     * {@value #PROP_ALLOW_EXTERNAL_HOST} it must point at the host of the configured endpoint -
+     * otherwise a gateway's answer could turn the tool into a fetcher for any host. The endpoint
+     * itself needs no check: it is configuration ({@value #PROP_URL} or the gateway), not
+     * something a script can influence.
      * @param prefix message prefix, e.g. {@code image.generate}
-     * @param url the URL to check
+     * @param url the answered URL to check
      * @return the refusal sentence, or {@code null} when the host is allowed
      */
     private String refusalSentence(String prefix, String url) {
@@ -549,17 +848,15 @@ public class ImageClient {
             return null;
         }
         String host = hostOf(url);
-        if (gatewayHost == null) {
-            return prefix + ": not available in this environment - no gateway configured to"
-                    + " compare with (" + PROP_GATEWAY_URL + " is unset); set "
-                    + PROP_ALLOW_EXTERNAL_HOST + "=true only for a trusted host, or configure "
-                    + PROP_GATEWAY_URL;
+        if (endpointHost == null) {
+            return prefix + ": the answered URL '" + url + "' cannot be checked - no endpoint is"
+                    + " configured; set " + PROP_ALLOW_EXTERNAL_HOST + "=true only for a trusted"
+                    + " host, or configure " + PROP_URL;
         }
-        if (!gatewayHost.equalsIgnoreCase(host)) {
-            return prefix + ": not available in this environment - '" + host + "' is not the"
-                    + " configured LLM gateway '" + gatewayHost + "' (set "
-                    + PROP_ALLOW_EXTERNAL_HOST + "=true only for a trusted host, or point "
-                    + PROP_GEN_URL + " at the gateway)";
+        if (!endpointHost.equalsIgnoreCase(host)) {
+            return prefix + ": the answered URL points at '" + host + "', not at the configured"
+                    + " image endpoint '" + endpointHost + "' (set " + PROP_ALLOW_EXTERNAL_HOST
+                    + "=true only for a trusted host)";
         }
         return null;
     }
@@ -617,6 +914,21 @@ public class ImageClient {
             throw new JsUserRuntimeException("image." + fn
                     + ": size must look like '1024x1024' (got an empty value)");
         }
+        String normalised = parseSize(size);
+        if (normalised == null) {
+            throw new JsUserRuntimeException(String.format(Locale.ROOT, "image.%s: size '%s' is"
+                    + " not usable - expected 'WxH' like '1024x1024', each side between 16 and %d"
+                    + " pixels", fn, size, MAX_SIDE));
+        }
+        return normalised;
+    }
+
+    /**
+     * Parses a {@code WxH} size string.
+     * @param size the value
+     * @return the value normalised to {@code WxH}, or {@code null} when it is not usable
+     */
+    private static String parseSize(String size) {
         String[] parts = size.trim().toLowerCase(Locale.ROOT).split("x", -1);
         if (parts.length == 2) {
             try {
@@ -626,12 +938,29 @@ public class ImageClient {
                     return width + "x" + height;
                 }
             } catch (NumberFormatException e) {
-                // falls through to the message below
+                // not a WxH size - the caller says what it expected
             }
         }
-        throw new JsUserRuntimeException(String.format(Locale.ROOT, "image.%s: size '%s' is not"
-                + " usable - expected 'WxH' like '1024x1024', each side between 16 and %d"
-                + " pixels", fn, size, MAX_SIDE));
+        return null;
+    }
+
+    /**
+     * Reads the configured default size ({@value #PROP_SIZE}), validated like a caller's value;
+     * unset means "send no size and let the server decide".
+     * @param key property name
+     * @return the normalised size, or {@code null} when the property is not set
+     */
+    private static String sizeProperty(String key) {
+        String value = trimToNull(get(key));
+        if (value == null) {
+            return null;
+        }
+        String normalised = parseSize(value);
+        if (normalised == null) {
+            throw invalidProperty(key, value, "'WxH' like '1024x1024', each side between 16 and "
+                    + MAX_SIDE + " pixels");
+        }
+        return normalised;
     }
 
     /**
@@ -694,9 +1023,28 @@ public class ImageClient {
         return env != null ? env.getProperty(key) : System.getProperty(key);
     }
 
+    /**
+     * Reads a dialect property: {@code legacy} or {@code native}; an unset property yields the
+     * fallback ({@value #DIALECT_LEGACY} for the generation, the generation's value for the
+     * edit). Anything else aborts with the property name and the quoted value.
+     * @param key property name
+     * @param fallback the value an unset property means
+     * @return the dialect value in lower case
+     */
+    private static String dialectProperty(String key, String fallback) {
+        String value = trimToNull(get(key));
+        if (value == null) {
+            return fallback;
+        }
+        String dialect = value.toLowerCase(Locale.ROOT);
+        if (DIALECT_LEGACY.equals(dialect) || DIALECT_NATIVE.equals(dialect)) {
+            return dialect;
+        }
+        throw invalidProperty(key, value, "'" + DIALECT_LEGACY + "' or '" + DIALECT_NATIVE + "'");
+    }
+
     /** Reads a boolean property strictly, aborting on anything else. */
-    private static boolean booleanProperty(String key, boolean fallback) {
-        String value = get(key);
+    private static boolean booleanProperty(String key, boolean fallback) {        String value = get(key);
         if (value == null || value.isBlank()) {
             return fallback;
         }

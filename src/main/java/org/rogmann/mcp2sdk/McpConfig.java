@@ -12,7 +12,7 @@ import org.rogmann.mcp2sdk.agent.AgentBoardTool;
 import org.rogmann.mcp2sdk.agent.ForkIdentityFilter;
 import org.rogmann.mcp2sdk.agent.PrefixForkTool;
 import org.rogmann.mcp2sdk.browser.BrowserTool;
- import org.rogmann.mcp2sdk.chat.PublicDirWebServer;
+import org.rogmann.mcp2sdk.chat.PublicDirWebServer;
 import org.rogmann.mcp2sdk.image.ImageClient;
 import org.rogmann.mcp2sdk.image.ImageLimits;
 import org.rogmann.mcp2sdk.image.JsImage;
@@ -185,7 +185,8 @@ public class McpConfig {
         // The image module's vision call resolves webui.* (current model, hasVision, token)
         // through the Spring environment - see docs/js/image.md §7.
         VisionClient.setEnvironment(environment);
-        // The diffusion client resolves mcp.js.image.gen.*/edit.* and the gateway the same way.
+        // The diffusion client resolves mcp.js.image.* (URL, model, size, steps, dialect) and the
+        // gateway (webui.model.url) the same way.
         ImageClient.setEnvironment(environment);
         // Image limits: resolved once and strictly - a bad mcp.js.image.* value stops the start
         // instead of surfacing in the middle of a call (AGENTS.md: no silent defaults).
