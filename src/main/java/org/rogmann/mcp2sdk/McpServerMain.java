@@ -78,6 +78,7 @@ public class McpServerMain {
                 "reactor.core.publisher.FluxIterable",
                 "reactor.core.publisher.FluxOnErrorReturn",
                 "reactor.core.publisher.FluxTimeout$TimeoutMainSubscriber",
+                "reactor.core.publisher.FluxTimeout$TimeoutTimeoutSubscriber",
                 "reactor.core.publisher.LambdaMonoSubscriber",
                 "reactor.core.publisher.MonoCompletionStage$MonoCompletionStageSubscription",
                 "reactor.core.publisher.MonoPeekTerminal",
