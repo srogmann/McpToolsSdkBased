@@ -32,6 +32,12 @@ import org.slf4j.LoggerFactory;
  * {@link InputStream} (constant memory). All file access uses the same security checks as
  * {@link JsFileSystem} (project base directory from system property {@code IDE_PROJECT_DIR}).
  * </p>
+ * <p>
+ * The AES block engine {@link #aesBlockEncrypt(byte[], byte[])} is the one public raw
+ * primitive of the core: the JDK's {@code AES/ECB/NoPadding} on a single 16-byte block. It is
+ * the block operation a key schedule, an AEAD construction or a stream-cipher/MAC pair is
+ * built on, and a future PDF decryption will use it, too.
+ * </p>
  *
  * <h3>Security</h3>
  * <ul>
@@ -39,6 +45,8 @@ import org.slf4j.LoggerFactory;
  *   <li>Parent-directory traversal ({@code ..}) and absolute paths outside the base are rejected.</li>
  *   <li>Symbolic links are only followed if the real path stays inside the base directory.</li>
  *   <li>Results and error messages contain only relative paths, never absolute paths.</li>
+ *   <li>Error messages abbreviate long paths (see {@link JsFileSystem#MESSAGE_ECHO_LIMIT}), so a
+ *       document passed where a path is expected never comes back as the message.</li>
  *   <li>All operations run purely in memory on caller-supplied byte arrays.</li>
  * </ul>
  */
@@ -161,7 +169,13 @@ public class JsCrypto {
     private static String digestFile(String algorithm, String filePath) {
         Path path = JsFileSystem.resolveSafePath(filePath);
         if (!Files.isRegularFile(path)) {
-            throw new JsUserRuntimeException("File not found: " + JsFileSystem.toRelative(path));
+            // The JS name of the function the caller used, e.g. "crypto.sha256".
+            String call = "crypto." + algorithm.replace("-", "").toLowerCase(Locale.ROOT);
+            throw new JsUserRuntimeException("File not found: "
+                    + JsFileSystem.toRelativeForMessage(path)
+                    + " - a string argument is a file path (" + call + "('out.bin')), not a text"
+                    + " payload; to hash text in memory pass its bytes, e.g. "
+                    + call + "(fs.encode(text)). See crypto.help()");
         }
         try {
             MessageDigest md = MessageDigest.getInstance(algorithm);
@@ -177,7 +191,8 @@ public class JsCrypto {
             throw new IllegalStateException("Algorithm not available: " + algorithm, e);
         } catch (IOException e) {
             LOG.error("Failed to hash file: " + path, e);
-            throw new JsUserRuntimeException("Failed to hash file: " + JsFileSystem.toRelative(path), e);
+            throw new JsUserRuntimeException("Failed to hash file: "
+                    + JsFileSystem.toRelativeForMessage(path), e);
         }
     }
 
@@ -189,8 +204,9 @@ public class JsCrypto {
      * Encrypts a single 16-byte block with AES-ECB (raw bytes, big-endian standard
      * convention, no padding). Supports AES-128/192/256 keys (16/24/32 bytes).
      * <p>
-     * This is the core primitive used for {@code H = E_K(0^16)}, {@code E_K(J0)} and the
-     * per-block keystream {@code E_K(counter)} of the extended set.
+     * This is the block primitive behind {@code H = E_K(0^16)}, {@code E_K(J0)} and a
+     * per-block keystream {@code E_K(counter)}; everything that needs more than one block is
+     * built on it.
      * </p>
      * @param key raw key bytes (16, 24 or 32)
      * @param block 16 bytes to encrypt
@@ -646,8 +662,9 @@ public class JsCrypto {
     // ------------------------------------------------------------------
 
     /**
-     * Returns the sections of the core help text: hashing, HMAC, AES-CBC/CTR and
-     * deflate/inflate.
+     * Returns the self-contained help sections of the core crypto module: hashing, HMAC,
+     * AES-CBC/CTR and deflate/inflate. The text ends with its own {@code --- Help ---} block,
+     * so it reads as a complete document.
      * @return help text as a multi-line string
      */
     public static String helpSections() {
@@ -655,10 +672,16 @@ public class JsCrypto {
                 JS Crypto API (namespace 'crypto')
                 ==================================
 
-                1) Hashing of byte arrays or files.
-                   A string argument is treated as a file path relative to the project base
-                   directory (streamed, constant memory). A byte array (Uint8Array or array of
-                   numbers 0-255) is hashed in memory. Return value is a lowercase hex string:
+                1) Hashing of byte arrays or files. The argument's TYPE decides:
+                   crypto.sha256('out.bin')  -> hashes the FILE out.bin (streamed, constant
+                                                memory, same security rules as fs)
+                   crypto.sha256(bytes)      -> hashes the bytes in memory
+                   TRAP: a string is ALWAYS a file path, never a text payload.
+                       wrong: crypto.sha256(text)             -> "File not found: <text>"
+                       right: crypto.sha256(fs.encode(text))  -> String to UTF-8 bytes first
+                   A path is resolved relative to the project base directory; a byte array
+                   (Uint8Array or array of numbers 0-255) is hashed in memory. The return
+                   value is a lowercase hex string:
                    crypto.md5(pathOrData)    -> MD5, 32 hex characters
                    crypto.sha1(pathOrData)   -> SHA-1, 40 hex characters
                    crypto.sha256(pathOrData) -> SHA-256, 64 hex characters
@@ -686,6 +709,7 @@ public class JsCrypto {
 
                 Examples:
                     var h = crypto.sha256("out.bin");                 // hash a file
+                    var ht = crypto.sha256(fs.encode("hello"));       // hash text (UTF-8 bytes)
                     var h512 = crypto.sha512(bytes);                  // 128 hex characters
                     var pt = crypto.aesCbcDecrypt(key, iv, ct);       // padded AES-CBC
                     var raw = crypto.inflate(bytes, 'zlib');          // PDF /FlateDecode

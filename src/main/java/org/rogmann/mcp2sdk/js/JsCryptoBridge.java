@@ -18,7 +18,8 @@ import java.util.Map;
  * <p>
  * Hashing: a single string argument is treated as a file path (streamed); a byte array
  * (Uint8Array or array of numbers 0-255) is treated as in-memory data; results are
- * lowercase hex strings. All other byte-array inputs and results are real
+ * lowercase hex strings. To hash text, pass its bytes ({@code crypto.sha256(fs.encode(text))}).
+ * All other byte-array inputs and results are real
  * {@code Uint8Array} typed arrays.
  * </p>
  *
@@ -173,7 +174,8 @@ public class JsCryptoBridge implements JsModuleInterface {
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException(e.getMessage()
                     + " (crypto: a String argument is treated as a file path and then hashed"
-                    + " streamed with constant memory - there is no need to build block lists,"
+                    + " streamed with constant memory - there is no need to build block lists;"
+                    + " to hash text, pass its bytes, e.g. crypto.sha256(fs.encode(text)),"
                     + " see crypto.help())", e);
         }
         return switch (name) {
