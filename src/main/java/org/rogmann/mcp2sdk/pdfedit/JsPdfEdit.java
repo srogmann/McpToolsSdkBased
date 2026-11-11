@@ -417,8 +417,10 @@ public final class JsPdfEdit {
               and the answer says how wide the widest line became. leading defaults to 1.2 × size;
               a line break in the text starts a new line. align is left|center|right.
               For a whole page built from these ops - headings, justified paragraphs, tables and
-              a flowchart - the server ships a library: loadShipped('pdftext'), described in
-              docs/js/pdftext.md. It measures with text.measure and writes nothing but these ops.
+              a flowchart - the server ships a library: loadShipped('pdftext'). Its manual is
+              loadShipped('pdftext').help(): the calls, the unit of a column width, and what a run
+              reports in notes/dropped. It measures with text.measure and writes nothing but these
+              ops.
 
             text.measure
               {op:'text.measure', text:'Leistung', font:'Helvetica', size:9}
