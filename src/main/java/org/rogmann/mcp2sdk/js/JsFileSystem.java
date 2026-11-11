@@ -62,6 +62,8 @@ import org.slf4j.LoggerFactory;
  *       and symbolic-link checks per mount).</li>
  *   <li>Symbolic links are only followed if the real path stays inside the selected directory.</li>
  *   <li>Results and error messages contain only relative (or add-on-prefixed) paths, never absolute paths.</li>
+ *   <li>Error messages abbreviate long paths and long arguments (see {@link #MESSAGE_ECHO_LIMIT}),
+ *       so a document passed where a path is expected never comes back as the message.</li>
  * </ul>
  *
  * <h3>Streaming large files</h3>
@@ -100,6 +102,16 @@ public class JsFileSystem {
 
     /** Upper bound for a single {@link #readBytes(String, long, int)} / {@link #readHex(String, long, int)} call. */
     public static final int MAX_READ_BYTES = 1024 * 1024;
+
+    /**
+     * Longest echo of a path or argument in an error message; longer input is abbreviated.
+     * <p>
+     * A caller who passes a whole document where a path is expected must not get the document
+     * back as the message: the message shows the beginning plus the real length, so a wrong
+     * call costs one line instead of the size of the input.
+     * </p>
+     */
+    public static final int MESSAGE_ECHO_LIMIT = 200;
 
     private JsFileSystem() {
         // Utility class
@@ -197,7 +209,8 @@ public class JsFileSystem {
             int slash = withoutLeading.indexOf('/');
             String mountName = slash < 0 ? withoutLeading : withoutLeading.substring(0, slash);
             if (mountName.isEmpty()) {
-                throw new JsUserRuntimeException("Access denied: invalid path: " + filePath);
+                throw new JsUserRuntimeException("Access denied: invalid path: "
+                        + abbreviateForMessage(filePath));
             }
             Path addonRoot = WorkProject.addonPath(mountName);
             if (addonRoot == null) {
@@ -209,7 +222,8 @@ public class JsFileSystem {
         // Normalize to prevent path traversal.
         Path resolved = mountRoot.resolve(rest.isEmpty() ? "." : rest).normalize();
         if (!resolved.startsWith(mountRoot)) {
-            LOG.warn("Path traversal attempt detected: filePath='{}' resolved to '{}'", filePath, resolved);
+            LOG.warn("Path traversal attempt detected: filePath='{}' resolved to '{}'",
+                    abbreviateForMessage(filePath), resolved);
             throw new JsUserRuntimeException(
                     "Access denied: the specified path is not within the permitted directory.");
         }
@@ -221,16 +235,19 @@ public class JsFileSystem {
                 existing = existing.getParent();
             }
             if (existing == null) {
-                throw new JsUserRuntimeException("Access denied: cannot resolve path: " + filePath);
+                throw new JsUserRuntimeException("Access denied: cannot resolve path: "
+                        + abbreviateForMessage(filePath));
             }
             Path realExisting = existing.toRealPath();
             if (!realExisting.startsWith(realRoot)) {
-                LOG.warn("Symbolic link escapes base directory: filePath='{}'", filePath);
+                LOG.warn("Symbolic link escapes base directory: filePath='{}'",
+                        abbreviateForMessage(filePath));
                 throw new JsUserRuntimeException(
                         "Access denied: symbolic links outside the permitted directory are not allowed.");
             }
         } catch (IOException e) {
-            throw new JsUserRuntimeException("Access denied: cannot resolve path: " + filePath, e);
+            throw new JsUserRuntimeException("Access denied: cannot resolve path: "
+                    + abbreviateForMessage(filePath), e);
         }
         return resolved;
     }
@@ -268,6 +285,44 @@ public class JsFileSystem {
     }
 
     /**
+     * Renders a path for an error message: relative to its mount and abbreviated if it is
+     * implausibly long.
+     * <p>
+     * The path is shortened <em>after</em> it has been made relative, so a prefix of an
+     * absolute path can never appear in a message (a relative path is the only form these
+     * messages carry).
+     * </p>
+     * @param path an absolute path inside a permitted directory
+     * @return the relative path, at most {@link #MESSAGE_ECHO_LIMIT} characters plus the
+     *         original length if it had to be shortened
+     */
+    public static String toRelativeForMessage(Path path) {
+        return abbreviateForMessage(toRelative(path));
+    }
+
+    /**
+     * Shortens a caller-supplied string (e.g. a path as it was passed) for an error message.
+     * <p>
+     * Everything up to {@link #MESSAGE_ECHO_LIMIT} characters is kept unchanged; a longer
+     * string is cut and the real length is appended, e.g.
+     * {@code "Antragstext ..., das ist kein Pfad... (11849 characters)"}. A surrogate pair is
+     * never split, so the shortened text stays a valid string.
+     * </p>
+     * @param text the text to echo (may be null)
+     * @return the text itself, or its beginning plus the character count
+     */
+    public static String abbreviateForMessage(String text) {
+        if (text == null || text.length() <= MESSAGE_ECHO_LIMIT) {
+            return text;
+        }
+        int end = MESSAGE_ECHO_LIMIT;
+        if (Character.isHighSurrogate(text.charAt(end - 1))) {
+            end--;
+        }
+        return text.substring(0, end) + "... (" + text.length() + " characters)";
+    }
+
+    /**
      * Returns the configured add-on mounts as {@code name -&gt; canonical root}.
      * @return add-on mounts (empty if none configured)
      */
@@ -290,7 +345,8 @@ public class JsFileSystem {
     private static JsUserRuntimeException unknownAddonFolder(String mountName) {
         if (WorkProject.hasAddonDirectories()) {
             return new JsUserRuntimeException(
-                    "Unknown add-on folder '/" + mountName + "'. Available add-on folders: " + WorkProject.addonNames());
+                    "Unknown add-on folder '/" + abbreviateForMessage(mountName)
+                            + "'. Available add-on folders: " + WorkProject.addonNames());
         }
         return new JsUserRuntimeException(
                 "Access denied: absolute paths are not permitted (no add-on folders configured).");
@@ -840,14 +896,14 @@ public class JsFileSystem {
     public static Map<String, Object> detectCharset(String filePath, int maxBytes) {
         Path path = resolveSafePath(filePath);
         if (!Files.isRegularFile(path)) {
-            throw new JsUserRuntimeException("File not found: " + toRelative(path));
+            throw new JsUserRuntimeException("File not found: " + toRelativeForMessage(path));
         }
         long fileSize;
         try {
             fileSize = Files.size(path);
         } catch (IOException e) {
             LOG.error("Failed to get size of file: " + path, e);
-            throw new JsUserRuntimeException("Failed to get size of file: " + toRelative(path), e);
+            throw new JsUserRuntimeException("Failed to get size of file: " + toRelativeForMessage(path), e);
         }
         int limit = maxBytes <= 0 ? DEFAULT_SNIFF_BYTES : (int) Math.min(maxBytes, MAX_READ_BYTES);
         byte[] data = readBytes(filePath, 0, limit);
@@ -1253,14 +1309,14 @@ public class JsFileSystem {
         String policy = normalizeErrorPolicy(errors);
         Path path = resolveSafePath(filePath);
         if (!Files.isRegularFile(path)) {
-            throw new JsUserRuntimeException("File not found: " + toRelative(path));
+            throw new JsUserRuntimeException("File not found: " + toRelativeForMessage(path));
         }
         byte[] data;
         try {
             data = Files.readAllBytes(path);
         } catch (IOException e) {
             LOG.error("Failed to read file: " + path, e);
-            throw new JsUserRuntimeException("Failed to read file: " + toRelative(path), e);
+            throw new JsUserRuntimeException("Failed to read file: " + toRelativeForMessage(path), e);
         }
         return decode(data, cs, policy, toRelative(path));
     }
@@ -1277,10 +1333,10 @@ public class JsFileSystem {
     private static JsUserRuntimeException decodingFailure(String action, Path path, Charset cs, Long lineNo,
             IOException e) {
         if (!isCodingError(e)) {
-            return new JsUserRuntimeException(action + ": " + toRelative(path), e);
+            return new JsUserRuntimeException(action + ": " + toRelativeForMessage(path), e);
         }
         String where = lineNo != null && lineNo > 0 ? " near line " + lineNo : "";
-        return new JsUserRuntimeException(action + ": " + toRelative(path) + where + " - the file is not valid "
+        return new JsUserRuntimeException(action + ": " + toRelativeForMessage(path) + where + " - the file is not valid "
                 + cs.name() + ". Pass the real charset (e.g. \"CP-1252\" or \"ISO-8859-1\"),"
                 + " check fs.detectCharset(path), or pass errors 'replace' to read it anyway.", e);
     }
@@ -1349,7 +1405,7 @@ public class JsFileSystem {
         String policy = normalizeErrorPolicy(errors);
         Path path = resolveSafePath(filePath);
         if (!Files.isRegularFile(path)) {
-            throw new JsUserRuntimeException("File not found: " + toRelative(path));
+            throw new JsUserRuntimeException("File not found: " + toRelativeForMessage(path));
         }
         if (startLine < 1) {
             startLine = 1;
@@ -1420,13 +1476,13 @@ public class JsFileSystem {
         String policy = normalizeErrorPolicy(errors);
         Path path = resolveSafePath(filePath);
         if (!Files.isRegularFile(path)) {
-            throw new JsUserRuntimeException("File not found: " + toRelative(path));
+            throw new JsUserRuntimeException("File not found: " + toRelativeForMessage(path));
         }
         try {
             return new LineReader(path, newReader(path, cs, policy), cs);
         } catch (IOException e) {
             LOG.error("Failed to open file for line reading: " + path, e);
-            throw new JsUserRuntimeException("Failed to open file: " + toRelative(path), e);
+            throw new JsUserRuntimeException("Failed to open file: " + toRelativeForMessage(path), e);
         }
     }
 
@@ -1443,7 +1499,7 @@ public class JsFileSystem {
     public static List<String> readdir(String dirPath) {
         Path dir = resolveSafePath(dirPath);
         if (!Files.isDirectory(dir)) {
-            throw new JsUserRuntimeException("Not a directory: " + toRelative(dir));
+            throw new JsUserRuntimeException("Not a directory: " + toRelativeForMessage(dir));
         }
         List<String> names = new ArrayList<>();
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
@@ -1452,7 +1508,7 @@ public class JsFileSystem {
             }
         } catch (IOException e) {
             LOG.error("Failed to list directory: " + dir, e);
-            throw new JsUserRuntimeException("Failed to list directory: " + toRelative(dir), e);
+            throw new JsUserRuntimeException("Failed to list directory: " + toRelativeForMessage(dir), e);
         }
         Collections.sort(names);
         return names;
@@ -1467,7 +1523,7 @@ public class JsFileSystem {
     public static List<String> listFiles(String dirPath) {
         Path dir = resolveSafePath(dirPath);
         if (!Files.isDirectory(dir)) {
-            throw new JsUserRuntimeException("Not a directory: " + toRelative(dir));
+            throw new JsUserRuntimeException("Not a directory: " + toRelativeForMessage(dir));
         }
         List<String> paths = new ArrayList<>();
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
@@ -1476,7 +1532,7 @@ public class JsFileSystem {
             }
         } catch (IOException e) {
             LOG.error("Failed to list directory: " + dir, e);
-            throw new JsUserRuntimeException("Failed to list directory: " + toRelative(dir), e);
+            throw new JsUserRuntimeException("Failed to list directory: " + toRelativeForMessage(dir), e);
         }
         Collections.sort(paths);
         return paths;
@@ -1491,7 +1547,7 @@ public class JsFileSystem {
     public static Map<String, Object> stat(String filePath) {
         Path path = resolveSafePath(filePath);
         if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
-            throw new JsUserRuntimeException("Path does not exist: " + toRelative(path));
+            throw new JsUserRuntimeException("Path does not exist: " + toRelativeForMessage(path));
         }
         try {
             BasicFileAttributes attrs = Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
@@ -1508,7 +1564,7 @@ public class JsFileSystem {
             return result;
         } catch (IOException e) {
             LOG.error("Failed to read attributes: " + path, e);
-            throw new JsUserRuntimeException("Failed to read attributes: " + toRelative(path), e);
+            throw new JsUserRuntimeException("Failed to read attributes: " + toRelativeForMessage(path), e);
         }
     }
 
@@ -1595,7 +1651,7 @@ public class JsFileSystem {
                     StandardOpenOption.WRITE);
         } catch (IOException e) {
             LOG.error("Failed to write file: " + path, e);
-            throw new JsUserRuntimeException("Failed to write file: " + toRelative(path), e);
+            throw new JsUserRuntimeException("Failed to write file: " + toRelativeForMessage(path), e);
         }
     }
 
@@ -1648,7 +1704,7 @@ public class JsFileSystem {
             Files.write(path, data, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
         } catch (IOException e) {
             LOG.error("Failed to append to file: " + path, e);
-            throw new JsUserRuntimeException("Failed to append to file: " + toRelative(path), e);
+            throw new JsUserRuntimeException("Failed to append to file: " + toRelativeForMessage(path), e);
         }
     }
 
@@ -1663,7 +1719,7 @@ public class JsFileSystem {
             Files.createDirectories(dir);
         } catch (IOException e) {
             LOG.error("Failed to create directory: " + dir, e);
-            throw new JsUserRuntimeException("Failed to create directory: " + toRelative(dir), e);
+            throw new JsUserRuntimeException("Failed to create directory: " + toRelativeForMessage(dir), e);
         }
     }
 
@@ -1676,7 +1732,7 @@ public class JsFileSystem {
     public static void rm(String filePath) {
         Path path = resolveSafePath(filePath);
         if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
-            throw new JsUserRuntimeException("Path does not exist: " + toRelative(path));
+            throw new JsUserRuntimeException("Path does not exist: " + toRelativeForMessage(path));
         }
         try {
             if (Files.isDirectory(path) && !Files.isSymbolicLink(path)) {
@@ -1694,7 +1750,7 @@ public class JsFileSystem {
             }
         } catch (IOException e) {
             LOG.error("Failed to delete: " + path, e);
-            throw new JsUserRuntimeException("Failed to delete: " + toRelative(path), e);
+            throw new JsUserRuntimeException("Failed to delete: " + toRelativeForMessage(path), e);
         }
     }
 
@@ -1709,7 +1765,7 @@ public class JsFileSystem {
         Path src = resolveSafePath(sourcePath);
         Path dst = resolveSafePath(targetPath);
         if (!Files.exists(src, LinkOption.NOFOLLOW_LINKS)) {
-            throw new JsUserRuntimeException("Source does not exist: " + toRelative(src));
+            throw new JsUserRuntimeException("Source does not exist: " + toRelativeForMessage(src));
         }
         try {
             Path parent = dst.getParent();
@@ -1721,7 +1777,7 @@ public class JsFileSystem {
         } catch (IOException e) {
             LOG.error("Failed to rename " + src + " to " + dst, e);
             throw new JsUserRuntimeException(
-                    "Failed to rename: " + toRelative(src) + " -> " + toRelative(dst), e);
+                    "Failed to rename: " + toRelativeForMessage(src) + " -> " + toRelativeForMessage(dst), e);
         }
     }
 
@@ -1736,7 +1792,7 @@ public class JsFileSystem {
         Path src = resolveSafePath(sourcePath);
         Path dst = resolveSafePath(targetPath);
         if (!Files.isRegularFile(src)) {
-            throw new JsUserRuntimeException("Source file does not exist: " + toRelative(src));
+            throw new JsUserRuntimeException("Source file does not exist: " + toRelativeForMessage(src));
         }
         try {
             Path parent = dst.getParent();
@@ -1748,7 +1804,7 @@ public class JsFileSystem {
         } catch (IOException e) {
             LOG.error("Failed to copy " + src + " to " + dst, e);
             throw new JsUserRuntimeException(
-                    "Failed to copy: " + toRelative(src) + " -> " + toRelative(dst), e);
+                    "Failed to copy: " + toRelativeForMessage(src) + " -> " + toRelativeForMessage(dst), e);
         }
     }
 
@@ -1768,13 +1824,13 @@ public class JsFileSystem {
     public static long size(String filePath) {
         Path path = resolveSafePath(filePath);
         if (!Files.isRegularFile(path)) {
-            throw new JsUserRuntimeException("File not found: " + toRelative(path));
+            throw new JsUserRuntimeException("File not found: " + toRelativeForMessage(path));
         }
         try {
             return Files.size(path);
         } catch (IOException e) {
             LOG.error("Failed to get size of file: " + path, e);
-            throw new JsUserRuntimeException("Failed to get size of file: " + toRelative(path), e);
+            throw new JsUserRuntimeException("Failed to get size of file: " + toRelativeForMessage(path), e);
         }
     }
 
@@ -1802,14 +1858,14 @@ public class JsFileSystem {
         }
         Path path = resolveSafePath(filePath);
         if (!Files.isRegularFile(path)) {
-            throw new JsUserRuntimeException("File not found: " + toRelative(path));
+            throw new JsUserRuntimeException("File not found: " + toRelativeForMessage(path));
         }
         long fileSize;
         try {
             fileSize = Files.size(path);
         } catch (IOException e) {
             LOG.error("Failed to get size of file: " + path, e);
-            throw new JsUserRuntimeException("Failed to get size of file: " + toRelative(path), e);
+            throw new JsUserRuntimeException("Failed to get size of file: " + toRelativeForMessage(path), e);
         }
         if (offset >= fileSize) {
             return new byte[0];
@@ -1834,7 +1890,7 @@ public class JsFileSystem {
             return read < actualLength ? Arrays.copyOf(buffer, read) : buffer;
         } catch (IOException e) {
             LOG.error("Failed to read bytes from file: " + path, e);
-            throw new JsUserRuntimeException("Failed to read bytes from file: " + toRelative(path), e);
+            throw new JsUserRuntimeException("Failed to read bytes from file: " + toRelativeForMessage(path), e);
         }
     }
 
@@ -1888,7 +1944,7 @@ public class JsFileSystem {
                     StandardOpenOption.WRITE);
         } catch (IOException e) {
             LOG.error("Failed to write file: " + path, e);
-            throw new JsUserRuntimeException("Failed to write file: " + toRelative(path), e);
+            throw new JsUserRuntimeException("Failed to write file: " + toRelativeForMessage(path), e);
         }
     }
 
@@ -1924,7 +1980,7 @@ public class JsFileSystem {
                 writeBytes(filePath, data);
                 return;
             }
-            throw new JsUserRuntimeException("File not found: " + toRelative(path)
+            throw new JsUserRuntimeException("File not found: " + toRelativeForMessage(path)
                     + " (fs.writeBytes(path, data, offset) patches an EXISTING file at an offset;"
                     + " to create a new file use fs.writeBytes(path, data) without an offset)");
         }
@@ -1945,7 +2001,7 @@ public class JsFileSystem {
             }
         } catch (IOException e) {
             LOG.error("Failed to write file: " + path, e);
-            throw new JsUserRuntimeException("Failed to write file: " + toRelative(path), e);
+            throw new JsUserRuntimeException("Failed to write file: " + toRelativeForMessage(path), e);
         }
     }
 
@@ -1969,13 +2025,13 @@ public class JsFileSystem {
         }
         Path path = resolveSafePath(filePath);
         if (!Files.isRegularFile(path)) {
-            throw new JsUserRuntimeException("File not found: " + toRelative(path));
+            throw new JsUserRuntimeException("File not found: " + toRelativeForMessage(path));
         }
         try {
             return new BinaryBlockReader(path, blockSize);
         } catch (IOException e) {
             LOG.error("Failed to open file for block reading: " + path, e);
-            throw new JsUserRuntimeException("Failed to open file: " + toRelative(path), e);
+            throw new JsUserRuntimeException("Failed to open file: " + toRelativeForMessage(path), e);
         }
     }
 
@@ -2034,7 +2090,7 @@ public class JsFileSystem {
                 }
             } catch (IOException e) {
                 LOG.error("Failed to read block from: " + path, e);
-                throw new JsUserRuntimeException("Failed to read block from: " + toRelative(path), e);
+                throw new JsUserRuntimeException("Failed to read block from: " + toRelativeForMessage(path), e);
             }
             int got = bb.position();
             if (got == 0) {
