@@ -18,6 +18,7 @@ import org.rogmann.mcp2sdk.image.ImageLimits;
 import org.rogmann.mcp2sdk.image.JsImage;
 import org.rogmann.mcp2sdk.image.VisionClient;
 import org.rogmann.mcp2sdk.m2.PomWatch;
+import org.rogmann.mcp2sdk.review.ReviewStore;
 import org.rogmann.mcp2sdk.security.McpLockdownFilter;
 import org.rogmann.mcp2sdk.security.WebUiSessionFilter;
 import org.rogmann.mcp2sdk.tools.*;
@@ -56,8 +57,8 @@ public class McpConfig {
      * @return the shared review store
      */
     @Bean
-    public org.rogmann.mcp2sdk.review.ReviewStore reviewStore() {
-        return org.rogmann.mcp2sdk.review.ReviewStore.getInstance();
+    public ReviewStore reviewStore() {
+        return ReviewStore.getInstance();
     }
 
     // JsonMapper Bean for serialization
@@ -193,10 +194,13 @@ public class McpConfig {
         ImageLimits.setCurrent(ImageLimits.from(environment));
         // Where 'output: demo' publishes pictures: <webui.public.path>/gen-images, served by the
         // Web UI under /chat/gen-images (a directory of the module's own, not the UI's root).
-        // The port is read lazily: with server.port=0 only local.server.port knows the bound one,
-        // and that property appears after the web server has started. No number of ours is used -
-        // 0 means "not known yet" and the module answers with a hint instead of a guessed URL.
-        JsImage.setLocalWebServer(PublicDirWebServer.of(
+        // 'IfAbsent': this is the application DEFAULT. An embedding application that runs this
+        // server inside its own UI registers its server before this configuration and keeps it -
+        // the default must not overrule an operator's switch. The port is read lazily: with
+        // server.port=0 only local.server.port knows the bound one, and that property appears
+        // after the web server has started. No number of ours is used - 0 means "not known yet"
+        // and the module answers with a hint instead of a guessed URL.
+        JsImage.setLocalWebServerIfAbsent(PublicDirWebServer.of(
                 environment.getProperty("webui.public.path"),
                 () -> {
                     Integer bound = environment.getProperty("local.server.port", Integer.class);

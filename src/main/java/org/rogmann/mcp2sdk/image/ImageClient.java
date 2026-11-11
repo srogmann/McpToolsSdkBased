@@ -91,8 +91,13 @@ import java.util.UUID;
  *       <em>answer</em>: without it that URL must point at the configured endpoint's host (the
  *       endpoint itself is configuration and is used as set - that is how the diffusion models
  *       get a server of their own),</li>
- *   <li>{@code webui.llm.token} - optional {@code Authorization: Bearer} header, the same token
- *       the Web UI proxy sends.</li>
+ *   <li>{@value #PROP_TOKEN} - the API key of a diffusion server of its own, sent as an
+ *       {@code Authorization: Bearer} header; unset means "no key" (but see the next bullet),</li>
+ *   <li>{@code webui.llm.token} - the gateway's key, the one the Web UI proxy sends. It goes out
+ *       only while the endpoint <em>is</em> the gateway: an operator who points
+ *       {@value #PROP_URL} at another host must not hand that credential to it by accident.
+ *       Such a request then carries no {@code Authorization} header, and a 401/403 answer says
+ *       why instead of leaving the operator guessing.</li>
  * </ul>
  * <p>
  * The timeout is {@link ImageLimits#timeoutSeconds()} (default 55 s, below the sandbox's 60 s
@@ -126,6 +131,8 @@ public class ImageClient {
     static final String DIALECT_NATIVE = "native";
     /** The current model's gateway - the base the endpoints fall back to. */
     static final String PROP_GATEWAY_URL = "webui.model.url";
+    /** API key for a diffusion server of its own (default: the gateway's key, see below). */
+    static final String PROP_TOKEN = "mcp.js.image.token";
     /** Optional API key, sent as an {@code Authorization: Bearer} header. */
     static final String PROP_LLM_TOKEN = "webui.llm.token";
 
@@ -157,7 +164,10 @@ public class ImageClient {
     private final boolean legacyEdit;
     private final boolean allowExternalHost;
     private final String endpointHost;
-    private final String llmToken;
+    /** The key sent to the endpoint, or {@code null} for "no Authorization header". */
+    private final String endpointToken;
+    /** True when {@value #PROP_LLM_TOKEN} is configured but withheld (another host). */
+    private final boolean gatewayTokenWithheld;
     private final int defaultTimeoutSeconds;
     private final JsonMapper jsonMapper = JsonMapper.builder().build();
 
@@ -192,7 +202,6 @@ public class ImageClient {
         this.legacyGeneration = DIALECT_LEGACY.equals(dialect);
         this.legacyEdit = DIALECT_LEGACY.equals(dialectProperty(PROP_EDIT_DIALECT, dialect));
         this.allowExternalHost = booleanProperty(PROP_ALLOW_EXTERNAL_HOST, false);
-        this.llmToken = trimToNull(get(PROP_LLM_TOKEN));
         this.defaultTimeoutSeconds = ImageLimits.current().timeoutSeconds();
         String gateway = trimToNull(get(PROP_GATEWAY_URL));
         String base = firstNonBlank(get(PROP_URL), gateway);
@@ -203,6 +212,28 @@ public class ImageClient {
         // Both dialects address the edit below the same base; the legacy one completes the
         // path the same way (the fork's "complete URL" reading is gone with its property name).
         this.editEndpoint = base == null ? null : endpoint(base, EDIT_PATH);
+        // The key follows the same split as the URL: a server of its own gets its own key, and
+        // the gateway's key goes to the gateway only - an operator who points the module at a
+        // foreign host must not hand it the credential by accident (the mirror image of the
+        // answer-side host rule above).
+        String ownToken = trimToNull(get(PROP_TOKEN));
+        String gatewayToken = trimToNull(get(PROP_LLM_TOKEN));
+        if (ownToken != null) {
+            this.endpointToken = ownToken;
+            this.gatewayTokenWithheld = false;
+        } else if (gatewayToken != null && endpointHost != null
+                && endpointHost.equals(hostOf(gateway))) {
+            this.endpointToken = gatewayToken;
+            this.gatewayTokenWithheld = false;
+        } else {
+            this.endpointToken = null;
+            this.gatewayTokenWithheld = gatewayToken != null;
+            if (gatewayTokenWithheld) {
+                LOG.debug("image: the diffusion endpoint ({}) is not the gateway ({}) - {} is not"
+                        + " sent; set {} for a server of its own", endpointHost, hostOf(gateway),
+                        PROP_LLM_TOKEN, PROP_TOKEN);
+            }
+        }
     }
 
     /**
@@ -703,8 +734,8 @@ public class ImageClient {
             connection.setRequestMethod("GET");
             connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
             connection.setReadTimeout(defaultTimeoutSeconds * 1000);
-            if (llmToken != null) {
-                connection.setRequestProperty("Authorization", "Bearer " + llmToken);
+            if (endpointToken != null) {
+                connection.setRequestProperty("Authorization", "Bearer " + endpointToken);
             }
             int code = connection.getResponseCode();
             if (code != HttpURLConnection.HTTP_OK) {
@@ -758,8 +789,8 @@ public class ImageClient {
             connection.setRequestProperty("Content-Type", contentType);
             connection.setRequestProperty("Accept", "application/json");
             connection.setRequestProperty("x-request-id", UUID.randomUUID().toString());
-            if (llmToken != null) {
-                connection.setRequestProperty("Authorization", "Bearer " + llmToken);
+            if (endpointToken != null) {
+                connection.setRequestProperty("Authorization", "Bearer " + endpointToken);
             }
             connection.setDoOutput(true);
         } catch (IOException | URISyntaxException e) {
@@ -805,8 +836,24 @@ public class ImageClient {
         LOG.error("image.{}: HTTP {} {} from {}: {}", fn, code, reason, endpoint, quoted);
         String detail = jsonErrorMessage(text);
         return new JsUserRuntimeException(String.format(Locale.ROOT,
-                "image.%s: HTTP %d %s from %s: %s%s", fn, code, reason, endpoint, quoted,
-                detail == null ? "" : " (" + detail + ")"));
+                "image.%s: HTTP %d %s from %s: %s%s%s", fn, code, reason, endpoint, quoted,
+                detail == null ? "" : " (" + detail + ")", withheldTokenHint(code)));
+    }
+
+    /**
+     * The sentence that explains an authentication refusal when the request went out without a
+     * header on purpose - a 401 the operator cannot explain is worse than a longer message.
+     * @param code the HTTP status of the answer
+     * @return the hint, or an empty string
+     */
+    private String withheldTokenHint(int code) {
+        if (!gatewayTokenWithheld || (code != HttpURLConnection.HTTP_UNAUTHORIZED
+                && code != HttpURLConnection.HTTP_FORBIDDEN)) {
+            return "";
+        }
+        return "; the request carried no Authorization header - " + PROP_LLM_TOKEN
+                + " is only sent to the gateway (" + PROP_GATEWAY_URL + "), set " + PROP_TOKEN
+                + " for a diffusion server of its own";
     }
 
     /** The {@code error.message} of an OpenAI-style error body, or null. */

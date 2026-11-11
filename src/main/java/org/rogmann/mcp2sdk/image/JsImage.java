@@ -54,6 +54,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Core of the {@code image} JS-module: metadata, colour/texture analysis (with a measured
@@ -107,8 +108,17 @@ public class JsImage implements AutoCloseable {
     /** Source pictures one {@code image.edit} sends (the reference server accepts several). */
     private static final int MAX_EDIT_SOURCES = 4;
 
-    /** The web server {@code output: 'demo'} publishes to (registered once at startup). */
-    private static volatile LocalWebServerConfig localWebServer;
+    /**
+     * The web server {@code output: 'demo'} publishes to - set once, read per call.
+     * <p>
+     * An {@link AtomicReference} because two registrations may meet: an embedding application
+     * (e.g. a desktop UI with a server of its own) registers before the application's
+     * configuration runs, and the application's default then steps back - see
+     * {@link #setLocalWebServerIfAbsent(LocalWebServerConfig)}.
+     * </p>
+     */
+    private static final AtomicReference<LocalWebServerConfig> localWebServer =
+            new AtomicReference<>();
 
     /** JSON reader of {@code describe} (Jackson 3, like {@code VisionClient}). */
     private static final JsonMapper JSON_MAPPER = JsonMapper.builder().build();
@@ -136,20 +146,49 @@ public class JsImage implements AutoCloseable {
     }
 
     /**
-     * Registers the web server {@code output: 'demo'} publishes pictures to (called once from
-     * {@code McpConfig}). Static on purpose: a {@code JsImage} instance lives for one script
-     * call, the configuration outlives it (see {@link LocalWebServerConfig}).
+     * Registers the web server {@code output: 'demo'} publishes pictures to - an explicit
+     * override, e.g. from the application's configuration ({@code McpConfig}) or from a test.
+     * Static on purpose: a {@code JsImage} instance lives for one script call, the configuration
+     * outlives it (see {@link LocalWebServerConfig}).
+     * <p>
+     * The registration is read once per call (help, publish, status), so an implementation may
+     * answer differently on every call - a switch in the application's UI therefore takes effect
+     * without a restart. This method replaces what was registered; use
+     * {@link #setLocalWebServerIfAbsent(LocalWebServerConfig)} where a server of the embedding
+     * application must not be overruled.
+     * </p>
      * @param config the server, or {@code null} to switch the demo output off
      */
     public static void setLocalWebServer(LocalWebServerConfig config) {
-        localWebServer = config;
+        localWebServer.set(config);
+    }
+
+    /**
+     * Registers the web server {@code output: 'demo'} publishes pictures to, unless one is
+     * registered already - first registration wins.
+     * <p>
+     * This is the call for an <em>application default</em>: an embedding application that brings
+     * a server of its own (e.g. a desktop UI that starts a web server from a switch in its
+     * settings) registers it before the MCP configuration runs, and the default then steps back
+     * instead of replacing it. Compare-and-set, so two registrations from different threads cannot
+     * both "win" - the second one keeps the first.
+     * </p>
+     * @param config the default server, or {@code null} for "no default" (changes nothing here)
+     * @return the server in effect after the call (the existing one when there was one, otherwise
+     *         {@code config})
+     */
+    public static LocalWebServerConfig setLocalWebServerIfAbsent(LocalWebServerConfig config) {
+        if (config != null) {
+            localWebServer.compareAndSet(null, config);
+        }
+        return localWebServer.get();
     }
 
     /**
      * @return the registered web server, or {@code null}
      */
     public static LocalWebServerConfig localWebServer() {
-        return localWebServer;
+        return localWebServer.get();
     }
 
     /**
@@ -422,8 +461,8 @@ public class JsImage implements AutoCloseable {
                                             {format: "png"})
                   // -> {text, model, usage, image}; one-shot vision request to the CURRENT
                   //    model (webui.hasVision must be true, webui.model.url must be set;
-                  //    see docs/js/image.md §7); the image is scaled to max side 1568 and
-                  //    sent as base64 data URL.
+                  //    image.status() names what is missing); the image is scaled to max
+                  //    side 1568 and sent as base64 data URL.
                   image.fonts()                           // installed font families (debug aid)
 
                 Raw samples - the PDF way (pdf.stream() delivers a JPEG unchanged, other filters
@@ -504,7 +543,7 @@ public class JsImage implements AutoCloseable {
         sb.append("  ").append(ImageLimits.PROP_TIMEOUT_SECONDS).append(" = ")
                 .append(limits.timeoutSeconds()).append(" s HTTP timeout for generate/edit -")
                 .append(" raise it AND the script's\n  timeoutSeconds when a diffusion run needs")
-                .append(" longer. See docs/js/image.md.");
+                .append(" longer (image.status() prints the configured value).");
         return sb.toString();
     }
 
@@ -523,17 +562,29 @@ public class JsImage implements AutoCloseable {
                 ? "endpoint configured (" + ImageClient.PROP_MODEL + " is set)"
                 : "off - set " + ImageClient.PROP_MODEL + " (e.g. 'Qwen/Qwen-Image-2.1')"
                         + " and " + ImageClient.PROP_URL + " (default: the gateway)");
-        LocalWebServerConfig server = localWebServer;
+        LocalWebServerConfig server = localWebServer.get();
         sb.append('\n').append("  output 'demo': ");
         if (server == null) {
-            sb.append("off - no web server registered (use output: 'none' with path: '…')");
+            sb.append("off - no web server registered. An operator registers one once"
+                    + " (JsImage.setLocalWebServer); the module then writes <dir>/images/<file>"
+                    + " and rewrites <dir>/images.html in the directory that server names - the"
+                    + " server's configuration is read on every call, so a switch in the"
+                    + " application takes effect without a restart, and the implementation maps"
+                    + " a file to its URL. Until then use output: 'none' and write the picture"
+                    + " with {path: '…'}");
         } else {
-            sb.append(server.getWebServerDir());
-            if (server.isActive()) {
+            // A2: the caller sees a project-relative path, never the absolute one
+            sb.append(publishedDirLabel(server));
+            String reason;
+            try {
+                reason = server.isActive() ? null : server.unavailableReason();
+            } catch (RuntimeException e) {
+                reason = "the server could not be asked: " + reasonOf(e);
+            }
+            if (reason == null) {
                 sb.append(" (server active)");
             } else {
-                String reason = server.unavailableReason();
-                sb.append(" (no URL").append(reason == null ? "" : ": " + reason).append(")");
+                sb.append(" (no URL: ").append(reason).append(')');
             }
         }
         return sb.toString();
@@ -3134,6 +3185,18 @@ public class JsImage implements AutoCloseable {
     /**
      * Publishes a generated picture: file under {@code <dir>/images/}, gallery
      * {@code <dir>/images.html} rewritten (newest first), URLs from the registered server.
+     * <p>
+     * The registered server names its published directory the way the interface promises it
+     * (absolute); the module translates it into a project-relative path in
+     * {@link #publishedDirectory(String, LocalWebServerConfig)} - passing the absolute path to
+     * the {@code fs} rules would read its leading {@code "/"} as an add-on mount and turn a
+     * correct configuration into "Access denied". Nothing an implementation does reaches the
+     * script as a foreign exception: every question the module asks it is wrapped.
+     * </p>
+     * <p>
+     * Package-private (like the registration itself) so the gallery channel can be tested
+     * without a diffusion endpoint.
+     * </p>
      * @param fn function name
      * @param prompt the prompt (slug of the file name)
      * @param bytes the picture
@@ -3141,33 +3204,27 @@ public class JsImage implements AutoCloseable {
      * @param options the caller's options ({@code demoClear})
      * @param out the result map to extend
      */
-    private void demoOutput(String fn, String prompt, byte[] bytes, String format,
-                            Map<String, Object> options, Map<String, Object> out) {
-        LocalWebServerConfig server = localWebServer;
+    void demoOutput(String fn, String prompt, byte[] bytes, String format,
+                    Map<String, Object> options, Map<String, Object> out) {
+        LocalWebServerConfig server = localWebServer.get();
         if (server == null) {
             throw new JsUserRuntimeException("image." + fn + ": output 'demo' needs a registered"
                     + " web server and none is configured - use {path: '…'} to write the picture"
                     + " into the project, or let the operator register one");
         }
-        Path demoDir;
-        try {
-            demoDir = JsFileSystem.resolveSafePath(server.getWebServerDir().toString());
-        } catch (JsUserRuntimeException e) {
-            throw new JsUserRuntimeException("image." + fn + ": the registered web server"
-                    + " directory '" + server.getWebServerDir() + "' is not usable - "
-                    + e.getMessage(), e);
-        }
+        Path demoDir = publishedDirectory(fn, server);
         if (boolOpt(fn, options, "demoClear", false)) {
             ImageDemoGallery.clear(demoDir);
         }
         Path file = ImageDemoGallery.addImage(demoDir, prompt, format, bytes);
         Path gallery = ImageDemoGallery.galleryFile(demoDir);
-        Optional<URI> galleryUri = server.uriFor(gallery);
-        Optional<URI> imageUri = server.uriFor(file);
+        Optional<URI> galleryUri = serverUriFor(fn, server, gallery);
+        Optional<URI> imageUri = serverUriFor(fn, server, file);
         if (galleryUri.isEmpty() || imageUri.isEmpty()) {
             throw new JsUserRuntimeException("image." + fn + ": the web server could not map '"
                     + JsFileSystem.toRelative(file) + "' to a URL - its directory and the served"
-                    + " path do not match");
+                    + " path do not match (the picture and the gallery were written to '"
+                    + JsFileSystem.toRelative(demoDir) + "', but nothing links to them)");
         }
         if (out.get("path") == null) {
             out.put("path", JsFileSystem.toRelative(file));
@@ -3175,15 +3232,214 @@ public class JsImage implements AutoCloseable {
             // the caller already named a file with path: - keep it, and name the demo file apart
             out.put("demoPath", JsFileSystem.toRelative(file));
         }
-        out.put("url", galleryUri.get().toString());
-        out.put("imageUrl", imageUri.get().toString());
-        out.put("webServerActive", server.isActive());
-        if (!server.isActive()) {
-            String reason = server.unavailableReason();
-            out.put("hint", "the picture and the gallery were written, but they have no URL"
+        boolean active;
+        String reason = null;
+        try {
+            active = server.isActive();
+            if (!active) {
+                reason = server.unavailableReason();
+            }
+        } catch (RuntimeException e) {
+            active = false;
+            reason = "the server could not be asked: " + reasonOf(e);
+        }
+        out.put("webServerActive", active);
+        if (active) {
+            out.put("url", galleryUri.get().toString());
+            out.put("imageUrl", imageUri.get().toString());
+        } else {
+            // a URL no browser can open is worse than none: the hint names the reason and the
+            // file to open instead
+            out.put("hint", "the picture and the gallery were written to '"
+                    + JsFileSystem.toRelative(demoDir) + "', but they have no URL"
                     + (reason == null ? "" : " (" + reason + ")") + " - open "
                     + JsFileSystem.toRelative(file) + " directly");
         }
+    }
+
+    // ========================================================================
+    // The registered web server: translation, checks and messages
+    // ========================================================================
+
+    /**
+     * The directory the registered server publishes to, as a path the file rules accept.
+     * <p>
+     * The interface hands out an absolute directory ({@code fs} would read its leading
+     * {@code "/"} as an add-on mount); the module relativises it against the project base,
+     * refuses a directory outside the project and refuses the project directory itself. That
+     * translation is the module's job: an implementation must not have to know where the
+     * project lies or how the sandbox names its paths.
+     * </p>
+     * @param fn function name for the message
+     * @param server the registered server
+     * @return the resolved directory
+     */
+    private static Path publishedDirectory(String fn, LocalWebServerConfig server) {
+        Path dir;
+        try {
+            dir = server.getWebServerDir();
+        } catch (RuntimeException e) {
+            throw new JsUserRuntimeException("image." + fn + ": the registered web server could"
+                    + " not name its published directory - " + reasonOf(e), e);
+        }
+        if (dir == null) {
+            throw new JsUserRuntimeException("image." + fn + ": the registered web server names"
+                    + " no directory for published pictures - the module writes <dir>/images/ and"
+                    + " <dir>/images.html into it");
+        }
+        try {
+            return JsFileSystem.resolveSafePath(publishedRelativeDir(dir));
+        } catch (JsUserRuntimeException e) {
+            throw new JsUserRuntimeException("image." + fn + ": " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * The published directory as a path relative to the project base directory.
+     * @param dir the directory the implementation named (absolute, or relative to the project)
+     * @return the relative path, never empty
+     * @throws JsUserRuntimeException with a plain sentence (no function prefix) when the
+     *         directory lies outside the project or is the project directory itself
+     */
+    private static String publishedRelativeDir(Path dir) {
+        Path base = JsFileSystem.projectBase().toAbsolutePath().normalize();
+        Path absolute = (dir.isAbsolute() ? dir : base.resolve(dir)).toAbsolutePath().normalize();
+        if (!absolute.startsWith(base)) {
+            // the project base may be reached through a symbolic link - compare the real paths
+            Path realDir = realPath(absolute);
+            Path realBase = realPath(base);
+            if (realDir != null && realBase != null && realDir.startsWith(realBase)) {
+                absolute = realDir;
+                base = realBase;
+            } else {
+                throw new JsUserRuntimeException("the web server directory '"
+                        + relativeLabel(absolute, base) + "' lies outside the project directory -"
+                        + " the pictures are written with the project's file rules, so the"
+                        + " published directory has to be inside the project");
+            }
+        }
+        String relative = base.relativize(absolute).toString().replace('\\', '/');
+        if (relative.isEmpty()) {
+            throw new JsUserRuntimeException("the web server publishes the project directory"
+                    + " itself - the pictures and their gallery page need a directory of their"
+                    + " own (e.g. gen-images)");
+        }
+        return relative;
+    }
+
+    /**
+     * The published directory as {@code help()} and {@code status()} show it: project-relative,
+     * never absolute, and never a failure - the help text has to survive a configuration it
+     * cannot use (the caller is an LLM, which cannot do anything with a stack trace).
+     * @param server the registered server
+     * @return the label, {@code "(unusable: …)"} when no relative path can be formed
+     */
+    private static String publishedDirLabel(LocalWebServerConfig server) {
+        Path dir;
+        try {
+            dir = server.getWebServerDir();
+        } catch (RuntimeException e) {
+            return "(unusable: " + reasonOf(e) + ")";
+        }
+        if (dir == null) {
+            return "(no directory named)";
+        }
+        try {
+            return publishedRelativeDir(dir);
+        } catch (RuntimeException e) {
+            return "(unusable: " + withoutAbsoluteBase(e.getMessage()) + ")";
+        }
+    }
+
+    /**
+     * Maps a file of the published directory to its URL - a failure of the implementation
+     * becomes a module message (the interface allows an implementation to throw).
+     * @param fn function name for the message
+     * @param server the registered server
+     * @param file the file to map
+     * @return the URL, or empty when the server does not serve that file
+     */
+    private static Optional<URI> serverUriFor(String fn, LocalWebServerConfig server, Path file) {
+        Optional<URI> uri;
+        try {
+            uri = server.uriFor(file);
+        } catch (RuntimeException e) {
+            throw new JsUserRuntimeException("image." + fn + ": the registered web server failed"
+                    + " to map a file to a URL - " + reasonOf(e), e);
+        }
+        return uri == null ? Optional.empty() : uri;
+    }
+
+    /**
+     * The message of a foreign exception, or its class name when it carries none - with the
+     * project base prefix removed (this text ends up in the help, in {@code status()} and in the
+     * hint, and those show project-relative paths only).
+     * @param e the exception an implementation threw
+     * @return the reason
+     */
+    private static String reasonOf(RuntimeException e) {
+        String message = e.getMessage();
+        return withoutAbsoluteBase(message == null || message.isBlank()
+                ? e.getClass().getSimpleName() : message);
+    }
+
+    /**
+     * Removes the absolute project base prefix from a text an implementation produced.
+     * @param text the text, may be null
+     * @return the text without that prefix, unchanged when it does not contain it
+     */
+    private static String withoutAbsoluteBase(String text) {
+        if (text == null || text.isBlank()) {
+            return text;
+        }
+        try {
+            String base = JsFileSystem.projectBase().toAbsolutePath().normalize().toString();
+            if (base.isEmpty()) {
+                return text;
+            }
+            return text.replace(base + "/", "").replace(base + "\\", "").replace(base, "");
+        } catch (RuntimeException e) {
+            LOG.debug("image: cannot strip the project base prefix ({}), showing the text as is",
+                    e.getMessage());
+            return text;
+        }
+    }
+
+    /**
+     * The real path of a directory.
+     * @param path the path
+     * @return the real path, or {@code null} when it does not exist (yet)
+     */
+    private static Path realPath(Path path) {
+        try {
+            return path.toRealPath();
+        } catch (IOException e) {
+            LOG.debug("image: no real path for '{}' yet ({}) - comparing the given paths",
+                    path.getFileName(), e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * A path for a message: relative to the project base when possible, otherwise only the
+     * file name - never absolute (a relative path is the only form these messages carry).
+     * @param path the path to label
+     * @param base the project base directory
+     * @return the label
+     */
+    private static String relativeLabel(Path path, Path base) {
+        try {
+            String relative = base.relativize(path).toString().replace('\\', '/');
+            if (!relative.isEmpty()) {
+                return relative;
+            }
+        } catch (IllegalArgumentException e) {
+            // different file-system roots - nothing relative to say
+            LOG.debug("image: '{}' cannot be made relative to the project base ({})",
+                    path.getFileName(), e.getMessage());
+        }
+        Path name = path.getFileName();
+        return name == null ? "(unknown directory)" : name.toString();
     }
 
     /** The prompt of {@code generate}/{@code edit}: required, at most 800 characters. */
@@ -3276,12 +3532,30 @@ public class JsImage implements AutoCloseable {
         generationMap.put("reason", generation ? null : ImageClient.PROP_MODEL
                 + " is not set or no URL (" + ImageClient.PROP_URL + " / webui.model.url)");
         capabilities.put("generation", generationMap);
-        LocalWebServerConfig server = localWebServer;
+        LocalWebServerConfig server = localWebServer.get();
         Map<String, Object> demoMap = new LinkedHashMap<>();
         demoMap.put("configured", server != null);
-        demoMap.put("active", server != null && server.isActive());
-        demoMap.put("reason", server == null ? null : server.unavailableReason());
-        demoMap.put("dir", server == null ? null : server.getWebServerDir().toString());
+        if (server == null) {
+            demoMap.put("active", false);
+            demoMap.put("reason", null);
+            demoMap.put("dir", null);
+        } else {
+            // A2: project-relative, never the absolute directory the implementation hands out
+            demoMap.put("dir", publishedDirLabel(server));
+            boolean active;
+            String reason = null;
+            try {
+                active = server.isActive();
+                if (!active) {
+                    reason = server.unavailableReason();
+                }
+            } catch (RuntimeException e) {
+                active = false;
+                reason = "the server could not be asked: " + reasonOf(e);
+            }
+            demoMap.put("active", active);
+            demoMap.put("reason", reason);
+        }
         capabilities.put("demo", demoMap);
         Map<String, Object> map = new LinkedHashMap<>();
         map.put("limits", limitMap);

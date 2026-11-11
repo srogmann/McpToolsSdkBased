@@ -241,13 +241,13 @@ public class VisionClient {
         if (!hasVisionEnabled()) {
             throw new JsUserRuntimeException("image.vision: the current model is not marked as"
                     + " vision-capable (" + PROP_HAS_VISION + "=false) - mark it in the"
-                    + " configuration or use image.analyze() / image.preview() instead; see"
-                    + " docs/js/image.md §7");
+                    + " configuration or use image.analyze() / image.preview() instead"
+                    + " (image.status() names what is missing)");
         }
         if (!hasEndpoint()) {
             throw new JsUserRuntimeException("image.vision: no vision model configured - set "
                     + PROP_URL + " (the current model's gateway) or " + PROP_VISION_URL
-                    + "; see docs/js/image.md §7");
+                    + " (image.status() names what is missing)");
         }
         String modelName = overrides != null && overrides.model() != null
                 && !overrides.model().isBlank() ? overrides.model().trim() : model;
