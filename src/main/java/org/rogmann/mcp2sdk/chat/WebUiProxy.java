@@ -20,6 +20,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.env.Environment;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -59,6 +60,14 @@ import java.util.zip.GZIPInputStream;
  * {@code ui_settings} object built from {@code webui.uiConfig} / {@code webui.customCss}. The Web
  * UI treats it as its default - a browser that already stores its own settings (Developer settings
  * such as "Custom CSS" included) keeps them, see {@link #buildUiSettings()}.</p>
+ *
+ * <p>Among those settings is the <b>default MCP server</b> ({@code mcpServers}, property
+ * {@value #PROP_MCP_SERVER_ENABLED}, docs/webui.md §6): the Web UI keeps its MCP servers in the
+ * browser's {@code localStorage} only, so a cleared browser cache would leave the chat without a
+ * single tool until somebody types the server in again. The seeded URL is not hard-wired - it is
+ * the origin of the {@code /props} request (same origin, so no CORS and the session cookie of the
+ * lockdown mode travels along) and, without a request, the configured address plus the bound
+ * port.</p>
  */
 @RestController
 @RequestMapping("/chat")
@@ -120,6 +129,44 @@ public class WebUiProxy {
 
     /** Key of the "Custom CSS" setting inside {@code ui_settings} (Web UI: {@code customCss}). */
     private static final String UI_SETTING_CUSTOM_CSS = "customCss";
+
+    /**
+     * Key of the MCP server list inside {@code ui_settings} (Web UI settings key: {@code mcpServers}).
+     *
+     * <p>The value is a <em>JSON string</em> holding an array of server objects - exactly the shape
+     * the Web UI's settings store keeps in {@code localStorage["LlamaUi.config"]}, not an array
+     * node. That is not cosmetic: the settings dialog edits the value as text and
+     * {@code exportSettings()} runs {@code JSON.parse} on it, so an array node would be dropped by
+     * the UI. See docs/webui.md §6.</p>
+     */
+    private static final String UI_SETTING_MCP_SERVERS = "mcpServers";
+
+    /**
+     * Switches the {@code mcpServers} seed on. Without a configured MCP server the Web UI has no
+     * tools at all, and on hosts that clear the browser cache at logoff the entry has to be typed
+     * in again after every restart - the seed saves that (property {@value #PROP_MCP_SERVER_ENABLED},
+     * default true).
+     */
+    private static final String PROP_MCP_SERVER_ENABLED = "webui.mcpServer.enabled";
+
+    /**
+     * URL of the MCP server the Web UI is seeded with (property {@value #PROP_MCP_SERVER_URL}).
+     * Unset - the normal case - means "derive it": the origin of the {@code /props} request, and
+     * without a request the configured {@code server.address} plus the bound port.
+     */
+    private static final String PROP_MCP_SERVER_URL = "webui.mcpServer.url";
+
+    /** Display name of the seeded MCP server entry (property {@value #PROP_MCP_SERVER_NAME}). */
+    private static final String PROP_MCP_SERVER_NAME = "webui.mcpServer.name";
+
+    /** Stable id of the seeded entry: the Web UI keys its server list by id. */
+    private static final String MCP_SERVER_ID = "mcp2sdk";
+
+    /** Path of this application's Streamable-HTTP MCP endpoint (see {@code McpConfig}). */
+    private static final String MCP_ENDPOINT_PATH = "/mcp";
+
+    /** Host used when {@code server.address} names no reachable address (wildcard, unset). */
+    private static final String MCP_SEED_FALLBACK_HOST = "127.0.0.1";
 
     /** Field name of the server-side UI defaults in the {@code /props} response. */
     private static final String PROPS_FIELD_UI_SETTINGS = "ui_settings";
@@ -218,6 +265,27 @@ public class WebUiProxy {
     @Value("${" + PROP_CUSTOM_CSS + ":}")
     private String customCss;
 
+    /**
+     * Whether the Web UI is seeded with a default MCP server (property
+     * {@value #PROP_MCP_SERVER_ENABLED}, default true).
+     *
+     * <p>The field initializer is the value for a hand-constructed instance (unit tests): Spring
+     * overwrites it from the property, the no-arg construction keeps the default.</p>
+     */
+    @Value("${" + PROP_MCP_SERVER_ENABLED + ":true}")
+    private boolean mcpServerEnabled = true;
+
+    /**
+     * Explicit URL of the seeded MCP server (property {@value #PROP_MCP_SERVER_URL}). Empty means
+     * "derive it", see {@link #resolveMcpServerUrl(String)}.
+     */
+    @Value("${" + PROP_MCP_SERVER_URL + ":}")
+    private String mcpServerUrl;
+
+    /** Display name of the seeded MCP server entry (property {@value #PROP_MCP_SERVER_NAME}). */
+    @Value("${" + PROP_MCP_SERVER_NAME + ":" + MCP_SERVER_ID + "}")
+    private String mcpServerName;
+
     /** Vision capabilities */
     @Value("${" + PROP_HAS_VISION + ":false}")
     private boolean hasVision;
@@ -249,6 +317,19 @@ public class WebUiProxy {
      */
     @Autowired(required = false)
     private ToolRegistry toolRegistry;
+
+    /**
+     * Spring environment, read <em>lazily</em> when the seeded MCP server URL has to be derived
+     * without a request at hand (startup log, unit test): {@code server.port=0} binds an arbitrary
+     * port and only {@code local.server.port} knows it - and that property appears after the web
+     * server has started, i.e. long after this bean was created (same pattern as {@code McpConfig}
+     * and {@code BrowserListeners}).
+     *
+     * <p>{@code required = false} keeps the no-arg construction of the unit tests working; the
+     * field is null there and the URL falls back to the request origin or stays unset.</p>
+     */
+    @Autowired(required = false)
+    private Environment environment;
 
     /**
      * Chat template of the configured model and the reasoning translations built on it
@@ -532,12 +613,21 @@ public class WebUiProxy {
     /**
      * Delivers model properties (llama.cpp compatible)
      * Accessible at: /chat/props
+     *
+     * <p>The request is taken for one reason: the seeded MCP server URL (see
+     * {@link #buildMcpServersSetting(String)}) must be the origin the browser itself used. A seed
+     * naming another spelling of the same host - {@code 127.0.0.1} while the page was opened as
+     * {@code localhost} - would be a different origin for the browser: the MCP request would then
+     * be a cross-origin request (no CORS headers here, refused) and would not carry the
+     * {@code JSESSIONID} cookie that {@code McpLockdownFilter} requires.</p>
+     *
+     * @param request the props request, used to derive the page's own origin
      */
     @GetMapping(value = "/props", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<String> getProps() {
+    public ResponseEntity<String> getProps(HttpServletRequest request) {
         LOG.info("{} GET /chat/props", LocalDateTime.now());
 
-        String response = buildJsonProps();
+        String response = buildJsonProps(selfBaseUrlOf(request));
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
@@ -965,8 +1055,21 @@ public class WebUiProxy {
 
     /**
      * Creates a llama.cpp compatible JSON with model properties
+     *
+     * @return the props JSON, with the MCP server URL derived from the configuration
      */
     private String buildJsonProps() {
+        return buildJsonProps(null);
+    }
+
+    /**
+     * Creates a llama.cpp compatible JSON with model properties.
+     *
+     * @param requestBaseUrl origin the page was requested from ({@code scheme://host:port} plus
+     *                       context path, no trailing slash), or {@code null} when no request is
+     *                       behind the call (startup log, unit test)
+     */
+    private String buildJsonProps(String requestBaseUrl) {
         ObjectNode mapProps = jsonMapper.createObjectNode();
         ObjectNode mapDefGenSettings = jsonMapper.createObjectNode();
         ObjectNode mapParams = jsonMapper.createObjectNode();
@@ -987,7 +1090,7 @@ public class WebUiProxy {
 
         // Server-side UI defaults (llama.cpp --ui-config counterpart). The Web UI reads this as
         // props.ui_settings and seeds its settings store from it, see buildUiSettings().
-        ObjectNode uiSettings = buildUiSettings();
+        ObjectNode uiSettings = buildUiSettings(requestBaseUrl);
         if (!uiSettings.isEmpty()) {
             mapProps.set(PROPS_FIELD_UI_SETTINGS, uiSettings);
         }
@@ -1029,9 +1132,20 @@ public class WebUiProxy {
      * of {@code default_generation_settings.params} yielded at least one known parameter (its
      * sync step returns early otherwise), so those must stay part of the props response.</p>
      *
-     * @return the node to serve, empty when neither property is configured
+     * @return the node to serve, empty when nothing is configured
      */
     ObjectNode buildUiSettings() {
+        return buildUiSettings(null);
+    }
+
+    /**
+     * Builds the {@code ui_settings} node for the request at hand (see {@link #getProps}).
+     *
+     * @param requestBaseUrl origin of the page, or {@code null} to derive the MCP server URL from
+     *                       the configuration
+     * @return the node to serve, empty when nothing is configured
+     */
+    ObjectNode buildUiSettings(String requestBaseUrl) {
         ObjectNode uiSettings = jsonMapper.createObjectNode();
 
         if (uiConfigJson != null && !uiConfigJson.isBlank()) {
@@ -1055,7 +1169,186 @@ public class WebUiProxy {
             uiSettings.put(UI_SETTING_CUSTOM_CSS, customCss);
         }
 
+        // Default MCP server (docs/webui.md §6). An entry the operator wrote into uiConfig wins:
+        // that is a deliberate configuration, this is only the built-in convenience.
+        if (!uiSettings.has(UI_SETTING_MCP_SERVERS)) {
+            String servers = buildMcpServersSetting(requestBaseUrl);
+            if (servers != null) {
+                uiSettings.put(UI_SETTING_MCP_SERVERS, servers);
+            }
+        }
+
         return uiSettings;
+    }
+
+    /**
+     * Builds the {@code mcpServers} setting: a JSON <em>string</em> holding the Web UI's server list
+     * with one entry that points at this application's own MCP endpoint.
+     *
+     * <p>Why this exists: the Web UI keeps its MCP servers in {@code localStorage} only, so without
+     * an entry the chat has no tools at all (only {@code get_info} from {@code /chat/tools}). On
+     * hosts that clear the browser cache at logoff the entry would have to be typed in again after
+     * every restart. The Web UI applies {@code ui_settings} on the first visit of a browser (empty
+     * {@code localStorage}) and on "Reset Settings to Default" - precisely the situations that cost
+     * the typing. A browser that already has its own settings keeps them, so this stays a default
+     * and never overwrites a decision a user made.</p>
+     *
+     * <p>Package-private so the unit test can drive the derivation without a running application.</p>
+     *
+     * @param requestBaseUrl origin of the page, or {@code null} to use the configuration
+     * @return the JSON string to serve, or {@code null} when nothing is seeded (switched off, no
+     *         URL derivable)
+     */
+    String buildMcpServersSetting(String requestBaseUrl) {
+        if (!mcpServerEnabled) {
+            LOG.debug("{} is false: the Web UI keeps its own MCP server list.", PROP_MCP_SERVER_ENABLED);
+            return null;
+        }
+        String url = resolveMcpServerUrl(requestBaseUrl);
+        if (url == null) {
+            // Nothing half-baked: a URL with port 0 would be a server the browser can never reach,
+            // and it would occupy the "first visit" application, blocking a later correct value.
+            LOG.info("No {} seed: the MCP server URL cannot be derived ({} unset and no request"
+                            + " origin, or no port known). Set {} to name it explicitly.",
+                    UI_SETTING_MCP_SERVERS, PROP_MCP_SERVER_URL, PROP_MCP_SERVER_URL);
+            return null;
+        }
+
+        ObjectNode entry = jsonMapper.createObjectNode();
+        entry.put("id", MCP_SERVER_ID);
+        entry.put("name", serverDisplayName());
+        entry.put("url", url);
+        // Only an enabled server with a URL is counted by the Web UI, and 'enabled' is what its
+        // toggle switch shows: a seed the user has to switch on first would miss the point.
+        entry.put("enabled", true);
+
+        ArrayNode servers = jsonMapper.createArrayNode();
+        servers.add(entry);
+        try {
+            return jsonMapper.writeValueAsString(servers);
+        } catch (RuntimeException e) {
+            LOG.warn("Cannot serialize the {} seed, the Web UI keeps its own server list: {}",
+                    UI_SETTING_MCP_SERVERS, e.getMessage());
+            return null;
+        }
+    }
+
+    /** Name of the seeded server entry (property {@value #PROP_MCP_SERVER_NAME}, fallback: its id). */
+    private String serverDisplayName() {
+        String name = (mcpServerName == null) ? "" : mcpServerName.trim();
+        return name.isEmpty() ? MCP_SERVER_ID : name;
+    }
+
+    /**
+     * Resolves the MCP endpoint URL the Web UI is seeded with, in three steps:
+     *
+     * <ol>
+     *   <li>{@value #PROP_MCP_SERVER_URL}, if set: the operator knows best (reverse proxy, another
+     *       transport such as {@code /mcp/sse}, another host),</li>
+     *   <li>the origin of the {@code /props} request plus {@value #MCP_ENDPOINT_PATH}: the spelling
+     *       the browser itself used, which keeps the MCP call same-origin - no CORS, and the
+     *       session cookie travels along that {@code McpLockdownFilter} asks for,</li>
+     *   <li>the configured address and bound port (see {@link #mcpServerUrlFromConfig()}) for the
+     *       cases without a request.</li>
+     * </ol>
+     *
+     * @param requestBaseUrl origin of the page, may be {@code null}
+     * @return the URL, or {@code null} when none can be derived
+     */
+    String resolveMcpServerUrl(String requestBaseUrl) {
+        if (mcpServerUrl != null && !mcpServerUrl.isBlank()) {
+            return stripTrailingSlash(mcpServerUrl.trim());
+        }
+        if (requestBaseUrl != null && !requestBaseUrl.isBlank()) {
+            return stripTrailingSlash(requestBaseUrl.trim()) + MCP_ENDPOINT_PATH;
+        }
+        return mcpServerUrlFromConfig();
+    }
+
+    /**
+     * Derives the MCP endpoint URL from the configuration, for callers without a request (startup
+     * log, unit test): {@code server.address} or the loopback address, the bound port, the context
+     * path and {@value #MCP_ENDPOINT_PATH}.
+     *
+     * @return the URL, or {@code null} when no port is known (no {@link Environment}, or
+     *         {@code server.port} still 0)
+     */
+    String mcpServerUrlFromConfig() {
+        if (environment == null) {
+            return null;
+        }
+        int port = configuredPort();
+        if (port <= 0) {
+            return null;
+        }
+        return "http://" + configuredHost() + ":" + port + configuredContextPath() + MCP_ENDPOINT_PATH;
+    }
+
+    /**
+     * The port this application listens on: {@code local.server.port} - the bound one, the only
+     * truth when {@code server.port=0} - and otherwise {@code server.port}.
+     *
+     * @return the port, or -1 when none is known
+     */
+    private int configuredPort() {
+        Integer bound = environment.getProperty("local.server.port", Integer.class);
+        if (bound != null && bound > 0) {
+            return bound;
+        }
+        Integer configured = environment.getProperty("server.port", Integer.class);
+        return (configured == null) ? -1 : configured;
+    }
+
+    /**
+     * Host of the seeded URL: {@code server.address}, or the loopback address when it is unset or a
+     * wildcard. Wildcards are the case that matters: {@code 0.0.0.0} is what the server binds, not
+     * what a browser can open.
+     *
+     * @return a host (IPv6 literals bracketed), never blank
+     */
+    private String configuredHost() {
+        String address = environment.getProperty("server.address", "");
+        if (address == null) {
+            address = "";
+        }
+        address = address.trim();
+        if (address.isEmpty() || "0.0.0.0".equals(address) || "::".equals(address)
+                || "[::]".equals(address) || "*".equals(address)) {
+            return MCP_SEED_FALLBACK_HOST;
+        }
+        if (address.indexOf(':') >= 0 && !address.startsWith("[")) {
+            return "[" + address + "]";
+        }
+        return address;
+    }
+
+    /**
+     * Context path of the application as a URL prefix ("" when there is none), because the MCP
+     * endpoint moves with it.
+     *
+     * @return the prefix, without a trailing slash
+     */
+    private String configuredContextPath() {
+        String contextPath = environment.getProperty("server.servlet.context-path", "");
+        if (contextPath == null || contextPath.isBlank() || "/".equals(contextPath.trim())) {
+            return "";
+        }
+        String path = stripTrailingSlash(contextPath.trim());
+        return path.startsWith("/") ? path : "/" + path;
+    }
+
+    /**
+     * Removes trailing slashes, so path concatenation cannot produce a double slash.
+     *
+     * @param value value to normalize
+     * @return the value without trailing slashes
+     */
+    private static String stripTrailingSlash(String value) {
+        String result = value;
+        while (result.endsWith("/")) {
+            result = result.substring(0, result.length() - 1);
+        }
+        return result;
     }
 
     /**
@@ -1077,6 +1370,18 @@ public class WebUiProxy {
                         + " are applied on the first visit or after 'Reset Settings to Default'.",
                 PROPS_FIELD_UI_SETTINGS, keys, keys.size(),
                 customCss == null ? 0 : customCss.length());
+
+        // The MCP seed is the one setting whose effect an operator cannot see in the browser (it
+        // appears in a dialog, and only once), so name the URL that would be shipped. Note that
+        // this line derives the URL from the configuration: the origin the browser actually used
+        // is only known per /props request, and it is what /props ships.
+        JsonNode seededServers = uiSettings.get(UI_SETTING_MCP_SERVERS);
+        if (seededServers != null && seededServers.isString()) {
+            LOG.info("Web UI default MCP server ({}): {} - applied by a browser without settings of"
+                            + " its own, i.e. after a cleared cache or on 'Reset Settings to Default'"
+                            + " (docs/webui.md §6.2).",
+                    PROP_MCP_SERVER_ENABLED, seededServers.asString());
+        }
     }
 
     /**
