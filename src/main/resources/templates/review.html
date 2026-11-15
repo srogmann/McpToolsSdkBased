@@ -40,6 +40,8 @@
 <div class="statusline">
     <span id="pollInfo"></span>
     <button type="button" id="reloadNow">Reload now</button>
+    <button type="button" id="soundToggle" title="Sound is switched on - a new request is announced with two short notes (a' 1/8, gis' 1/4). Click to switch it off.">Sound: on</button>
+    <button type="button" id="soundTest" title="Plays the two notes once, so you can check that the browser really produces sound. Works also while the signal is switched off.">Test Sound</button>
 </div>
 <div class="banner" id="statusBanner" hidden></div>
 
@@ -58,7 +60,7 @@
         <th>Decide</th>
     </tr>
     </thead>
-    <tbody>
+    <tbody id="entriesBody">
     <tr th:if="${#lists.isEmpty(entries)}">
         <td colspan="9">No requests.</td>
     </tr>
@@ -102,7 +104,8 @@
     /* No meta refresh: the page reloads only when the set of statuses really changed,
        otherwise a reload would throw away the scroll position for no reason. */
     var OPEN = ['pending', 'approved', 'running'];
-    var POLL_MS = 5000;
+    var POLL_MS = 5000;         /* while a request is open */
+    var IDLE_POLL_MS = 15000;   /* while nothing is open: only look for arrivals */
 
     var pollInfo = document.getElementById('pollInfo');
     var banner = document.getElementById('statusBanner');
@@ -116,6 +119,160 @@
     }
     function setInfo(text) { if (pollInfo) { pollInfo.textContent = text; } }
 
+    /* ---------- Short acoustic signal when a new request arrives ----------
+       Two notes, a' 1/8 and gis' 1/4 at 120 bpm (a' = 440 Hz, gis' = 415.30 Hz),
+       synthesised with the Web Audio API - no audio file, nothing to download.
+       A browser may refuse audio until the page saw a user gesture; then the
+       signal is kept and played on the first click or key press. */
+    var MUTE_KEY = 'review:signal-muted';
+    var NOTES = [
+        {freq: 440.00, seconds: 0.25},   /* a'   1/8 */
+        {freq: 415.30, seconds: 0.50}    /* gis' 1/4 */
+    ];
+    var audioCtx = null;
+    var signalWanted = false;      // a signal was due but the browser still blocked audio
+    var signalForce = false;       // that kept signal is an explicit test - plays also muted
+    var soundBtn = document.getElementById('soundToggle');
+    var soundTestBtn = document.getElementById('soundTest');
+    var muted = false;
+    try { muted = window.localStorage.getItem(MUTE_KEY) === '1'; } catch (e) { muted = false; }
+
+    function renderSoundButton() {
+        if (!soundBtn) { return; }
+        /* label = state, tooltip = state and what a click would do */
+        soundBtn.textContent = muted ? 'Sound: off' : 'Sound: on';
+        soundBtn.title = muted
+                ? 'Sound is switched off - new requests arrive silently. '
+                  + 'Click to switch the signal on.'
+                : 'Sound is switched on - a new request is announced with two short notes '
+                  + '(a\' 1/8, gis\' 1/4). Click to switch it off.';
+        if (!muted && (!audioCtx || audioCtx.state !== 'running')) {
+            soundBtn.title += ' Your browser still blocks audio; the first click on this page '
+                    + 'also allows it.';
+        }
+    }
+
+    function audio() {
+        if (!audioCtx) {
+            var Ctx = window.AudioContext || window.webkitAudioContext;
+            if (!Ctx) { return null; }
+            try { audioCtx = new Ctx(); } catch (e) { audioCtx = null; }
+        }
+        return audioCtx;
+    }
+
+    /* Firefox releases an idle audio device: minutes later a signal loses its first
+       (short) note in the wake-up of the hardware. A barely audible 20 Hz tone keeps the
+       graph - and the device - running, so the signal starts on live audio. */
+    var keepAlive = null;
+    function startKeepAlive(ctx) {
+        if (keepAlive || muted) { return; }
+        try {
+            var osc = ctx.createOscillator();
+            var gain = ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.value = 20;       /* below hearing, but not silence */
+            gain.gain.value = 0.0001;
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start();
+            keepAlive = osc;
+        } catch (e) { keepAlive = null; }
+    }
+
+    /** Plays the two notes. {@code force} is the explicit "Test Sound": it plays also
+     *  while the signal is switched off (the reviewer asked for it). */
+    function playSignal(force) {
+        if (muted && !force) { signalWanted = false; return; }
+        var ctx = audio();
+        if (!ctx) { return; }
+        if (ctx.state !== 'running') {
+            /* autoplay policy: only a user gesture may start the context */
+            try { ctx.resume(); } catch (e) { /* ignore */ }
+            signalWanted = true;
+            signalForce = !!force;
+            renderSoundButton();
+            setInfo('Signal blocked by the browser - click once to allow it.');
+            return;
+        }
+        signalWanted = false;
+        signalForce = false;
+        startKeepAlive(ctx);
+        /* Lead-in: even with a warm device the first samples can be swallowed. */
+        var t = ctx.currentTime + 0.35;
+        if (window.console && console.info) {
+            console.info('review signal played (audio state ' + ctx.state + ')');
+        }
+        NOTES.forEach(function (note) {
+            var end = t + note.seconds;
+            var osc = ctx.createOscillator();
+            var gain = ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.value = note.freq;
+            /* short attack and release, so the tone does not click */
+            gain.gain.setValueAtTime(0.0001, t);
+            gain.gain.exponentialRampToValueAtTime(0.18, t + 0.015);
+            gain.gain.setValueAtTime(0.18, Math.max(t + 0.02, end - 0.04));
+            gain.gain.exponentialRampToValueAtTime(0.0001, end);
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start(t);
+            osc.stop(end + 0.02);
+            t = end + 0.02;
+        });
+    }
+
+    /** A click or key press may start the audio context - and plays a kept signal. */
+    function unlockAudio() {
+        var ctx = audio();
+        if (!ctx) { return; }
+        var play = function () {
+            if (ctx.state !== 'running') { return; }
+            startKeepAlive(ctx);
+            renderSoundButton();       /* the "still blocks audio" hint is obsolete now */
+            if (signalWanted) { playSignal(signalForce); }
+        };
+        if (ctx.state === 'running') { play(); return; }
+        try {
+            var started = ctx.resume();
+            if (started && started.then) { started.then(play, function () { /* ignore */ }); }
+            else { play(); }
+        } catch (e) { /* ignore */ }
+    }
+
+    if (soundBtn) {
+        renderSoundButton();
+        soundBtn.addEventListener('click', function () {
+            if (muted) {
+                muted = false;
+                try { window.localStorage.setItem(MUTE_KEY, '0'); } catch (e) { /* ignore */ }
+                renderSoundButton();
+                /* the click is the gesture the browser wants: unlock and keep the audio
+                   device warm, but no sample here - that is what "Test Sound" is for */
+                unlockAudio();
+                return;
+            }
+            muted = true;
+            try { window.localStorage.setItem(MUTE_KEY, '1'); } catch (e) { /* ignore */ }
+            renderSoundButton();
+            if (keepAlive) {                  /* no audio device left running while muted */
+                try { keepAlive.stop(); } catch (e) { /* ignore */ }
+                keepAlive = null;
+            }
+        });
+    }
+
+    /* Explicit check of the sound output: plays the arrival signal once. Works also while
+       the signal is switched off - the reviewer asked for a tone. */
+    if (soundTestBtn) {
+        soundTestBtn.addEventListener('click', function () {
+            unlockAudio();
+            playSignal(true);
+        });
+    }
+    document.addEventListener('pointerdown', unlockAudio);
+    document.addEventListener('keydown', unlockAudio);
+
     function signature(doc) {
         var rows = doc.querySelectorAll('tr[data-id]');
         var parts = [];
@@ -125,8 +282,41 @@
         return parts.join('|');
     }
 
+    /** IDs whose row carries the given status in a signature. */
+    function idsWithStatus(sig, wanted) {
+        var ids = [];
+        sig.split('|').forEach(function (part) {
+            var eq = part.indexOf('=');
+            if (eq > 0 && part.substring(eq + 1) === wanted) { ids.push(part.substring(0, eq)); }
+        });
+        return ids;
+    }
+
+    function hasOpenIn(sig) {
+        return OPEN.some(function (s) { return sig.indexOf('=' + s) >= 0; });
+    }
+
+    /**
+     * Swaps the rows of the fetched page into this document instead of reloading it.
+     * A reload would be a NEW document, and a new document loses the audio context the
+     * reviewer unlocked with a click - every arrival would ask for a fresh click. Swapping
+     * in place also keeps the scroll position. Returns false when the fetched page has no
+     * table (then the caller falls back to a reload).
+     */
+    function applyRows(doc) {
+        var target = document.getElementById('entriesBody');
+        var fresh = doc.getElementById ? doc.getElementById('entriesBody') : null;
+        if (!target || !fresh || !target.replaceChildren) { return false; }
+        var adopted = Array.prototype.map.call(fresh.children, function (node) {
+            return document.importNode ? document.importNode(node, true) : node;
+        });
+        target.replaceChildren.apply(target, adopted);
+        return true;
+    }
+
     var current = signature(document);
-    var hasOpen = OPEN.some(function (s) { return current.indexOf('=' + s) >= 0; });
+    var hasOpen = hasOpenIn(current);
+    var staleWhileHidden = false;
 
     if (reloadBtn) {
         reloadBtn.addEventListener('click', function () {
@@ -148,13 +338,16 @@
     }
 
     if (!hasOpen) {
-        setInfo('No open request - no automatic updates.');
-        return;
+        /* Nothing open - but a request may still arrive, and that is exactly what the
+           signal is for: keep looking, only slower. */
+        setInfo('No open request - checking every ' + Math.round(IDLE_POLL_MS / 1000)
+                + ' s for a new one.');
+    } else {
+        setInfo('Open request present, checked ' + clock());
     }
-    setInfo('Open request present, checked ' + clock());
 
     function poll() {
-        if (navigating || document.hidden || !window.fetch || !window.DOMParser) { return; }
+        if (navigating || !window.fetch || !window.DOMParser) { return; }
         window.fetch(window.location.href, {cache: 'no-store', headers: {'Accept': 'text/html'}})
                 .then(function (resp) { return resp.text(); })
                 .then(function (html) {
@@ -164,8 +357,35 @@
                         setInfo('Status not readable (' + clock() + ')');
                         return;
                     }
-                    setInfo('Checked ' + clock());
-                    if (fresh === current) { return; }
+                    if (fresh === current) {
+                        setInfo('Checked ' + clock() + ' - no change.');
+                        return;
+                    }
+                    /* A request is new when its ID is pending now and was not before. */
+                    var known = idsWithStatus(current, 'pending');
+                    var arrived = idsWithStatus(fresh, 'pending').some(function (id) {
+                        return known.indexOf(id) < 0;
+                    });
+                    current = fresh;
+                    hasOpen = hasOpenIn(fresh);
+                    if (arrived) { playSignal(); }
+                    setInfo(arrived
+                            ? 'Checked ' + clock() + ' - new request'
+                              + (signalWanted ? ', click once to allow the signal.' : '.')
+                            : 'Checked ' + clock() + ' - list updated.');
+                    /* Rows are swapped in place - no reload, so the unlocked audio context
+                       survives and the signal keeps working without further clicks. */
+                    if (applyRows(doc)) {
+                        if (banner) { banner.hidden = true; }
+                        return;
+                    }
+                    /* Fallback: the fetched page is not the table we know - reload it. */
+                    if (document.hidden) {
+                        staleWhileHidden = true;
+                        showBanner('The requests changed - reloading as soon as this tab '
+                                + 'is visible again.');
+                        return;
+                    }
                     showBanner('The requests changed - reloading ...');
                     window.setTimeout(reloadNow, 500);
                 })
@@ -175,9 +395,18 @@
                 });
     }
 
-    window.setInterval(poll, POLL_MS);
+    /* Self-scheduling instead of setInterval: the pace depends on whether anything is open. */
+    function schedule() {
+        window.setTimeout(function () {
+            poll();
+            schedule();
+        }, hasOpen ? POLL_MS : IDLE_POLL_MS);
+    }
+    schedule();
     document.addEventListener('visibilitychange', function () {
-        if (!document.hidden) { poll(); }
+        if (document.hidden) { return; }
+        if (staleWhileHidden) { staleWhileHidden = false; reloadNow(); return; }
+        poll();
     });
     window.addEventListener('beforeunload', function () { navigating = true; });
 })();
