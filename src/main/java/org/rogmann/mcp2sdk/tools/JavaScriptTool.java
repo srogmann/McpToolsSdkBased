@@ -384,6 +384,12 @@ public class JavaScriptTool {
      * pre-initialization step and the file content is appended; all combinations are executed
      * by the same engine {@link #runScript}, guaranteeing identical sandbox restrictions.
      * </p>
+     * <p>
+     * Undocumented compatibility fallback: when {@code script} is absent but {@code command} is
+     * given, the value of {@code command} is used as the inline source and a warning is logged.
+     * Some models habitually send the source under that name (the parameter name of other
+     * tools); the parameter is deliberately not part of the tool schema.
+     * </p>
      * @param exchange the server exchange
      * @param request the tool call request
      * @return the tool call result
@@ -396,6 +402,19 @@ public class JavaScriptTool {
         Map<String, Object> arguments = request.arguments();
 
         Object oScript = arguments.get("script");
+        if (oScript == null) {
+            // Undocumented compatibility fallback: some models send the inline source as
+            // 'command' - the parameter name of other tools they have seen far more often -
+            // instead of 'script'. Accept it (with a warning) rather than failing the call,
+            // but do not advertise it in the tool schema.
+            Object oCommand = arguments.get("command");
+            if (oCommand != null && !oCommand.toString().isBlank()) {
+                LOGGER.warn("Tool call passed 'command' instead of 'script'; using its value as "
+                        + "the inline JavaScript source ({} chars). 'command' is not a documented "
+                        + "parameter of this tool.", oCommand.toString().length());
+                oScript = oCommand;
+            }
+        }
         Object oPath = arguments.get("path");
         if (oScript == null && oPath == null) {
             return CallToolResult.builder()
