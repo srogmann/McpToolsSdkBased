@@ -1,6 +1,6 @@
 /**
  * pdftext - a small typesetter on top of pdfedit: pages, headings, justified paragraphs, lists,
- * tables and flowcharts, rendered as pdfedit operations.
+ * tables, flowcharts and diagrams, rendered as pdfedit operations.
  *
  * The library is a document model plus two passes: the first one collects every string that needs
  * a width, the second one lays out and emits the ops. Measuring is the only thing it asks the
@@ -36,11 +36,19 @@
  *    line, which the result reports.
  *
  *  - No hyphenation, no font fallback, no bidi. A word that is wider than its column runs over
- *    (and the element is reported), because a silently clipped number column is the kind of thing
- *    one sees only on paper.
+ *    (and the element is reported - a paragraph line as well as a table cell), because a silently
+ *    clipped number column is the kind of thing one sees only on paper. Implausible column widths
+ *    are notes, not exceptions: see help() and columnWidths().
+ *
+ * The manual of the module is help() - the text a caller reads (it is what the tool description
+ * advertises). docs/js/pdftext.md is the maintenance note next to this code.
  */
 
 'use strict';
+
+// The PDF backend of the diagram module: a scene becomes pdfedit ops. pdftext owns the page and
+// the measuring cache; diagram/pdf.js only translates items (docs/js/diagram-plan.md §3.1).
+var diagramPdf = require('./diagram/pdf.js');
 
 /** Page size presets in points. */
 var PAGES = {
@@ -383,6 +391,30 @@ Report.prototype.list = function (items, options) {
 
 /**
  * A table.
+ * <p>
+ * A column is {@code {title, width, align}}, and the unit of {@code width} is the form of the
+ * value:
+ * </p>
+ * <ul>
+ *   <li><b>a number is points</b> - {@code width: 120} is 120 pt wide. The padding is part of
+ *       that ({@code padding}, default 4 pt each side), so the column holds 112 pt of text.</li>
+ *   <li><b>a string {@code 'NN%'} is a share of the text area</b> - {@code '22%'} is 22 % of the
+ *       481.28 pt an A4 page has between the margins.</li>
+ *   <li><b>{@code 'auto'} or no width at all</b> - the column gets its share of what the explicit
+ *       ones leave, distributed by its content.</li>
+ * </ul>
+ * <p>
+ * There is no fraction shorthand and no unit suffix: {@code width: 0.28} is 0.28 <em>points</em>,
+ * not 28 %, and {@code '120pt'} is no number at all. A width like that leaves no room for text;
+ * the run raises the column to the narrowest usable width and says so in {@code result.notes} -
+ * it does not throw, and it does not stay silent.
+ * </p>
+ * <pre>
+ *     doc.table({cols: [{title: 'Nr.', width: 30},                        // 30 pt
+ *                       {title: 'Leistung'},                              // by content
+ *                       {title: 'Betrag', width: '22%', align: 'right'}], // 22 % of the area
+ *                rows: [['1', 'Aufstellung der Anlage 3', '1.240,00']]});
+ * </pre>
  * @param {object} table {cols, rows, fontSize, header, zebra, padding, lineWidth, borderColor,
  *                        headerFill, zebraFill, spaceBefore, spaceAfter}
  * @returns {object} this report
@@ -430,6 +462,33 @@ Report.prototype.flowchart = function (chart) {
     nodeHeight: chart.nodeHeight === undefined ? 26 : chart.nodeHeight,
     spaceBefore: chart.spaceBefore === undefined ? 8 : chart.spaceBefore,
     spaceAfter: chart.spaceAfter === undefined ? 10 : chart.spaceAfter
+  });
+  return this;
+};
+
+/**
+ * A diagram: a scene from the {@code diagram} module, drawn as vector graphics.
+ * <p>
+ * The scene is not re-laid out here - it carries points already. pdftext measures its text with the
+ * report's font, places the block (page break when it does not fit, horizontally centred) and turns
+ * every item into the same ops the other elements use. {@code diagram.parse(...)} and
+ * {@code diagram.layout(...)} build the scene (docs/js/diagram-plan.md §5, §11.3).
+ * </p>
+ * @param {object} scene the scene ({kind:'scene', width, height, items})
+ * @param {object} [options] {spaceBefore, spaceAfter}
+ * @returns {object} this report
+ */
+Report.prototype.diagram = function (scene, options) {
+  if (!scene || scene.kind !== 'scene' || !Array.isArray(scene.items)) {
+    throw new Error('pdftext: diagram(scene) needs a scene from diagram.layout()'
+      + " ({kind:'scene', width, height, items:[…]})");
+  }
+  var opts = options || {};
+  this.blocks.push({
+    kind: 'diagram',
+    scene: scene,
+    spaceBefore: opts.spaceBefore === undefined ? 8 : opts.spaceBefore,
+    spaceAfter: opts.spaceAfter === undefined ? 10 : opts.spaceAfter
   });
   return this;
 };
@@ -557,7 +616,14 @@ function collect(report) {
     } else if (block.kind === 'table') {
       for (var c = 0; c < block.cols.length; c++) {
         if (block.cols[c].title) {
+          // The whole title for the natural width of an auto column, and its words for the header
+          // wrap - a title of two words is wrapped like a cell and needs both in the cache.
           want(report, String(block.cols[c].title), block.font, block.fontSize);
+          var titleWords = splitWords(block.cols[c].title);
+          for (var tw = 0; tw < titleWords.length; tw++) {
+            want(report, titleWords[tw], block.font, block.fontSize);
+          }
+          want(report, ' ', block.font, block.fontSize);
         }
       }
       for (var r = 0; r < block.rows.length; r++) {
@@ -572,6 +638,11 @@ function collect(report) {
     } else if (block.kind === 'flowchart') {
       for (var n = 0; n < block.nodes.length; n++) {
         want(report, block.nodes[n].label, report.font, block.size);
+      }
+    } else if (block.kind === 'diagram') {
+      var diagramTexts = diagramPdf.measureTexts(block.scene);
+      for (var dt = 0; dt < diagramTexts.length; dt++) {
+        want(report, diagramTexts[dt].text, report.font, diagramTexts[dt].size);
       }
     }
   }
@@ -724,6 +795,8 @@ function layout(report) {
       placeTable(report, state, block);
     } else if (block.kind === 'flowchart') {
       placeFlowchart(report, state, block);
+    } else if (block.kind === 'diagram') {
+      placeDiagram(report, state, block);
     }
   }
   return {pageCount: pages.length, notes: state.notes, dropped: state.dropped, state: state};
@@ -872,6 +945,26 @@ function noteOnce(state, note) {
 }
 
 /**
+ * Adds a dropped entry once.
+ * <p>
+ * A repeated header of a table that runs over several pages is the same finding on every page, and
+ * so is a column whose width was clamped once - the entry carries the place (column, row, word), so
+ * an entry that is identical is the same fact and not a second one.
+ * </p>
+ * @param {object} state the layout state
+ * @param {string} message the entry
+ */
+function dropOnce(state, message) {
+  if (!state.droppedSeen) {
+    state.droppedSeen = {};
+  }
+  if (!state.droppedSeen[message]) {
+    state.droppedSeen[message] = true;
+    state.dropped.push(message);
+  }
+}
+
+/**
  * Places a table: header, rows, borders, page breaks with a repeated header.
  * @param {object} report the report
  * @param {object} state the layout state
@@ -879,7 +972,7 @@ function noteOnce(state, note) {
  */
 function placeTable(report, state, block) {
   var available = pageWidth(report);
-  var widths = columnWidths(report, block, available);
+  var widths = columnWidths(report, state, block, available);
   var leading = Math.round(block.fontSize * 1.25 * 100) / 100;
   var pad = block.padding;
   state.y += block.spaceBefore || 0;
@@ -898,7 +991,7 @@ function placeTable(report, state, block) {
     fit(report, state, headerHeight, false);
     top = state.y;
     drawRow(report, state, block, header, widths, top, headerHeight, leading, pad, true, false,
-      true);
+      true, 0);
     state.y += headerHeight;
   }
   for (var r = 0; r < block.rows.length; r++) {
@@ -919,13 +1012,13 @@ function placeTable(report, state, block) {
       if (block.header) {
         top = state.y;
         drawRow(report, state, block, header, widths, top, headerHeight, leading, pad, true,
-          false, true);
+          false, true, 0);
         state.y += headerHeight;
       }
     }
     top = state.y;
     drawRow(report, state, block, cells, widths, top, height, leading, pad, false,
-      block.zebra && r % 2 === 1, firstOnPage);
+      block.zebra && r % 2 === 1, firstOnPage, r + 1);
     state.y += height;
   }
   state.y += block.spaceAfter || 0;
@@ -948,26 +1041,50 @@ function rowHeight(cells, leading, pad) {
 
 /**
  * Computes the column widths: explicit ones first, the rest by content.
+ * <p>
+ * An explicit width carries its unit in its form (a number of points, or a string {@code 'NN%'}).
+ * What cannot be laid out is not kept silently:
+ * </p>
+ * <ul>
+ *   <li>a width that is no positive, finite number (a {@code NaN} would travel into every
+ *       coordinate of the page and abort the write - {@code '120pt'}, {@code ''}, {@code -40})
+ *       makes the column a content-based one, and the note says which value was read;</li>
+ *   <li>a column narrower than its padding plus a character has no room for text (the cell text
+ *       would stand beyond the border, the next column's text on top of it) and is raised to the
+ *       narrowest usable width;</li>
+ *   <li>columns that together need more than the text area run over the right margin.</li>
+ * </ul>
+ * <p>
+ * All three are notes, not exceptions: a table with one odd width is still a report one wants on
+ * paper, and the caller cannot catch an exception it never sees.
+ * </p>
  * @param {object} report the report
+ * @param {object} state the layout state (the notes land there)
  * @param {object} block the table block
  * @param {number} available the usable width
  * @returns {Array<number>} the widths in points
  */
-function columnWidths(report, block, available) {
+function columnWidths(report, state, block, available) {
   var widths = new Array(block.cols.length);
   var auto = [];
   var used = 0;
   for (var i = 0; i < block.cols.length; i++) {
     var spec = block.cols[i].width;
-    if (spec === undefined || spec === null || spec === 'auto') {
+    if (spec === undefined || spec === null
+        || (typeof spec === 'string' && spec.trim() === 'auto')) {
       auto.push(i);
-    } else if (typeof spec === 'string' && spec.charAt(spec.length - 1) === '%') {
-      widths[i] = available * parseFloat(spec) / 100;
-      used += widths[i];
-    } else {
-      widths[i] = Number(spec);
-      used += widths[i];
+      continue;
     }
+    var width = resolveColumnWidth(spec, available);
+    if (!isFinite(width) || width <= 0) {
+      noteOnce(state, 'table column ' + (i + 1) + ': width ' + JSON.stringify(spec) + ' is not a'
+        + ' positive number of points (it resolves to ' + width + ')' + widthHint(spec)
+        + ' - the column is laid out by its content, like \'auto\'');
+      auto.push(i);
+      continue;
+    }
+    widths[i] = width;
+    used += width;
   }
   if (auto.length) {
     var natural = new Array(auto.length);
@@ -981,7 +1098,70 @@ function columnWidths(report, block, available) {
       widths[auto[b]] = total > 0 ? rest * natural[b] / total : rest / auto.length;
     }
   }
+  var minimum = minimumColumnWidth(block.padding);
+  for (var c = 0; c < widths.length; c++) {
+    if (widths[c] < minimum) {
+      noteOnce(state, 'table column ' + (c + 1) + ': width ' + ptText(widths[c]) + ' leaves no room'
+        + ' for text (' + block.padding + ' pt padding on each side)' + widthHint(block.cols[c].width)
+        + ' - raised to ' + ptText(minimum));
+      widths[c] = minimum;
+    }
+  }
+  if (sum(widths) > available + 0.5) {
+    noteOnce(state, 'the columns of a table need ' + ptText(sum(widths)) + ', but the text area is'
+      + ' only ' + ptText(available) + ' wide - the table runs over the right margin');
+  }
   return widths;
+}
+
+/**
+ * Turns one width spec into points, without judging whether the value makes sense.
+ * @param {number|string} spec the width as the caller wrote it ({@code 120} or {@code '22%'})
+ * @param {number} available the usable width
+ * @returns {number} the width in points, or NaN when the spec is no number
+ */
+function resolveColumnWidth(spec, available) {
+  if (typeof spec === 'string') {
+    var text = spec.trim();
+    if (text.charAt(text.length - 1) === '%') {
+      return available * parseFloat(text) / 100;
+    }
+    return Number(text);
+  }
+  return Number(spec);
+}
+
+/**
+ * The narrowest column that still holds text: the padding on both sides and a character or two.
+ * @param {number} pad the cell padding
+ * @returns {number} the width in points
+ */
+function minimumColumnWidth(pad) {
+  return 2 * pad + 12;
+}
+
+/**
+ * A width for a message: two decimals and the unit.
+ * @param {number} value the width in points
+ * @returns {string} the width as text
+ */
+function ptText(value) {
+  return (Math.round(value * 100) / 100) + ' pt';
+}
+
+/**
+ * A hint for the mistake behind a width below 1: a share written as a fraction.
+ * @param {number|string} spec the width as the caller wrote it
+ * @returns {string} the hint, or an empty string when the value does not look like a fraction
+ */
+function widthHint(spec) {
+  var value = typeof spec === 'number' ? spec : (typeof spec === 'string' ? parseFloat(spec) : NaN);
+  if (!(value > 0) || value >= 1) {
+    return '';
+  }
+  var percent = Math.round(value * 1000) / 10;
+  return ' (a share written as a fraction? a number is points: ' + JSON.stringify(spec) + ' is '
+    + ptText(value) + ', ' + percent + ' % is \'' + percent + '%\')';
 }
 
 /**
@@ -1006,6 +1186,12 @@ function naturalWidth(report, block, index) {
 
 /**
  * Draws one row of a table: background, borders, text.
+ * <p>
+ * A word wider than its cell is neither clipped nor broken: it runs over, and the row reports it in
+ * {@code dropped} - the same contract a paragraph has, in the same form (how far, in pt, and the
+ * word). A table cell is where a silently cut number shows up only on paper, so the report is not
+ * optional here.
+ * </p>
  * @param {object} report the report
  * @param {object} state the layout state
  * @param {object} block the table block
@@ -1017,9 +1203,11 @@ function naturalWidth(report, block, index) {
  * @param {number} pad the cell padding
  * @param {boolean} isHeader whether this is the header row
  * @param {boolean} shaded whether a zebra fill goes behind the row
+ * @param {boolean} withTop whether the top border of the row is drawn
+ * @param {number} row the row number for a report (0 for the header row)
  */
 function drawRow(report, state, block, cells, widths, top, height, leading, pad, isHeader,
-                 shaded, withTop) {
+                 shaded, withTop, row) {
   var left = report.margin.left;
   var x = left;
   var fill = isHeader ? block.headerFill : shaded ? block.zebraFill : null;
@@ -1030,9 +1218,20 @@ function drawRow(report, state, block, cells, widths, top, height, leading, pad,
   for (var c = 0; c < widths.length; c++) {
     var cell = cells[c] || [];
     var align = block.cols[c].align || 'left';
+    var inner = widths[c] - 2 * pad;
+    var reported = false;
     for (var l = 0; l < cell.length; l++) {
       if (!cell[l].words.length) {
         continue;
+      }
+      // One entry per cell: the first line that runs over is the finding, the rest of the cell is
+      // the same too-narrow column.
+      if (!reported && cell[l].width > inner + 0.5) {
+        reported = true;
+        dropOnce(state, 'a word runs over its column by '
+          + Math.round((cell[l].width - inner) * 10) / 10 + ' pt in table column ' + (c + 1)
+          + ' (' + (isHeader ? 'header' : 'row ' + row) + '): '
+          + JSON.stringify(cell[l].words[0]));
       }
       var text = cell[l].words.join(' ');
       var offset = align === 'right' ? widths[c] - 2 * pad - cell[l].width
@@ -1066,6 +1265,41 @@ function sum(values) {
     total += values[i];
   }
   return total;
+}
+
+/**
+ * Places a diagram scene: page break if needed, horizontally centred, then the ops of
+ * {@code diagram/pdf.js} in drawing order.
+ * @param {object} report the report
+ * @param {object} state the layout state
+ * @param {object} block the diagram block
+ */
+function placeDiagram(report, state, block) {
+  var box = diagramPdf.bounds(block.scene);
+  state.y += block.spaceBefore;
+  fit(report, state, box.height + block.spaceAfter, true);
+  var usable = pageWidth(report);
+  var offsetX = report.margin.left - box.originX;
+  if (box.width < usable) {
+    offsetX += (usable - box.width) / 2;
+  } else if (box.width > usable + 0.5) {
+    noteOnce(state, 'a diagram is ' + Math.round((box.width - usable) * 10) / 10
+      + ' pt wider than the text area - it runs over the right margin');
+  }
+  var offsetY = state.y - box.originY;
+  var ops = diagramPdf.ops(block.scene, {
+    offsetX: offsetX,
+    offsetY: offsetY,
+    font: report.font,
+    color: report.color,
+    widthOf: function (text, size) {
+      return widthOf(report, text, report.font, size);
+    }
+  });
+  for (var i = 0; i < ops.length; i++) {
+    place(state, ops[i]);
+  }
+  state.y += box.height + block.spaceAfter;
 }
 
 /**
@@ -1399,6 +1633,89 @@ Report.prototype.save = function (path, options) {
   };
 };
 
+/**
+ * The help text: what the library is, the calls, the unit of a column width, and what a run reports
+ * in {@code notes} and {@code dropped}.
+ * <p>
+ * This is the external description of the module - the text a caller reads before writing the first
+ * line. {@code docs/js/pdftext.md} is the maintenance note next to the code, not the manual.
+ * </p>
+ * @returns {string} the help text
+ */
+function help() {
+  return [
+    'pdftext - a small typesetter on pdfedit: pages, headings, justified paragraphs, lists,',
+    'tables and flowcharts, written as pdfedit ops.',
+    '',
+    '  var pdftext = loadShipped(\'pdftext\');',
+    '  var doc = pdftext.report({page:\'A4\', margin:57, font:\'Helvetica\', size:10,',
+    '                            title:\'Pruefbericht 2026-220\',',
+    '                            header:\'Pruefbericht 2026-220 · Anlage 3\',',
+    '                            footer:\'Seite {page} von {pages}\'});',
+    '  doc.heading(\'Pruefbericht 2026-220\');',
+    '  doc.paragraph(\'Der Antrag ist vollstaendig eingegangen ...\', {align:\'justify\'});',
+    '  doc.table({cols:[{title:\'Nr.\', width:30},',
+    '                    {title:\'Leistung\'},',
+    '                    {title:\'Betrag\', width:\'22%\', align:\'right\'}],',
+    '             rows:[[\'1\', \'Aufstellung der Anlage 3\', \'1.240,00\']]});',
+    '  var result = doc.save(\'target/report.pdf\');',
+    '  // {file, bytes, pages, ops, backend, notes[], dropped[], verify}',
+    '',
+    'The library measures (one pdfedit call per font and size) and writes nothing but pdfedit ops:',
+    'page.add, text.put, draw.rect, draw.line, content.append. doc.ops() is the same run without',
+    'writing a file - useful to look at result.notes and result.dropped before writing anything.',
+    '',
+    'Elements (every call returns the report, so calls chain)',
+    '  heading(text, {level, size, spaceBefore, spaceAfter, align, color})',
+    '  paragraph(text, {align, size, font, leading, spaceBefore, spaceAfter, color, indent})',
+    '  list(items, {type:\'bullet\'|\'number\', indent, size, font, align, spaceAfter})',
+    '  table({cols, rows, header, fontSize, zebra, padding, lineWidth, borderColor, headerFill,',
+    '         zebraFill, spaceBefore, spaceAfter})',
+    '  flowchart({nodes:[{id,label}], edges:[[from,to]], size, gap, rankGap, nodeHeight})',
+    '  diagram(scene, {spaceBefore, spaceAfter})   // a scene from the diagram module, drawn vector',
+    '  rule({color, lineWidth, spaceBefore, spaceAfter})',
+    '  spacer(pt), pageBreak(), header(text), footer(text)   // {page} and {pages} are replaced',
+    '',
+    'Column widths (cols[i].width) - the unit is the form of the value',
+    '  30       a number is POINTS and includes the padding: with padding 4 pt on each side a',
+    '           30 pt column holds 22 pt of text',
+    '  \'22%\'    a string \'NN%\' is a share of the text area (481.28 pt on A4 with 57 pt margins)',
+    '  \'auto\'   or no width at all: the column gets its share of what the explicit ones leave,',
+    '           distributed by its content',
+    '  There is no fraction shorthand and no unit suffix: width 0.28 is 0.28 points (not 28 %),',
+    '  \'120pt\' is no number. Such a column cannot hold text; the run raises it to the narrowest',
+    '  usable width and says so in result.notes - it neither throws nor stays silent.',
+    '',
+    'What a run reports',
+    '  result.notes[]    what the run had to decide: an implausible column width (with the column',
+    '                    number and the value as it was read), columns that together leave the text',
+    '                    area, justified text set word by word because the server cannot put word',
+    '                    spacing into an embedded font, the older measuring backend',
+    '  result.dropped[]  what does not fit and was therefore not fixed: a word wider than its',
+    '                    column - in a paragraph AND in a table cell (how far in pt, the word,',
+    '                    column and row) - and a header wider than the text area. A word is never',
+    '                    broken, so a dropped entry is a layout decision still to make: a wider',
+    '                    column, a shorter text, a smaller size.',
+    '  Both are plain strings. Read them: they are the only thing between you and a page that looks',
+    '  fine in the op list and wrong on paper.',
+    '',
+    'Limits',
+    '  no hyphenation, no font fallback, no bidi. A table row is not split across pages (a row',
+    '  taller than a page is an error, not a silent cut). No preformatted/code block: paragraph()',
+    '  collapses whitespace (a line break in the text forces a new line, nothing else), so code is',
+    '  set line by line - one paragraph per line, font \'Courier\' (a standard font, nothing is',
+    '  embedded) and the indent computed from the leading spaces - Courier advances exactly 0.6 em,',
+    '  so four spaces at 9 pt are 4 × 0.6 × 9 = 21.6 pt of indent:',
+    '    doc.paragraph(\'<a>\', {font:\'Courier\', size:9, indent:21.6});',
+    '',
+    'Measuring: pdftext.backend() says which backend this server has (\'op\' = the text.measure op,',
+    'exact for a standard font and for an embedded file; \'placement\' = the older round trip,',
+    'embedded TrueType only), result.backend says which one ran, and',
+    'pdftext.measure(font, size, [\'a\',\'b\']) answers widths directly. pdftext.defaults() reads or',
+    'changes {page, margin, font, size, color} for every following report of the run.'
+  ].join('\n');
+}
+
 module.exports = {
   report: report,
   PAGES: PAGES,
@@ -1407,5 +1724,7 @@ module.exports = {
   /** Which measuring backend this server has ('op' or 'placement'). */
   backend: measuringBackend,
   /** Measures strings directly - the same numbers the report uses. */
-  measure: measureTexts
+  measure: measureTexts,
+  /** The help text of the module: the calls, the column width units, notes and dropped. */
+  help: help
 };

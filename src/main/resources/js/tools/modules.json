@@ -1,6 +1,46 @@
 {
   "pdftext": {
     "file": "lib/pdftext.js",
-    "summary": "`loadShipped('pdftext')` is a small typesetter on pdfedit (headings, justified paragraphs, tables, flowcharts) - docs/js/pdftext.md"
+    "summary": "`loadShipped('pdftext')` is a small typesetter on pdfedit (headings, justified paragraphs, tables, flowcharts) - `help()` explains the calls, the unit of a column width (a number is points, 'NN%' is a share of the text area) and what a run reports in `notes`/`dropped`"
+  },
+  "diagram": {
+    "file": "lib/diagram.js",
+    "summary": "`loadShipped('diagram')` parses a Mermaid/DOT subset into a JSON model, lays it out itself (no runtime dependency; measured text is injected) and draws it as SVG - `help()` lists the subset, the `%%`-directives (pin/rank/port/weight/route/curve/layout), the two placement strategies (`layout: 'layered' | 'force'`) and the limits"
+  },
+  "diagram-model": {
+    "file": "lib/diagram/model.js",
+    "summary": "internal building block of `diagram`: the IR (nodes/edges/groups), its validation and the limits (loaded by `diagram.js` via `require`)"
+  },
+  "diagram-scene": {
+    "file": "lib/diagram/scene.js",
+    "summary": "internal building block of `diagram`: the scene format (rect/ellipse/polygon/path/text/group), its bounds/normalize/orient helpers and the curve segments (rounded corners, Catmull-Rom spline) both backends draw"
+  },
+  "diagram-parse-dot": {
+    "file": "lib/diagram/parse-dot.js",
+    "summary": "internal building block of `diagram`: the DOT frontend (rankdir, subgraph, constraint, weight, ports) into the IR"
+  },
+  "diagram-parse-mermaid": {
+    "file": "lib/diagram/parse-mermaid.js",
+    "summary": "internal building block of `diagram`: the declared Mermaid flowchart subset frontend (shapes, edges, subgraph, `%%`-directives) into the IR"
+  },
+  "diagram-parse-state": {
+    "file": "lib/diagram/parse-state.js",
+    "summary": "internal building block of `diagram`: the Mermaid state-diagram subset frontend (`[*]` pseudo states, transitions, composite states as groups) into the IR"
+  },
+  "diagram-layout": {
+    "file": "lib/diagram/layout.js",
+    "summary": "internal building block of `diagram`: the layout phases p0measure..p5route (cycles, ranks, order, place, orthogonal routing) producing a scene"
+  },
+  "diagram-force": {
+    "file": "lib/diagram/force.js",
+    "summary": "internal building block of `diagram`: the force-directed placement (spring embedder with rectangle repulsion, box separation, flow-direction term and a seeded multi-start) behind the `layout: 'force'` option"
+  },
+  "diagram-svg": {
+    "file": "lib/diagram/svg.js",
+    "summary": "internal building block of `diagram`: the SVG backend that renders a scene to a self-contained SVG string"
+  },
+  "diagram-pdf": {
+    "file": "lib/diagram/pdf.js",
+    "summary": "internal building block of `diagram` and `pdftext`: the PDF backend that turns a scene into pdfedit ops (draw.rect/draw.line/text.put/content.append)"
   }
 }
