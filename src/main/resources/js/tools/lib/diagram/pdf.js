@@ -5,8 +5,10 @@
  * ops {@code pdftext} already uses ({@code draw.rect}, {@code draw.line}, {@code text.put},
  * {@code content.append}), so the same diagram that is an SVG comes out of the same scene as a PDF.
  * The unit of the scene is a point and its origin is top-left, exactly what {@code space:'page'}
- * (and the mirrored CTM of {@code content.append}) already expect, so no axis has to be flipped
- * here - {@code pdftext} places the block and hands the page offsets in.
+ * expects, so no axis has to be flipped for the ops that carry a space. A {@code content.append}
+ * stream does not: it lives in user space (y up), so those paths are mirrored with the page height
+ * from {@code ctx.pageHeight} (see {@link contentOp}). {@code pdftext} places the block and hands the
+ * page offsets in.
  *
  *     var ops = require('./diagram/pdf.js').ops(scene, {
  *       offsetX: 57, offsetY: 120,
@@ -28,7 +30,7 @@ var KAPPA = 0.5522847498;
 /**
  * Translates a scene into pdfedit ops (the {@code page} member is filled in by the caller).
  * @param {object} scene the scene
- * @param {object} ctx {offsetX, offsetY, widthOf, font, color}
+ * @param {object} ctx {offsetX, offsetY, pageHeight, widthOf, font, color}
  * @returns {Array<object>} the ops, in drawing order
  */
 function ops(scene, ctx) {
@@ -38,20 +40,108 @@ function ops(scene, ctx) {
   var font = context.font || 'Helvetica';
   var defaultColor = context.color || '#111111';
   var widthOf = typeof context.widthOf === 'function' ? context.widthOf : estimateWidth;
+  // The page height is what turns the scene's page space (y down) into the user space (y up) a
+  // content.append stream lives in - see contentOp.
+  var pageHeight = numberOr(context.pageHeight, 0);
   var out = [];
   var items = scene.items || [];
   for (var i = 0; i < items.length; i++) {
-    emitItem(items[i], offsetX, offsetY, font, defaultColor, widthOf, out);
+    emitItem(items[i], offsetX, offsetY, font, defaultColor, widthOf, out, pageHeight);
   }
   return out;
+}
+
+ /**
+ * A copy of a scene with every coordinate and every size multiplied by {@code factor}.
+ * <p>
+ * The PDF backend emits absolute coordinates, so a diagram that is larger than the text area has to
+ * be scaled before it is placed - a page break alone cannot help, the ops would run off the page. The
+ * scene itself is not touched (a caller may draw the same scene twice).
+ * </p>
+ * @param {object} scene the scene
+ * @param {number} factor the factor (&gt; 0)
+ * @returns {object} the scaled copy
+ */
+function scaled(scene, factor) {
+  var f = numberOr(factor, 1);
+  var copy = {
+    kind: scene.kind,
+    width: scene.width * f,
+    height: scene.height * f,
+    originX: (scene.originX || 0) * f,
+    originY: (scene.originY || 0) * f,
+    items: []
+  };
+  for (var i = 0; i < (scene.items || []).length; i++) {
+    copy.items.push(scaleItem(scene.items[i], f));
+  }
+  if (scene.phases) {
+    copy.phases = scene.phases;
+  }
+  return copy;
+}
+
+/**
+ * One item, scaled.
+ * @param {object} item the item
+ * @param {number} f the factor
+ * @returns {object} the scaled copy
+ */
+function scaleItem(item, f) {
+  var copy = {};
+  for (var key in item) {
+    if (Object.prototype.hasOwnProperty.call(item, key)) {
+      copy[key] = item[key];
+    }
+  }
+  function num(value) {
+    return typeof value === 'number' ? value * f : value;
+  }
+  if (typeof copy.x === 'number') {
+    copy.x = num(copy.x);
+  }
+  if (typeof copy.y === 'number') {
+    copy.y = num(copy.y);
+  }
+  if (typeof copy.w === 'number') {
+    copy.w = num(copy.w);
+  }
+  if (typeof copy.h === 'number') {
+    copy.h = num(copy.h);
+  }
+  if (typeof copy.rx === 'number') {
+    copy.rx = num(copy.rx);
+  }
+  if (typeof copy.cx === 'number') {
+    copy.cx = num(copy.cx);
+  }
+  if (typeof copy.cy === 'number') {
+    copy.cy = num(copy.cy);
+  }
+  if (typeof copy.size === 'number') {
+    copy.size = num(copy.size);
+  }
+  if (typeof copy.lineWidth === 'number') {
+    copy.lineWidth = num(copy.lineWidth);
+  }
+  if (Array.isArray(copy.dash)) {
+    copy.dash = copy.dash.map(function (d) {
+      return typeof d === 'number' ? d * f : d;
+    });
+  }
+  if (Array.isArray(copy.points)) {
+    copy.points = copy.points.map(function (point) {
+      return [point[0] * f, point[1] * f];
+    });
+  }
+  return copy;
 }
 
 /**
  * The texts a scene draws, so a caller can measure them before laying out.
  * @param {object} scene the scene
  * @returns {Array<object>} {text, size} per text (and group label)
- */
-function measureTexts(scene) {
+ */function measureTexts(scene) {
   var out = [];
   var seen = {};
   var items = scene.items || [];
@@ -108,17 +198,17 @@ function bounds(scene) {
  * @param {Function} widthOf the width source
  * @param {Array<object>} out the op list
  */
-function emitItem(item, dx, dy, font, defaultColor, widthOf, out) {
+function emitItem(item, dx, dy, font, defaultColor, widthOf, out, pageHeight) {
   if (item.kind === 'rect') {
-    emitRect(item, dx, dy, out);
+    emitRect(item, dx, dy, out, pageHeight);
   } else if (item.kind === 'ellipse') {
-    emitEllipse(item, dx, dy, out);
+    emitEllipse(item, dx, dy, out, pageHeight);
   } else if (item.kind === 'polygon') {
-    emitPolygon(item, dx, dy, out);
+    emitPolygon(item, dx, dy, out, pageHeight);
   } else if (item.kind === 'path') {
-    emitPath(item, dx, dy, out);
+    emitPath(item, dx, dy, out, pageHeight);
   } else if (item.kind === 'group') {
-    emitGroup(item, dx, dy, font, widthOf, out);
+    emitGroup(item, dx, dy, font, widthOf, out, pageHeight);
   } else if (item.kind === 'text') {
     emitText(item, dx, dy, font, defaultColor, widthOf, out);
   }
@@ -130,15 +220,16 @@ function emitItem(item, dx, dy, font, defaultColor, widthOf, out) {
  * @param {number} dx the offset x
  * @param {number} dy the offset y
  * @param {Array<object>} out the op list
+ * @param {number} [pageHeight] the page height (for a path, see {@link contentOp})
  */
-function emitRect(item, dx, dy, out) {
+function emitRect(item, dx, dy, out, pageHeight) {
   var x = item.x + dx;
   var y = item.y + dy;
   var rx = item.rx || 0;
   if (rx > 0) {
     var radius = Math.min(rx, Math.min(item.w, item.h) / 2);
     var path = roundedRect(x, y, item.w, item.h, radius);
-    out.push(contentOp(path, item.fill, item.stroke, item.lineWidth, item.dash));
+    out.push(contentOp(path, item.fill, item.stroke, item.lineWidth, item.dash, pageHeight));
     return;
   }
   out.push({
@@ -161,7 +252,7 @@ function emitRect(item, dx, dy, out) {
  * @param {number} dy the offset y
  * @param {Array<object>} out the op list
  */
-function emitEllipse(item, dx, dy, out) {
+function emitEllipse(item, dx, dy, out, pageHeight) {
   var cx = item.cx + dx;
   var cy = item.cy + dy;
   var rx = item.rx;
@@ -176,7 +267,7 @@ function emitEllipse(item, dx, dy, out) {
     curve(cx + kx, cy - ry, cx + rx, cy - ky, cx + rx, cy),
     'h'
   ].join(' ');
-  out.push(contentOp(path, item.fill, item.stroke, item.lineWidth, item.dash));
+  out.push(contentOp(path, item.fill, item.stroke, item.lineWidth, item.dash, pageHeight));
 }
 
 /**
@@ -186,7 +277,7 @@ function emitEllipse(item, dx, dy, out) {
  * @param {number} dy the offset y
  * @param {Array<object>} out the op list
  */
-function emitPolygon(item, dx, dy, out) {
+function emitPolygon(item, dx, dy, out, pageHeight) {
   if (!item.points || item.points.length < 2) {
     return;
   }
@@ -195,7 +286,8 @@ function emitPolygon(item, dx, dy, out) {
     parts.push(lineTo(item.points[i][0] + dx, item.points[i][1] + dy));
   }
   parts.push('h');
-  out.push(contentOp(parts.join(' '), item.fill, item.stroke, item.lineWidth, item.dash));
+  out.push(contentOp(parts.join(' '), item.fill, item.stroke, item.lineWidth, item.dash,
+    pageHeight));
 }
 
 /**
@@ -213,10 +305,10 @@ function emitPolygon(item, dx, dy, out) {
  * @param {number} dy the offset y
  * @param {Array<object>} out the op list
  */
-function emitPath(item, dx, dy, out) {
+function emitPath(item, dx, dy, out, pageHeight) {
   var points = item.points || [];
   if (item.curve && points.length > 2) {
-    emitCurvedPath(item, dx, dy, out);
+    emitCurvedPath(item, dx, dy, out, pageHeight);
     return;
   }
   for (var i = 1; i < points.length; i++) {
@@ -241,7 +333,7 @@ function emitPath(item, dx, dy, out) {
  * @param {number} dy the offset y
  * @param {Array<object>} out the op list
  */
-function emitCurvedPath(item, dx, dy, out) {
+function emitCurvedPath(item, dx, dy, out, pageHeight) {
   var points = item.points;
   var parts = [move(points[0][0] + dx, points[0][1] + dy)];
   var segments = sceneLib.curveSegments(points, item.curve);
@@ -255,7 +347,7 @@ function emitCurvedPath(item, dx, dy, out) {
     }
   }
   out.push(contentOp(parts.join(' '), null, item.stroke || '#333333',
-    item.lineWidth === undefined ? 1 : item.lineWidth, item.dash));
+    item.lineWidth === undefined ? 1 : item.lineWidth, item.dash, pageHeight));
 }
 
 /**
@@ -267,9 +359,9 @@ function emitCurvedPath(item, dx, dy, out) {
  * @param {Function} widthOf the width source (unused for a start-anchored title)
  * @param {Array<object>} out the op list
  */
-function emitGroup(item, dx, dy, font, widthOf, out) {
+function emitGroup(item, dx, dy, font, widthOf, out, pageHeight) {
   var path = roundedRect(item.x + dx, item.y + dy, item.w, item.h, Math.min(4, item.h / 2));
-  out.push(contentOp(path, '#f6f7f9', '#b9bec7', 1, [4, 3]));
+  out.push(contentOp(path, '#f6f7f9', '#b9bec7', 1, [4, 3], pageHeight));
   var size = item.size || 9;
   out.push({
     op: 'text.put',
@@ -321,15 +413,36 @@ function emitText(item, dx, dy, font, defaultColor, widthOf, out) {
 
 /**
  * A content.append op that draws a path with fill and/or stroke, isolated by q/Q.
- * @param {string} path the path operators
+ * <p>
+ * The path is built in <b>page space</b> (origin top left, y downwards) like every other item of the
+ * scene. {@code content.append} writes its text unchanged into a new stream of the page, and such a
+ * stream lives in <b>default user space</b> (origin bottom left, y upwards) - unlike
+ * {@code draw.rect}/{@code draw.line}/{@code text.put}, which carry {@code space:'page'} and are
+ * converted. Without the mirroring {@code cm} below every path would be drawn upside down, i.e. a
+ * diamond at page y=265 would appear at y = pageHeight - 265: the labels stay where they belong and
+ * the shapes they belong to move away from them.
+ * </p>
+ * @param {string} path the path operators (page space)
  * @param {string|null} fill the fill colour
  * @param {string|null} stroke the stroke colour
  * @param {number} lineWidth the stroke width
  * @param {Array<number>|null} dash the dash pattern
+ * @param {number} [pageHeight] the page height; when given, the path is mirrored into user space
  * @returns {object} the op
  */
-function contentOp(path, fill, stroke, lineWidth, dash) {
-  var parts = ['q'];
+function contentOp(path, fill, stroke, lineWidth, dash, pageHeight) {
+  var mirrored = typeof pageHeight === 'number' && pageHeight > 0;
+  // pdftext pushes one `q` per op, and every op restores it with a leading `Q` (that is how
+  // pdfedit's own ops are written: "Q <cm> geometry"). A stream that only wrapped itself in q/Q left
+  // that pending state alone and so composed its `cm` with whatever the op before had left behind -
+  // two mirrors make the identity, and the path lands mirrored. `Q q` normalises: the leading `Q`
+  // takes the base state, and the trailing `Q q` gives it back, so neither the ambient nor the depth
+  // changes for the next op.
+  var parts = mirrored ? ['Q', 'q'] : ['q'];
+  if (mirrored) {
+    // 1 0 0 -1 0 H maps page space (y down) onto user space (y up) with the page's own height.
+    parts.push('1 0 0 -1 0 ' + pageHeight + ' cm');
+  }
   var fillRgb = rgb(fill);
   var strokeRgb = rgb(stroke);
   if (fillRgb) {
@@ -351,7 +464,11 @@ function contentOp(path, fill, stroke, lineWidth, dash) {
   } else if (strokeRgb) {
     parts.push('S');
   }
-  parts.push('Q');
+  if (mirrored) {
+    parts.push('Q', 'q');
+  } else {
+    parts.push('Q');
+  }
   return {op: 'content.append', text: parts.join(' ')};
 }
 
@@ -519,6 +636,7 @@ function round(value) {
 
 module.exports = {
   ops: ops,
+  scaled: scaled,
   measureTexts: measureTexts,
   bounds: bounds
 };
