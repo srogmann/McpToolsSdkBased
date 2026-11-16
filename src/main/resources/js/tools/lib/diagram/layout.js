@@ -59,6 +59,13 @@ var RANK_GAP = 26;
 /** The length of the orthogonal stub a forced port gets before the line turns. */
 var PORT_STUB = 7;
 
+/**
+ * The stub a {@code route: 'smooth'} line keeps along the side's normal. Longer than the orthogonal
+ * stub, because it decides the tangent of the curve: 18 pt is about the "leaves the box straight and
+ * then bends" look of the flowchart renderers, where 7 pt still reads as a kink.
+ */
+var SMOOTH_STUB = 18;
+
 /** How long edges get an extra arrowhead in the middle: 'off' (default) or 'long'. */
 var MID_ARROWS = ['off', 'long'];
 
@@ -98,6 +105,15 @@ var BACK_CHANNELS = ['edge', 'target'];
  * sideways jog per rank), {@code 'keep'} leaves them where the placement put them.
  */
 var JOG_MODES = ['remove', 'keep'];
+
+/**
+ * How a group is honoured in the placement: {@code 'flow'} places every node by the barycenter
+ * sweeps like an ungrouped graph and only draws the band around the members (short edges, the bands
+ * may touch - reported), {@code 'strips'} gives every top-level group its own vertical strip (bands
+ * never overlap, but a chain that runs through several groups is spread over the strips and its
+ * edges become long horizontal runs).
+ */
+var GROUP_MODES = ['flow', 'strips'];
 
 /**
  * Runs the layout.
@@ -207,6 +223,7 @@ function attachRecipe(graph) {
     curveTension: graph.curveTension,
     backChannels: graph.backChannels,
     jogs: graph.jogs,
+    groups: graph.groups,
     midArrows: graph.midArrows,
     midArrowAfter: graph.midArrowAfter,
     force: force,
@@ -263,6 +280,8 @@ function prepare(model, options, limits) {
     curveTension: sceneLib.CURVE_TENSION,
     backChannels: 'edge',
     jogs: 'remove',
+    groups: 'flow',
+    groupsGiven: false,
     midArrows: 'off',
     midArrowAfter: 200,
     /** Passed through to phases.recipe.origin - the caller's provenance (fixture, hashes). */
@@ -499,6 +518,15 @@ function applyOptions(graph, options) {
         + JOG_MODES.join(', ') + ')');
     }
     graph.jogs = jogs;
+  }
+  if (options.groups !== undefined) {
+    graph.groupsGiven = true;
+    var groups = String(options.groups);
+    if (GROUP_MODES.indexOf(groups) < 0) {
+      throw new Error("diagram/layout: unknown groups '" + options.groups + "' (allowed: "
+        + GROUP_MODES.join(', ') + ')');
+    }
+    graph.groups = groups;
   }
   var pins = options.pin || {};
   for (var id in pins) {
@@ -1791,9 +1819,15 @@ function intersectIntervals(first, second) {
  */
 function packAndSweep(graph, layers) {
   var r;
-  if (graph.model.groups.length && !hasPins(graph)) {
+  if (graph.model.groups.length && !hasPins(graph) && graph.groups !== 'flow') {
     placeClustered(graph, layers);
     return;
+  }
+  if (graph.model.groups.length && graph.groupsGiven && graph.groups === 'flow') {
+    graph.notes.push("layout: groups: 'flow' places every node by the barycenter sweeps and draws a"
+      + ' band around each group afterwards - the edges stay short, but a band may touch another'
+      + ' and the members of a group are not kept in one column (pass groups: \'strips\' for one'
+      + ' strip per group, the former default)');
   }
   for (r = 0; r < layers.length; r++) {
     var cursor = 0;
@@ -2463,8 +2497,9 @@ function noteOverlappingGroups(graph, order, boxes) {var byId = {};
       if (a.x < b.x + b.w - 0.5 && b.x < a.x + a.w - 0.5
           && a.y < b.y + b.h - 0.5 && b.y < a.y + a.h - 0.5) {
         graph.notes.push("layout: the subgraphs '" + order[i].label + "' and '" + order[j].label
-          + "' overlap - top-level groups get their own strip, but nested groups inside one"
-          + ' strip can still touch (docs/js/diagram-plan.md §13.3)');
+          + "' overlap - in groups: 'flow' a band follows the nodes, in 'strips' every top-level"
+          + ' group gets its own strip and only nested groups inside one strip can still touch'
+          + ' (docs/js/diagram-plan.md §13.3)');
       }
     }
   }
@@ -2586,16 +2621,21 @@ function emitEdges(graph, out, labels) {
     return;
   }
   var byGap = segmentsByGap(graph.segments, graph.layers.length);
-  var assignment = assignLanes(byGap, graph.layers, graph.route);
+  assignPorts(graph);
+  var assignment = assignLanes(byGap, graph.layers, graph.route, graph);
   graph.gapLanes = assignment.laneCounts;
   var lanes = assignment.lanes;
   if (graph.route === 'direct') {
     graph.notes.push("layout: route 'direct' draws straight lines between the node borders -"
       + ' a straight line may cross a node box, which is expected and not reported');
   }
+  if (graph.route === 'smooth') {
+    graph.notes.push("layout: route 'smooth' draws one stubbed curve per edge - side and back edges"
+      + ' keep the orthogonal channel (a curve around a box needs one),'
+      + " and 'curve: off' leaves the two stubs as a polyline");
+  }
   graph.routes = [];
   var backLanes = assignBackLanes(graph);
-  assignPorts(graph);
   for (var i = 0; i < graph.edges.length; i++) {
     var edge = graph.edges[i];
     var style = edgeStyle(edge);
@@ -2605,6 +2645,11 @@ function emitEdges(graph, out, labels) {
     }
     if (graph.route === 'direct') {
       routeDirect(graph, edge, style, out, labels);
+      continue;
+    }
+    if (graph.route === 'smooth' && !edge.side && !edge.back && edge.chain
+        && edge.chain.length === 2) {
+      routeSmooth(graph, edge, style, out, labels);
       continue;
     }
     if (edge.side || edge.back) {
@@ -3043,12 +3088,21 @@ function edgePath(graph, points, style) {
  * share a lane, so siblings split at one branch point. Two buses share a lane only when their x
  * ranges do not overlap, so unrelated families stay visibly apart.
  * </p>
+ * <p>
+ * The order of the lanes is the nesting rule of a one-layer channel router (docs/js/diagram-plan.md
+ * §7.1): where two runs overlap in x, the one whose vertical end would cut the other's horizontal run
+ * has to take the deeper lane. A fan of six edges out of one node is exactly the case where the
+ * naive order (by exit x) is useless - all six exits sit on the same node - and the target x alone
+ * points the wrong way for the half that turns right. The rule is applied pairwise and summed into a
+ * depth per segment, so the comparator stays a total order.
+ * </p>
  * @param {Array<Array<object>>} byGap the segments by gap
  * @param {Array<Array<object>>} layers the layers
  * @param {string} mode 'orthogonal' | 'tree' | 'direct'
+ * @param {object} graph the graph (the port positions come from it)
  * @returns {object} {lanes: lane by segment key, laneCounts: lanes per gap}
  */
-function assignLanes(byGap, layers, mode) {
+function assignLanes(byGap, layers, mode, graph) {
   var lanes = {};
   var laneCounts = [];
   for (var gap = 0; gap < byGap.length; gap++) {
@@ -3057,21 +3111,92 @@ function assignLanes(byGap, layers, mode) {
       laneCounts.push(assignBusLanes(list, lanes));
       continue;
     }
-    var top = positionsOf(layers[gap] || []);
-    var bottom = positionsOf(layers[gap + 1] || []);
-    list.sort(function (a, b) {
-      var dTop = (top[a.a.uid] || 0) - (top[b.a.uid] || 0);
-      if (dTop !== 0) {
-        return dTop;
-      }
-      return (bottom[a.b.uid] || 0) - (bottom[b.b.uid] || 0);
-    });
-    for (var i = 0; i < list.length; i++) {
-      lanes[segmentKey(list[i])] = i;
+    var runs = [];
+    for (var r = 0; r < list.length; r++) {
+      var ends = runEnds(list[r], graph);
+      runs.push({seg: list[r], x1: ends[0], x2: ends[1],
+        lo: Math.min(ends[0], ends[1]), hi: Math.max(ends[0], ends[1]), depth: 0});
     }
-    laneCounts.push(list.length);
+    for (var a = 0; a < runs.length; a++) {
+      for (var b = 0; b < runs.length; b++) {
+        if (a === b) {
+          continue;
+        }
+        if (deeperCrosses(runs[a], runs[b])) {
+          runs[a].depth++;      // b must not sit deeper than a: a takes the deeper lane
+        }
+        if (deeperCrosses(runs[b], runs[a])) {
+          runs[a].depth--;
+        }
+      }
+    }
+    runs.sort(function (one, other) {
+      if (one.depth !== other.depth) {
+        return one.depth - other.depth;
+      }
+      if (one.x1 !== other.x1) {
+        return one.x1 - other.x1;
+      }
+      if (one.x2 !== other.x2) {
+        return one.x2 - other.x2;
+      }
+      return one.seg.a.uid - other.seg.a.uid;
+    });
+    for (var l = 0; l < runs.length; l++) {
+      lanes[segmentKey(runs[l].seg)] = l;
+    }
+    laneCounts.push(runs.length);
   }
   return {lanes: lanes, laneCounts: laneCounts};
+}
+
+/**
+ * The x of both ends of a segment where it actually touches its nodes: the port of a spread side, the
+ * middle of the side otherwise, the point of a dummy.
+ * @param {object} seg the segment
+ * @param {object} graph the graph
+ * @returns {Array<number>} the x of the start and of the end
+ */
+function runEnds(seg, graph) {
+  var edge = seg.edge;
+  return [nodeEndX(seg.a, edge === null ? null : edge, false),
+    nodeEndX(seg.b, edge === null ? null : edge, true)];
+}
+
+/**
+ * The x where an edge meets one of its nodes.
+ * @param {object} node the node (may be a dummy)
+ * @param {object} edge the edge
+ * @param {boolean} atTarget true for the target end, false for the source end
+ * @returns {number} the x
+ */
+function nodeEndX(node, edge, atTarget) {
+  var centre = node.x + (node.w || 0) / 2;
+  if (!edge || node.dummy) {
+    return centre;
+  }
+  var side = atTarget ? edge.entrySide : edge.exitSide;
+  if (side !== 'n' && side !== 's') {
+    return centre;
+  }
+  var spread = atTarget ? edge.entrySpread : edge.exitSpread;
+  return sidePoint(node, side, spread ? spread.index : undefined,
+    spread ? spread.count : undefined)[0];
+}
+
+/**
+ * Whether putting {@code deeper} on a deeper lane than {@code shallower} makes their two runs cross:
+ * the vertical end of one cuts the horizontal run of the other.
+ * @param {object} shallower the run on the upper lane
+ * @param {object} deeper the run on the lower lane
+ * @returns {boolean} true when that order crosses
+ */
+function deeperCrosses(shallower, deeper) {
+  var eps = 1.5;
+  if (deeper.x1 > shallower.lo + eps && deeper.x1 < shallower.hi - eps) {
+    return true;      // the deeper run drops into the upper run's span
+  }
+  return shallower.x2 > deeper.lo + eps && shallower.x2 < deeper.hi - eps;
 }
 
 /**
@@ -3260,6 +3385,11 @@ function absorbStep(graph, edge, node, side, points, endIndex, cornerIndex, runX
   }
   points[endIndex][0] = runX;
   points[cornerIndex][0] = runX;
+  // The y followed the old x on the outline of a diamond or a hexagon - move it along.
+  var recess = shapeRecess(node, side, runX - (node.x + node.w / 2));
+  var y = side === 'n' ? node.y + recess : node.y + node.h - recess;
+  points[endIndex][1] = y;
+  points[cornerIndex][1] = y;
   if (endIndex === 0) {
     edge.exitX = runX;
   } else {
@@ -3455,6 +3585,54 @@ function addArrowheads(edge, points, out) {
 }
 
 /**
+ * Routes an edge as one smooth line: from the node's outline, a short stub along the side's normal,
+ * the same at the target, and the rest is the curve ({@code curve: 'spline'} gives the slightly
+ * curved line Mermaid draws, {@code 'off'} the bare stub-to-stub polyline).
+ * <p>
+ * {@code direct} draws border to border, which leaves the line at an arbitrary angle and lets it cut
+ * through a box; the two stubs here keep it perpendicular to the shape, so a fan out of a diamond
+ * leaves the four edges of the rhombus at right angles and no arrowhead sits at a corner
+ * (docs/js/diagram-plan.md §13.8).
+ * </p>
+ * @param {object} graph the graph
+ * @param {object} edge the edge
+ * @param {object} style the line style
+ * @param {Array<object>} out the item list
+ * @param {Array<object>} labels the label list
+ */
+function routeSmooth(graph, edge, style, out, labels) {
+  var from = edge.fromNode;
+  var to = edge.toNode;
+  var exitSide = edge.exit || edge.exitSide || 's';
+  var entrySide = edge.entry || edge.entrySide || 'n';
+  var start = edge.exit
+    ? sidePoint(from, edge.exit)
+    : sidePoint(from, exitSide, edge.exitSpread ? edge.exitSpread.index : undefined,
+      edge.exitSpread ? edge.exitSpread.count : undefined);
+  var end = edge.entry
+    ? sidePoint(to, edge.entry)
+    : sidePoint(to, entrySide, edge.entrySpread ? edge.entrySpread.index : undefined,
+      edge.entrySpread ? edge.entrySpread.count : undefined);
+  var points = [start];
+  if (edge.waypoints) {
+    for (var i = 0; i < edge.waypoints.length; i++) {
+      points.push([edge.waypoints[i][0], edge.waypoints[i][1]]);
+    }
+  } else {
+    var stub = SMOOTH_STUB;
+    var startStub = offsetNormal(start, exitSide, stub);
+    var endStub = offsetNormal(end, entrySide, stub);
+    points.push(startStub);
+    points.push(endStub);
+  }
+  points.push(end);
+  out.push(edgePath(graph, points, style));
+  recordRoute(graph, edge, out);
+  addArrowheads(edge, points, out);
+  addEdgeLabel(edge, points, labels);
+}
+
+/**
  * The point where the line from the node's centre to another node's centre leaves the node box.
  * @param {object} node the node
  * @param {object} other the other node
@@ -3470,10 +3648,89 @@ function boundaryPoint(node, other) {
   if (Math.abs(dx) < 1e-9 && Math.abs(dy) < 1e-9) {
     return [cx, cy];
   }
-  var tx = Math.abs(dx) < 1e-9 ? Infinity : (node.w / 2) / Math.abs(dx);
-  var ty = Math.abs(dy) < 1e-9 ? Infinity : (node.h / 2) / Math.abs(dy);
-  var t = Math.min(tx, ty);
+  var t = boundaryT(node, dx, dy);
   return [cx + dx * t, cy + dy * t];
+}
+
+/**
+ * The factor that takes a direction from the node's centre to the point where it leaves the outline.
+ * <p>
+ * The box is only the outline of a rectangle. A diamond is the rhombus through the middle of the four
+ * sides, a circle is the inscribed ellipse, and a line that is trimmed to the box would end in the air
+ * next to those shapes (reported as a "dangling" arrowhead in docs/js/diagram-plan.md §7.1).
+ * </p>
+ * @param {object} node the node
+ * @param {number} dx the x distance to the other centre
+ * @param {number} dy the y distance to the other centre
+ * @returns {number} the factor (&gt; 0)
+ */
+function boundaryT(node, dx, dy) {
+  var a = node.w / 2;
+  var b = node.h / 2;
+  if (node.shape === 'diamond') {
+    // |x|/a + |y|/b = 1 on every of the four edges.
+    return 1 / (Math.abs(dx) / a + Math.abs(dy) / b);
+  }
+  if (node.shape === 'circle' || node.shape === 'start' || node.shape === 'end') {
+    return 1 / Math.sqrt((dx / a) * (dx / a) + (dy / b) * (dy / b));
+  }
+  var tx = Math.abs(dx) < 1e-9 ? Infinity : a / Math.abs(dx);
+  var ty = Math.abs(dy) < 1e-9 ? Infinity : b / Math.abs(dy);
+  return Math.min(tx, ty);
+}
+
+/**
+ * How far a point that sits {@code offset} beside the middle of a side lies outside the shape, i.e.
+ * how far it has to move back along the side's inward normal to lie on the outline.
+ * <p>
+ * Zero for a rectangle (and for every shape whose side is flat) - this is what keeps the arrowheads
+ * of a diamond, a hexagon, a circle or a stadium on the drawn outline instead of at the corners of
+ * the invisible box (docs/js/diagram-plan.md §7.1).
+ * </p>
+ * @param {object} node the node
+ * @param {string} side n | e | s | w
+ * @param {number} offset the distance from the middle of the side
+ * @returns {number} the recess, 0..h/2 resp. 0..w/2
+ */
+function shapeRecess(node, side, offset) {
+  var along = Math.abs(offset || 0);
+  if (along < 1e-9) {
+    return 0;
+  }
+  var w = node.w;
+  var h = node.h;
+  var horizontal = side === 'n' || side === 's';
+  if (node.shape === 'diamond') {
+    return horizontal ? along * (h / w) : along * (w / h);
+  }
+  if (node.shape === 'circle' || node.shape === 'start' || node.shape === 'end') {
+    // The outline is the ellipse through the middle of the four sides.
+    var rx = w / 2;
+    var ry = h / 2;
+    var radius = horizontal ? ry : rx;
+    var across = horizontal ? rx : ry;
+    var share = Math.min(1, along / across);
+    return radius - radius * Math.sqrt(Math.max(0, 1 - share * share));
+  }
+  if (node.shape === 'stadium') {
+    // Flat in the middle, a half circle of radius h/2 at both ends.
+    var r = h / 2;
+    var flat = horizontal ? Math.max(0, w / 2 - r) : 0;
+    if (along <= flat) {
+      return 0;
+    }
+    var s = Math.min(1, (along - flat) / r);
+    return r - r * Math.sqrt(Math.max(0, 1 - s * s));
+  }
+  if (node.shape === 'hexagon') {
+    var inset = Math.min(w / 4, 16);
+    if (horizontal) {
+      var flatHex = w / 2 - inset;
+      return along <= flatHex ? 0 : Math.min(h / 2, (along - flatHex) * (h / 2) / inset);
+    }
+    return along >= h / 2 ? w / 2 : inset * (1 - along / (h / 2));
+  }
+  return 0;
 }
 
 /**
@@ -3486,16 +3743,17 @@ function boundaryPoint(node, other) {
  */
 function sidePoint(node, side, index, count) {
   var offset = sideOffset(node, side, index, count);
+  var recess = shapeRecess(node, side, offset);
   if (side === 'n') {
-    return [node.x + node.w / 2 + offset, node.y];
+    return [node.x + node.w / 2 + offset, node.y + recess];
   }
   if (side === 'e') {
-    return [node.x + node.w, node.y + node.h / 2 + offset];
+    return [node.x + node.w - recess, node.y + node.h / 2 + offset];
   }
   if (side === 'w') {
-    return [node.x, node.y + node.h / 2 + offset];
+    return [node.x + recess, node.y + node.h / 2 + offset];
   }
-  return [node.x + node.w / 2 + offset, node.y + node.h];
+  return [node.x + node.w / 2 + offset, node.y + node.h - recess];
 }
 
 /**

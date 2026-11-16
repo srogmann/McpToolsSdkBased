@@ -32,8 +32,11 @@ var ARROWS = ['end', 'start', 'both', 'none'];
 /** Port sides: north, east, south, west. */
 var SIDES = ['n', 'e', 's', 'w'];
 
-/** How an edge is drawn: orthogonal (default), a shared tree bus, or one straight line. */
-var ROUTES = ['orthogonal', 'tree', 'direct'];
+/**
+ * How an edge is drawn: orthogonal (default), a shared tree bus, one straight line, or a smooth curve
+ * with a short stub on the node's side (the Mermaid look).
+ */
+var ROUTES = ['orthogonal', 'tree', 'direct', 'smooth'];
 
 /**
  * How the line of an edge is smoothed: {@code 'off'} (straight segments), {@code 'round'} (the
