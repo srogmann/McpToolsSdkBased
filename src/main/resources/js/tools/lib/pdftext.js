@@ -475,7 +475,11 @@ Report.prototype.flowchart = function (chart) {
  * {@code diagram.layout(...)} build the scene (docs/js/diagram-plan.md §5, §11.3).
  * </p>
  * @param {object} scene the scene ({kind:'scene', width, height, items})
- * @param {object} [options] {spaceBefore, spaceAfter}
+ * @param {object} [options] {spaceBefore, spaceAfter, fit, scale}
+ *   {@code fit: 'page'} (default) scales the drawing down until it fits the text area of one page,
+ *   {@code 'width'} only until it fits the width, {@code 'none'} leaves it at its size (a drawing that
+ *   is taller than the page then runs off the page - a note says so). {@code scale} is a fixed factor
+ *   and wins over {@code fit}. Scaling only ever shrinks: a small drawing keeps its size.
  * @returns {object} this report
  */
 Report.prototype.diagram = function (scene, options) {
@@ -488,7 +492,9 @@ Report.prototype.diagram = function (scene, options) {
     kind: 'diagram',
     scene: scene,
     spaceBefore: opts.spaceBefore === undefined ? 8 : opts.spaceBefore,
-    spaceAfter: opts.spaceAfter === undefined ? 10 : opts.spaceAfter
+    spaceAfter: opts.spaceAfter === undefined ? 10 : opts.spaceAfter,
+    fit: opts.fit === undefined ? 'page' : opts.fit,
+    scale: opts.scale === undefined ? null : opts.scale
   });
   return this;
 };
@@ -640,7 +646,7 @@ function collect(report) {
         want(report, block.nodes[n].label, report.font, block.size);
       }
     } else if (block.kind === 'diagram') {
-      var diagramTexts = diagramPdf.measureTexts(block.scene);
+      var diagramTexts = diagramPdf.measureTexts(diagramScene(block, diagramScale(report, block)));
       for (var dt = 0; dt < diagramTexts.length; dt++) {
         want(report, diagramTexts[dt].text, report.font, diagramTexts[dt].size);
       }
@@ -1275,21 +1281,38 @@ function sum(values) {
  * @param {object} block the diagram block
  */
 function placeDiagram(report, state, block) {
-  var box = diagramPdf.bounds(block.scene);
+  var scale = diagramScale(report, block);
+  var scene = diagramScene(block, scale);
+  var box = diagramPdf.bounds(scene);
+  var usableWidth = pageWidth(report);
+  var usableHeight = contentHeight(report);
+  if (scale < 1) {
+    // A scaled drawing is a different scene: the ops carry absolute points, so the shrink has to
+    // happen before they are built (a page break cannot help a drawing that is too tall).
+    noteOnce(state, 'a diagram was scaled to '
+      + Math.round(scale * 1000) / 10 + ' % to fit the text area ('
+      + Math.round(block.scene.width) + ' x ' + Math.round(block.scene.height)
+      + ' pt -> ' + Math.round(box.width) + ' x ' + Math.round(box.height)
+      + ' pt) - pass {fit: \'none\'} or {scale: 1} to keep the size');
+  }
   state.y += block.spaceBefore;
   fit(report, state, box.height + block.spaceAfter, true);
-  var usable = pageWidth(report);
+  if (box.height > usableHeight + 0.5) {
+    noteOnce(state, 'the diagram is ' + Math.round(box.height) + ' pt high but the text area of a page'
+      + ' is only ' + Math.round(usableHeight) + ' pt - it runs off the page (pass {fit: \'page\'})');
+  }
   var offsetX = report.margin.left - box.originX;
-  if (box.width < usable) {
-    offsetX += (usable - box.width) / 2;
-  } else if (box.width > usable + 0.5) {
-    noteOnce(state, 'a diagram is ' + Math.round((box.width - usable) * 10) / 10
+  if (box.width < usableWidth) {
+    offsetX += (usableWidth - box.width) / 2;
+  } else if (box.width > usableWidth + 0.5) {
+    noteOnce(state, 'a diagram is ' + Math.round((box.width - usableWidth) * 10) / 10
       + ' pt wider than the text area - it runs over the right margin');
   }
   var offsetY = state.y - box.originY;
-  var ops = diagramPdf.ops(block.scene, {
+  var ops = diagramPdf.ops(scene, {
     offsetX: offsetX,
     offsetY: offsetY,
+    pageHeight: report.pageSize.height,
     font: report.font,
     color: report.color,
     widthOf: function (text, size) {
@@ -1300,6 +1323,39 @@ function placeDiagram(report, state, block) {
     place(state, ops[i]);
   }
   state.y += box.height + block.spaceAfter;
+}
+
+/**
+ * The factor a diagram block is drawn with: {@code scale} when given, otherwise what {@code fit}
+ * asks for - {@code 'page'} shrinks it into the text area of one page, {@code 'width'} only into the
+ * width, {@code 'none'} leaves it alone. Scaling never enlarges.
+ * @param {object} report the report
+ * @param {object} block the diagram block
+ * @returns {number} the factor (0 &lt; f &lt;= 1 for the fit modes)
+ */
+function diagramScale(report, block) {
+  if (typeof block.scale === 'number' && block.scale > 0) {
+    return block.scale;
+  }
+  var box = diagramPdf.bounds(block.scene);
+  var mode = block.fit || 'page';
+  if (mode === 'page') {
+    return Math.min(1, pageWidth(report) / box.width, contentHeight(report) / box.height);
+  }
+  if (mode === 'width') {
+    return Math.min(1, pageWidth(report) / box.width);
+  }
+  return 1;
+}
+
+/**
+ * The scene a diagram block is drawn from, scaled when needed.
+ * @param {object} block the diagram block
+ * @param {number} scale the factor
+ * @returns {object} the scene to draw
+ */
+function diagramScene(block, scale) {
+  return scale < 1 ? diagramPdf.scaled(block.scene, scale) : block.scene;
 }
 
 /**
@@ -1672,7 +1728,8 @@ function help() {
     '  table({cols, rows, header, fontSize, zebra, padding, lineWidth, borderColor, headerFill,',
     '         zebraFill, spaceBefore, spaceAfter})',
     '  flowchart({nodes:[{id,label}], edges:[[from,to]], size, gap, rankGap, nodeHeight})',
-    '  diagram(scene, {spaceBefore, spaceAfter})   // a scene from the diagram module, drawn vector',
+    '  diagram(scene, {spaceBefore, spaceAfter, fit, scale})   // a scene from the diagram module,',
+    "                                 // drawn vector; fit: 'page' (default) shrinks it into one page",
     '  rule({color, lineWidth, spaceBefore, spaceAfter})',
     '  spacer(pt), pageBreak(), header(text), footer(text)   // {page} and {pages} are replaced',
     '',
