@@ -1,11 +1,11 @@
 {
   "pdftext": {
     "file": "lib/pdftext.js",
-    "summary": "`loadShipped('pdftext')` is a small typesetter on pdfedit (headings, justified paragraphs, tables, flowcharts) - `help()` explains the calls, the unit of a column width (a number is points, 'NN%' is a share of the text area) and what a run reports in `notes`/`dropped`"
+    "summary": "`loadShipped('pdftext')` is a small typesetter on pdfedit (headings, justified paragraphs, tables, flowcharts) - `help()` explains the calls, the page options (presets and `orientation`), the unit of a column width (a number is points, 'NN%' is a share of the text area) and what a run reports in `notes`/`dropped`/`diagrams`"
   },
   "diagram": {
     "file": "lib/diagram.js",
-    "summary": "`loadShipped('diagram')` parses a Mermaid/DOT subset into a JSON model, lays it out itself (no runtime dependency; measured text is injected) and draws it as SVG - `help()` lists the subset, the `%%`-directives (pin/rank/port/weight/route/curve/layout), the two placement strategies (`layout: 'layered' | 'force'`) and the limits"
+    "summary": "`loadShipped('diagram')` parses a Mermaid/DOT subset into a JSON model, lays it out itself (built-in base-14 widths, or a measure function of your own) and draws it as SVG - `help()` lists the subset, the `%%`-directives (pin/rank/port/weight/route/curve/layout), the two placement strategies (`layout: 'layered' | 'force'`), `fit()` (does a scene fit a page, at which scale, how small does the text get), `metric()` and the limits"
   },
   "diagram-model": {
     "file": "lib/diagram/model.js",
@@ -26,6 +26,14 @@
   "diagram-parse-state": {
     "file": "lib/diagram/parse-state.js",
     "summary": "internal building block of `diagram`: the Mermaid state-diagram subset frontend (`[*]` pseudo states, transitions, composite states as groups) into the IR"
+  },
+  "diagram-fit": {
+    "file": "lib/diagram/fit.js",
+    "summary": "internal building block of `diagram` and `pdftext`: the page presets, the orientation rule, the text area and the one scale formula behind `diagram.fit()`"
+  },
+  "diagram-metric": {
+    "file": "lib/diagram/metric.js",
+    "summary": "internal building block of `diagram`: the advance widths of the base-14 fonts (exact for ASCII) behind `diagram.metric()`, which `layout()` uses when no measure function is injected"
   },
   "diagram-layout": {
     "file": "lib/diagram/layout.js",

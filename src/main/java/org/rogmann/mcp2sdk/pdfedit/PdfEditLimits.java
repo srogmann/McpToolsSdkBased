@@ -78,6 +78,23 @@ public final class PdfEditLimits {
     /** Largest number of objects {@code verify()} reads. */
     public static final int MAX_VERIFY_OBJECTS = 200_000;
 
+    /**
+     * Pixels of one {@code render()} page - the guard in front of PDFBox' rasterizer.
+     * <p>
+     * The number is the {@code image} module's default decode limit ({@code mcp.js.image.maxPixels}),
+     * so a rendered page can be handed to {@code image.open()} without hitting a second, smaller
+     * ceiling. A4 fits up to about 690 dpi, A3 up to about 490 dpi; a larger sheet is refused with
+     * the computed numbers in the message.
+     * </p>
+     */
+    public static final long MAX_RENDER_PIXELS = 32L * 1024 * 1024;
+
+    /** Smallest resolution {@code render()} accepts (dpi). */
+    public static final int MIN_RENDER_DPI = 24;
+
+    /** Largest resolution {@code render()} accepts (dpi). */
+    public static final int MAX_RENDER_DPI = 1_200;
+
     private PdfEditLimits() {
         // Utility class
     }

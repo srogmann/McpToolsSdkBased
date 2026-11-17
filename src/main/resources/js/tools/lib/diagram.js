@@ -29,6 +29,8 @@ var sceneLib = require('./diagram/scene.js');
 var dotLib = require('./diagram/parse-dot.js');
 var mermaidLib = require('./diagram/parse-mermaid.js');
 var stateLib = require('./diagram/parse-state.js');
+var fitLib = require('./diagram/fit.js');
+var metricLib = require('./diagram/metric.js');
 
 /** The module version. */
 var VERSION = '0.1.0';
@@ -204,6 +206,52 @@ function limits(overrides) {
 }
 
 /**
+ * How a scene fits onto a page - a calculation, not a drawing.
+ * <p>
+ * The formula is one `min`, but three things around it are easy to get wrong by hand: the scene is
+ * normalised (its origin is the margin, not 0), the text area of a page is the page minus twice the
+ * margin minus the space of a header and a footer, and scaling never enlarges. This call answers
+ * all three, plus the number that matters for a diagram: the size the smallest label ends up at.
+ * </p>
+ * <pre>{@code
+ * diagram.fit(scene, {page: 'A4', margin: 15, orientation: 'auto'})
+ * // {scale: 0.452, width: 565, height: 542, orientation: 'portrait',
+ * //  smallestFont: 4.52, legible: false, fits: true,
+ * //  warning: 'the drawing is … and is scaled to 45.2 % …; the smallest text would be 4.52 pt …'}
+ * }</pre>
+ * @param {object|string} scene the scene (or its JSON)
+ * @param {object} [options] {page, margin, orientation, fit, scale, headerSpace, footerSpace}
+ * @returns {object} {page, pageSize, orientation, textArea, drawing, scale, width, height,
+ *   smallestFont, legible, fits, warning}
+ */
+function fit(scene, options) {
+  var resolved = typeof scene === 'string' ? JSON.parse(scene) : scene;
+  return fitLib.fit(resolved, options || {});
+}
+
+/**
+ * The built-in advance widths of a standard font, usable as the {@code measure} of a layout.
+ * <p>
+ * A caller who only wants a picture should not have to import a typesetter to measure a label:
+ * the widths of the base-14 fonts are part of the specification, so they ship with this module
+ * (ASCII exactly, the font's default width otherwise). {@code layout()} uses them on its own; this
+ * call is for a caller who wants the number, or who lays out with another font.
+ * </p>
+ * <pre>{@code
+ * var m = diagram.metric('Helvetica', 10);
+ * m.width('Knoten');                                  // 35.58
+ * diagram.layout(model, {measure: m.measure});         // same numbers as pdftext.measure()
+ * }</pre>
+ * @param {string} [font] the font name (default 'Helvetica'; Arial and Times New Roman are
+ *        aliases, Courier is monospaced)
+ * @param {number} [size] the size in points (default 10)
+ * @returns {object} {font, size, source, width(text[, size]), measure(request)}
+ */
+function metric(font, size) {
+  return metricLib.metric(font, size);
+}
+
+/**
  * The help text - the manual a caller reads before the first line.
  * @returns {string} the help text
  */
@@ -229,6 +277,9 @@ function help() {
     '                 data-node groups, so an edited SVG can be read back)',
     '  diff(before, after, {tolerance, shift, base, free})      -> {shift, moved, nudge, targets,',
     '                 absolute, exact, unchanged, onlyInFirst, onlyInSecond}',
+    '  fit(scene, {page, margin, orientation, fit, scale, headerSpace, footerSpace})',
+    '                 -> {scale, width, height, smallestFont, legible, fits, warning, ...}',
+    "  metric(font, size)                                      -> {width(text), measure(request)}",
     '  version(), limits(overrides), help()',
     '',
     'Mermaid subset: flowchart/graph TB/TD/BT/LR/RL; shapes A[ ] A( ) A([ ]) A[[ ]] A[( )]',
@@ -340,7 +391,8 @@ function help() {
     '     Every item of a node carries nodeGroup, every path carries edgeFrom/edgeTo, and the SVG',
     '     wraps them in <g id="node-..." data-node="..."> / <g id="edge-...-to-..." data-edge="...">,',
     '     so a moved node can be read back by name instead of by matching coordinates or labels.',
-    '     Turn the edit into nudge deltas (undo the normalisation!), then confirm with report().',
+    '     Turn the edit into nudge deltas (undo the normalisation!), then confirm it by laying the',
+    '     model out again and reading the counters (or diff() against the new positions).',
     '  6. phases.recipe answers "which picture is this": strategy, seed, relaxation, every nudge',
     '     and the module version, with the effective values. The SVG repeats it in the <title> and',
     '     in a comment. Pass {recipe: {fixture, fixtureHash, moduleHash}} to layout() and the',
@@ -384,8 +436,42 @@ function help() {
     '                          overlap, but a chain that runs through several groups is spread over',
     '                          the strips and its edges become long horizontal runs',
     '',
-    'The measure function is injected: layout never touches a font. Without one, widths are',
-    'estimated and a note says so. The scene carries a "phases" block (layout, ranks, layers,',
+    'Measuring labels: layout never touches a font. Without a measure function it uses the',
+    'built-in widths of the standard fonts (diagram/metric.js) - exact numbers for Helvetica, the',
+    'font this layout measures with, so nothing is guessed. Pass one for another font:',
+    '  measure(request)                       request {font, size, text} -> width in pt',
+    "  var m = diagram.metric('Helvetica', 10);  // built-in widths, nothing to import",
+    '  m.width("Knoten")                         -> 35.58 pt',
+    "  diagram.metric('Courier')              // monospaced; Arial/Times New Roman are aliases",
+    '  diagram.layout(model, {measure: m.measure});',
+    "  An unknown font reports source:'estimate' and falls back to length x size x 0.55, and the",
+    '  scene says so in notes. A server with pdftext has the same numbers:',
+    "  pdftext.measure('Helvetica', 10, ['Knoten']).",
+    '',
+    'Onto a page: fit(scene, {page, margin, orientation, fit, scale}) - the calculation, not the',
+    '  drawing (nothing in the scene changes):',
+    "  page:        'A4' (default), 'A3', 'A5', 'LETTER', 'LEGAL', 'TABLOID' or {width, height} in pt",
+    "  orientation: 'portrait' is how a preset is defined; 'landscape' swaps width and height",
+    "               (also on {width, height}), 'auto' picks landscape for a wide drawing",
+    '  margin:      one number or {top, right, bottom, left}, default 57 pt (the pdftext default)',
+    "  fit:         'page' (default, shrink into the text area), 'width' (width only), 'none';",
+    '               scale: <f> is a fixed factor and wins over fit. Scaling only ever shrinks.',
+    '  The text area is the page minus twice the margin minus headerSpace/footerSpace (pdftext',
+    '  reserves 2.2 x size per header/footer line and passes that in).',
+    '  The answer: scale, width, height, page, pageSize, orientation, textArea, drawing, fits -',
+    '  and smallestFont, the size the smallest label ends up at, with legible:false below about',
+    '  6 pt and one warning sentence. Read that number: a drawing that only fits at 45 % does not',
+    '  have a page problem, it has a legibility problem.',
+    '  Drawing it: pdfedit ops come from diagram/pdf.js, the normal way is pdftext -',
+    "    doc.diagram(scene, {fit:'page'});            // factor in result.diagrams[0].appliedScale",
+    "    var result = doc.save('out.pdf');",
+    '  and looking at it (image.preview/describe take a path or the bytes, never a handle):',
+    "    var png = pdfedit.render(result.file, {page:1, dpi:150}).data;",
+    "    fs.writeBytes('seite1.png', png);",
+    "    console.log(image.preview('seite1.png', {width:80}));   // coarse text view, no tokens",
+    "    image.describe('seite1.png');                            // the vision model",
+    '',
+    'The scene carries a "phases" block (layout, ranks, layers,',
     'crossings, drawnCrossings, crossingPairs, drawnOverlaps, nearOverlaps, backwardEdges,',
     'channels, backBundles, pinned, route, curve, force, boxHits, boxHitPairs, kinks, kinkCount,',
     'recipe)',
@@ -419,6 +505,8 @@ module.exports = {
   positions: positions,
   positionsOfSvg: positionsOfSvg,
   diff: diff,
+  fit: fit,
+  metric: metric,
   /** The IR module (for a caller who builds a model step by step). */
   model: modelLib
 };

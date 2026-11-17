@@ -51,7 +51,7 @@ function ops(scene, ctx) {
   return out;
 }
 
- /**
+/**
  * A copy of a scene with every coordinate and every size multiplied by {@code factor}.
  * <p>
  * The PDF backend emits absolute coordinates, so a diagram that is larger than the text area has to

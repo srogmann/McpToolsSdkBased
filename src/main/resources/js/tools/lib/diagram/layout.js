@@ -18,8 +18,11 @@
  *
  *     var scene = require('./diagram/layout.js').run(model, {measure: fn, stopAfter: 'p3order'});
  *
- * The measure function is injected ({@code function({font, size, text}) -> width}); without it a
- * rough estimate is used and a note says so.
+ * The measure function is injected ({@code function({font, size, text}) -> width}). Without one the
+ * built-in widths of the standard fonts are used ({@code diagram/metric.js}) - for the font this
+ * layout measures with (Helvetica) those are the exact numbers of the specification, so a caller
+ * who does not care about measuring gets a correct picture and no note. Only a font the table does
+ * not know falls back to an estimate, and then a note says so.
  */
 
 'use strict';
@@ -27,6 +30,7 @@
 var sceneLib = require('./scene.js');
 var modelLib = require('./model.js');
 var forceLib = require('./force.js');
+var metricLib = require('./metric.js');
 
 /** The font the measure function is called with. */
 var FONT = 'Helvetica';
@@ -375,7 +379,8 @@ function pinNode(node, id, pin, graph) {
 }
 
 /**
- * Wraps the measuring function, falling back to an estimate and saying so.
+ * Wraps the measuring function: the injected one, else the built-in widths of the standard fonts,
+ * else an estimate - and in the last case a note says so.
  * @param {Function} measure the injected function, or undefined
  * @param {object} graph the graph (receives the note)
  * @returns {Function} the measuring function
@@ -391,9 +396,15 @@ function resolveMeasure(measure, graph) {
       return width;
     };
   }
-  graph.notes.push('layout: no measure function was injected - node widths are estimated'
-    + " (length x size x 0.55), so a label may be slightly off; pass options.measure for exact"
-    + ' widths (docs/js/diagram-plan.md §2.3)');
+  // The layout measures with FONT, so the table of that font is what is needed here - exact for a
+  // standard font, so no note: the picture is right, not guessed.
+  var builtin = metricLib.metric(FONT, FONT_SIZE);
+  if (builtin.source === 'builtin') {
+    return builtin.measure;
+  }
+  graph.notes.push("layout: the font '" + FONT + "' has no built-in width table and no measure"
+    + ' function was injected - node widths are estimated (length x size x 0.55), so a label may'
+    + ' be slightly off; pass options.measure for exact widths (docs/js/diagram-plan.md §2.3)');
   return function (request) {
     return String(request.text).length * request.size * 0.55;
   };

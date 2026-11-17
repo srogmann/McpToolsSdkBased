@@ -25,9 +25,9 @@ import java.util.TreeSet;
  * </p>
  * <p>
  * Writing is gated: the module refuses {@code create} and {@code edit} unless the server was
- * started with {@code -Dmcp.js.pdfedit.readonly=false}. Reading ({@code verify}, {@code status},
- * {@code help}) works either way - so a deployment can hand out the checker without handing out
- * the writer.
+ * started with {@code -Dmcp.js.pdfedit.readonly=false}. Reading ({@code verify}, {@code render},
+ * {@code status}, {@code help}) works either way - so a deployment can hand out the checker (and
+ * the rasterizer) without handing out the writer.
  * </p>
  */
 public final class JsPdfEdit {
@@ -137,6 +137,33 @@ public final class JsPdfEdit {
     }
 
     // -------------------------------------------------------------------
+    // render
+    // -------------------------------------------------------------------
+
+    /**
+     * Renders one page of a document given by path as a bitmap (works in read-only mode).
+     * @param filePath project-relative path
+     * @param options the options (page, dpi, region, format, quality)
+     * @return {@code {data, page, pages, dpi, format, width, height, notes, ...}}
+     */
+    public static Map<String, Object> render(String filePath, Map<String, Object> options) {
+        Source source = read(filePath);
+        return PdfEditRender.run(source.displayName(), source.data(), options);
+    }
+
+    /**
+     * Renders one page of a document given as bytes as a bitmap (works in read-only mode).
+     * @param data the bytes
+     * @param displayName the name used in messages, may be {@code null}
+     * @param options the options (page, dpi, region, format, quality)
+     * @return {@code {data, page, pages, dpi, format, width, height, notes, ...}}
+     */
+    public static Map<String, Object> render(byte[] data, String displayName,
+                                             Map<String, Object> options) {
+        return PdfEditRender.run(name(displayName), data, options);
+    }
+
+    // -------------------------------------------------------------------
     // status / help
     // -------------------------------------------------------------------
 
@@ -151,7 +178,8 @@ public final class JsPdfEdit {
         map.put("scope", "writing PDFs: create, edit pages, write text and shapes, place images,"
                 + " cut and insert operators, set bookmarks, add annotations and links, fill and"
                 + " flatten an interactive form, merge another document, embed a TrueType font,"
-                + " and verify the result with the project's own reader");
+                + " verify the result with the project's own reader, and render a page as a"
+                + " bitmap (PNG/JPEG, PDFBox) so a caller can look at it");
         // status() must answer even when the property is broken - that is when it is called.
         boolean writeEnabled;
         try {
@@ -185,6 +213,9 @@ public final class JsPdfEdit {
         limits.put("maxFieldValueChars", (long) PdfEditLimits.MAX_FIELD_VALUE_CHARS);
         limits.put("maxVerifyPages", (long) PdfEditLimits.MAX_VERIFY_PAGES);
         limits.put("maxVerifyObjects", (long) PdfEditLimits.MAX_VERIFY_OBJECTS);
+        limits.put("maxRenderPixels", PdfEditLimits.MAX_RENDER_PIXELS);
+        limits.put("minRenderDpi", (long) PdfEditLimits.MIN_RENDER_DPI);
+        limits.put("maxRenderDpi", (long) PdfEditLimits.MAX_RENDER_DPI);
         map.put("limits", limits);
         map.put("options", new ArrayList<Object>(new TreeSet<>(PdfEditOptions.NAMES)));
         map.put("pageSizes", List.of("A0", "A1", "A2", "A3", "A4", "A5", "A6", "LETTER", "LEGAL",
@@ -214,7 +245,8 @@ public final class JsPdfEdit {
                 "repaired tag structure (/StructTreeRoot is reported, not rebuilt)",
                 "filling an XFA form (its fields stand in the packet, not in the AcroForm -"
                         + " form.fill refuses with code 'xfa')",
-                "rendering, layout (no tables, no justification, no hyphenation)",
+                "layout (no tables, no justification, no hyphenation) - rendering is"
+                        + " pdfedit.render(), one page per call",
                 "redaction as a command: removing content is content.cut or stream.set, and"
                         + " covering it is draw.rect - the help shows the recipe",
                 "linearization"));
@@ -252,7 +284,10 @@ public final class JsPdfEdit {
                 .replace("{{fonts}}", String.join(", ", PdfEditFonts.names()))
                 .replace("{{maxVerifyPages}}", Integer.toString(PdfEditLimits.MAX_VERIFY_PAGES))
                 .replace("{{maxVerifyObjects}}",
-                        Integer.toString(PdfEditLimits.MAX_VERIFY_OBJECTS));
+                        Integer.toString(PdfEditLimits.MAX_VERIFY_OBJECTS))
+                .replace("{{maxRenderPixels}}", Long.toString(PdfEditLimits.MAX_RENDER_PIXELS))
+                .replace("{{minRenderDpi}}", Integer.toString(PdfEditLimits.MIN_RENDER_DPI))
+                .replace("{{maxRenderDpi}}", Integer.toString(PdfEditLimits.MAX_RENDER_DPI));
     }
 
     /** The help text of the module (also the source of examples the tests pin). */
@@ -270,6 +305,8 @@ public final class JsPdfEdit {
               pdfedit.create(ops[, options])           -> RESULT (a new document)
               pdfedit.edit(input, ops[, options])      -> RESULT (input: path or Uint8Array)
               pdfedit.verify(input[, {strict}])        -> {ok, problems, notes, metrics}
+              pdfedit.render(input[, options])         -> {data: Uint8Array (PNG/JPEG), page,
+                                                          pages, dpi, width, height, notes[]}
               pdfedit.status()                         -> limits, ops, whether writing is enabled
               pdfedit.help()                           -> this text
 
@@ -289,6 +326,32 @@ public final class JsPdfEdit {
               dates:{created,modified}  ISO-8601 strings; without dates no date is written
               verify:true             verify the result with the project's own reader
               maxOutputBytes:<n>      refuse a result larger than n bytes
+
+            RENDER - look at a page (a reading call: it works without the write property)
+            -----------------------------------------------------------------------------
+              pdfedit.render('out.pdf', {page:1, dpi:150})    // path or Uint8Array
+              page:1          the page (1-based, as pdf.pages() prints it)
+              dpi:150         resolution, {{minRenderDpi}}..{{maxRenderDpi}}; 150 shows the page,
+                              300 reads small print
+              region:[x,y,w,h]  only that part of the page, in POINTS of the displayed page -
+                              origin top-left, y downwards, /Rotate applied. That is exactly the
+                              space pdf.placement() prints its items in, so the bbox of a path can
+                              be passed in unchanged. The whole page is rendered and the region is
+                              cut out of it, so the pixel limit applies to the page.
+              format:'png'    'png' (lossless) or 'jpeg' (smaller; quality:0.85, 0 < q <= 1)
+              The answer: {data: Uint8Array, page, pages, dpi, format, width, height, byteLength,
+              pageSize:{width,height} in pt, rotate, region, notes[]}.
+              What it is for - seeing the result instead of trusting the op list
+              (image.preview/describe take a path or the bytes, not a handle):
+                var png = pdfedit.render('out.pdf', {page:1, dpi:150}).data;
+                fs.writeBytes('out-1.png', png);                          // for the human
+                console.log(image.preview('out-1.png', {width:80}));      // a rough text view
+                image.describe('out-1.png');                              // the vision model
+              A detail is a region at a higher dpi, not a scaled-up crop:
+                pdfedit.render('out.pdf', {page:1, dpi:400, region:[60, 300, 240, 120]})
+              Rendering is PDFBox' own renderer: what a viewer shows is what comes out. A page with
+              a defect is reported as code 'broken', and pdf.placement() then shows what the reader
+              still found.
 
             COORDINATES, UNITS AND THE ECHO
             -------------------------------
@@ -630,7 +693,9 @@ public final class JsPdfEdit {
               maxOutlineItems {{maxOutlineItems}}, maxAnnotationChars {{maxAnnotationChars}},
               maxFieldValueChars {{maxFieldValueChars}}.
               verify() walks at most maxVerifyPages {{maxVerifyPages}} pages and reads at most
-              maxVerifyObjects {{maxVerifyObjects}} objects.
+              maxVerifyObjects {{maxVerifyObjects}} objects. render() refuses a page above
+              maxRenderPixels {{maxRenderPixels}} pixels (about 690 dpi on A4) and a dpi
+              outside {{minRenderDpi}}..{{maxRenderDpi}}.
             A limit names itself and its value in the error, because a silently truncated document
             is worse than a refused call.
 
@@ -638,7 +703,7 @@ public final class JsPdfEdit {
             imbalanced (a cut would break BT/ET, q/Q or BMC/EMC), orphans (refs:'error' found a
             pointer), unknown-field (form.fill: the name is not in the form), xfa (the form's
             fields live in the /XFA packet), usage, limit, readonly. `readonly` means the server runs without
-            -Dmcp.js.pdfedit.readonly=false; verify/status/help work there either way.
+            -Dmcp.js.pdfedit.readonly=false; verify/render/status/help work there either way.
 
             OBJECT NUMBERS: a full save writes the objects in traversal order (PDFBox), so the
             numbers of the result differ from the input - `changed[].objNum` names the input

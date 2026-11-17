@@ -49,16 +49,13 @@
 // The PDF backend of the diagram module: a scene becomes pdfedit ops. pdftext owns the page and
 // the measuring cache; diagram/pdf.js only translates items (docs/js/diagram-plan.md §3.1).
 var diagramPdf = require('./diagram/pdf.js');
+// The page presets and the fit arithmetic live in the diagram module: diagram.fit() and a
+// report that places a diagram must answer the same question the same way, so there is one table
+// and one formula (not two copies that drift).
+var fitLib = require('./diagram/fit.js');
 
-/** Page size presets in points. */
-var PAGES = {
-  A4: {width: 595.28, height: 841.89},
-  A3: {width: 841.89, height: 1190.55},
-  A5: {width: 419.53, height: 595.28},
-  LETTER: {width: 612, height: 792},
-  LEGAL: {width: 612, height: 1008},
-  TABLOID: {width: 792, height: 1224}
-};
+/** Page size presets in points - portrait, as a page dictionary holds them. */
+var PAGES = fitLib.PAGES;
 
 /**
  * What a report uses when its options say nothing - the one place where the house style of a
@@ -73,6 +70,9 @@ var PAGES = {
  */
 var DEFAULTS = {
   page: 'A4',
+  // The page orientation: null means "as the preset is defined" (portrait), 'landscape' swaps
+  // width and height - for a preset and for an explicit {width, height} alike.
+  orientation: null,
   margin: 57,
   font: 'Helvetica',
   size: 10,
@@ -232,7 +232,8 @@ function measureByPlacement(font, size, texts) {
 
 /**
  * Creates a report.
- * @param {object} options {page, margin, font, size, leading, color, header, footer, title, author}
+ * @param {object} options {page, orientation, margin, font, size, leading, color, header, footer,
+ *        title, author}
  * @returns {object} the report
  */
 function report(options) {
@@ -242,9 +243,9 @@ function report(options) {
 /**
  * Reads or changes the defaults of every following report.
  * <p>
- *     pdftext.defaults()                    // {page, margin, font, size, color}
+ *     pdftext.defaults()                    // {page, orientation, margin, font, size, color}
  *     pdftext.defaults({page: 'A5'})        // a whole run on A5
- *     pdftext.defaults({page: 'A4', margin: 71})
+ *     pdftext.defaults({page: 'A4', orientation: 'landscape'})
  * </p>
  * @param {object} [options] the values to change (a partial update)
  * @returns {object} the defaults as they stand now
@@ -262,6 +263,7 @@ function defaults(options) {
   }
   return {
     page: DEFAULTS.page,
+    orientation: DEFAULTS.orientation,
     margin: DEFAULTS.margin,
     font: DEFAULTS.font,
     size: DEFAULTS.size,
@@ -275,7 +277,11 @@ function defaults(options) {
  * @constructor
  */
 function Report(options) {
-  this.pageSize = resolvePage(options.page || DEFAULTS.page);
+  var page = resolvePage(options.page === undefined ? DEFAULTS.page : options.page,
+    options.orientation === undefined ? DEFAULTS.orientation : options.orientation);
+  this.pageSize = {width: page.width, height: page.height};
+  this.pageOrientation = page.orientation;
+  this.pagePreset = page.preset;
   this.margin = resolveMargin(options.margin === undefined ? DEFAULTS.margin : options.margin);
   this.font = options.font || DEFAULTS.font;
   this.size = options.size || DEFAULTS.size;
@@ -292,23 +298,31 @@ function Report(options) {
 }
 
 /**
- * Resolves the page size option.
- * @param {string|object} page 'A4' or {width, height}
- * @returns {{width: number, height: number}} the size in points
+ * Resolves the page size option - a preset name or an explicit {@code {width, height}} - and
+ * applies the orientation.
+ * <p>
+ * The presets are the portrait sizes (A4, A3, A5, LETTER, LEGAL, TABLOID); {@code orientation}
+ * swaps width and height, for a preset and for an explicit size alike. A landscape A4 is therefore
+ * {@code {page:'A4', orientation:'landscape'}} or, for any special format,
+ * {@code {page:{width:841.89, height:595.28}}}. The table and the rule live in
+ * {@code diagram/fit.js}, so {@code diagram.fit()} answers with the same numbers.
+ * </p>
+ * @param {string|object} page 'A4' or {width, height} in points
+ * @param {string|null} [orientation] 'portrait', 'landscape' or null (as the preset is defined)
+ * @returns {{width: number, height: number, orientation: string, preset: string|null}} the page
  */
-function resolvePage(page) {
-  if (typeof page === 'string') {
-    var preset = PAGES[page.toUpperCase()];
-    if (!preset) {
-      throw new Error("pdftext: unknown page '" + page + "' - known are "
-        + Object.keys(PAGES).join(', ') + ' or {width, height} in points');
-    }
-    return preset;
+function resolvePage(page, orientation) {
+  if (orientation === 'auto') {
+    // A report chooses its page before it lays anything out, so there is no drawing to look at.
+    throw new Error("pdftext: orientation 'auto' needs a drawing - a report picks its page first."
+      + " Use 'portrait' or 'landscape', and diagram.fit(scene, {orientation:'auto'}) to ask"
+      + ' which one a scene wants');
   }
-  if (page && page.width > 0 && page.height > 0) {
-    return page;
+  try {
+    return fitLib.resolvePage(page, orientation === undefined ? null : orientation);
+  } catch (e) {
+    throw new Error(String(e.message).replace('diagram.fit: ', 'pdftext: '));
   }
-  throw new Error('pdftext: page is a preset name or {width, height} in points');
 }
 
 /**
@@ -479,7 +493,9 @@ Report.prototype.flowchart = function (chart) {
  *   {@code fit: 'page'} (default) scales the drawing down until it fits the text area of one page,
  *   {@code 'width'} only until it fits the width, {@code 'none'} leaves it at its size (a drawing that
  *   is taller than the page then runs off the page - a note says so). {@code scale} is a fixed factor
- *   and wins over {@code fit}. Scaling only ever shrinks: a small drawing keeps its size.
+ *   and wins over {@code fit}. Scaling only ever shrinks: a small drawing keeps its size. The
+ *   applied factor and the resulting smallest text size are in {@code result.diagrams[]}; the same
+ *   calculation before the fact is {@code diagram.fit()}.
  * @returns {object} this report
  */
 Report.prototype.diagram = function (scene, options) {
@@ -780,6 +796,9 @@ function wrapText(report, text, font, size, width) {
 function layout(report) {
   var pages = [];
   var state = {pages: pages, page: null, y: 0, notes: report.notes, dropped: [],
+    // One entry per diagram block: what fit asked for and what it became (the answer a caller
+    // reads instead of parsing a note sentence).
+    diagrams: [],
     headerSpace: report.headerText ? report.size * 2.2 : 0,
     footerSpace: report.footerText ? report.size * 2.2 : 0};
   newPage(report, state);
@@ -1281,7 +1300,8 @@ function sum(values) {
  * @param {object} block the diagram block
  */
 function placeDiagram(report, state, block) {
-  var scale = diagramScale(report, block);
+  var fits = diagramFit(report, block);
+  var scale = fits.scale;
   var scene = diagramScene(block, scale);
   var box = diagramPdf.bounds(scene);
   var usableWidth = pageWidth(report);
@@ -1295,8 +1315,35 @@ function placeDiagram(report, state, block) {
       + ' pt -> ' + Math.round(box.width) + ' x ' + Math.round(box.height)
       + ' pt) - pass {fit: \'none\'} or {scale: 1} to keep the size');
   }
+  if (fits.legible === false) {
+    // The scale is a page question; this is the readability question behind it.
+    noteOnce(state, 'the smallest text of a diagram is ' + fits.smallestFont + ' pt after scaling'
+      + ' to ' + Math.round(scale * 1000) / 10 + ' % - below about 6 pt a label is hard to read'
+      + ' (a larger page, a smaller margin or a split diagram helps)');
+  }
+  // What fit asked for and what it became - note above says it in a sentence, this says it in
+  // numbers (a caller should not have to parse prose). The page is filled in after the page break
+  // below, because that is when it is known.
+  var entry = {
+    index: state.diagrams.length + 1,
+    page: null,
+    fit: block.fit === undefined ? 'page' : block.fit,
+    requestedScale: typeof block.scale === 'number' ? block.scale : null,
+    appliedScale: Math.round(scale * 10000) / 10000,
+    width: fits.width,
+    height: fits.height,
+    drawingWidth: fits.drawing.width,
+    drawingHeight: fits.drawing.height,
+    smallestFont: fits.smallestFont,
+    legible: fits.legible,
+    fits: null,
+    warning: fits.warning
+  };
+  state.diagrams.push(entry);
   state.y += block.spaceBefore;
   fit(report, state, box.height + block.spaceAfter, true);
+  entry.page = state.pages.length;
+  entry.fits = fits.fits;
   if (box.height > usableHeight + 0.5) {
     noteOnce(state, 'the diagram is ' + Math.round(box.height) + ' pt high but the text area of a page'
       + ' is only ' + Math.round(usableHeight) + ' pt - it runs off the page (pass {fit: \'page\'})');
@@ -1326,26 +1373,31 @@ function placeDiagram(report, state, block) {
 }
 
 /**
- * The factor a diagram block is drawn with: {@code scale} when given, otherwise what {@code fit}
- * asks for - {@code 'page'} shrinks it into the text area of one page, {@code 'width'} only into the
- * width, {@code 'none'} leaves it alone. Scaling never enlarges.
+ * How a diagram block fits this report's text area - the same answer {@code diagram.fit()}
+ * gives, with the numbers the report already holds (page, margins, header/footer space).
+ * @param {object} report the report
+ * @param {object} block the diagram block
+ * @returns {object} the fit answer (scale, width, height, smallestFont, legible, fits, warning)
+ */
+function diagramFit(report, block) {
+  return fitLib.fit(block.scene, {
+    textArea: {width: pageWidth(report), height: contentHeight(report)},
+    pageSize: report.pageSize,
+    page: report.pagePreset,
+    orientation: report.pageOrientation,
+    fit: block.fit,
+    scale: block.scale
+  });
+}
+
+/**
+ * The factor a diagram block is drawn with - the one-number form of {@link diagramFit}.
  * @param {object} report the report
  * @param {object} block the diagram block
  * @returns {number} the factor (0 &lt; f &lt;= 1 for the fit modes)
  */
 function diagramScale(report, block) {
-  if (typeof block.scale === 'number' && block.scale > 0) {
-    return block.scale;
-  }
-  var box = diagramPdf.bounds(block.scene);
-  var mode = block.fit || 'page';
-  if (mode === 'page') {
-    return Math.min(1, pageWidth(report) / box.width, contentHeight(report) / box.height);
-  }
-  if (mode === 'width') {
-    return Math.min(1, pageWidth(report) / box.width);
-  }
-  return 1;
+  return diagramFit(report, block).scale;
 }
 
 /**
@@ -1646,6 +1698,8 @@ Report.prototype.ops = function () {
   measureAll(this);
   applyHeaderFooter(this, laid.state);
   laid.ops = flatten(laid.state.pages);
+  // The diagram blocks' fit answers, next to the notes that also mention them.
+  laid.diagrams = laid.state.diagrams;
   laid.backend = measuringBackend();
   if (laid.backend === 'placement') {
     noteOnce(laid.state, 'measured with pdf.placement() because this server has no text.measure'
@@ -1659,7 +1713,7 @@ Report.prototype.ops = function () {
  * Lays the report out, writes it with pdfedit and puts the bytes into a file.
  * @param {string} path the output path in the project
  * @param {object} [options] pdfedit options (passed through)
- * @returns {object} {file, bytes, pages, ops, backend, notes, dropped, verify}
+ * @returns {object} {file, bytes, pages, ops, backend, page, notes, dropped, diagrams, verify}
  */
 Report.prototype.save = function (path, options) {
   var laid = this.ops();
@@ -1683,8 +1737,11 @@ Report.prototype.save = function (path, options) {
     pages: laid.pageCount,
     ops: ops.length,
     backend: laid.backend,
+    page: {width: this.pageSize.width, height: this.pageSize.height,
+      orientation: this.pageOrientation},
     notes: (created.notes || []).concat(laid.notes),
     dropped: laid.dropped,
+    diagrams: laid.diagrams,
     verify: created.verify || null
   };
 };
@@ -1715,11 +1772,24 @@ function help() {
     '                    {title:\'Betrag\', width:\'22%\', align:\'right\'}],',
     '             rows:[[\'1\', \'Aufstellung der Anlage 3\', \'1.240,00\']]});',
     '  var result = doc.save(\'target/report.pdf\');',
-    '  // {file, bytes, pages, ops, backend, notes[], dropped[], verify}',
+    '  // {file, bytes, pages, ops, backend, page, notes[], dropped[], diagrams[], verify}',
     '',
     'The library measures (one pdfedit call per font and size) and writes nothing but pdfedit ops:',
     'page.add, text.put, draw.rect, draw.line, content.append. doc.ops() is the same run without',
     'writing a file - useful to look at result.notes and result.dropped before writing anything.',
+    '',
+    'Page (report options)',
+    "  page         'A4' (default), 'A3', 'A5', 'LETTER', 'LEGAL', 'TABLOID' - each as a page",
+    '               dictionary defines it, i.e. portrait - or {width, height} in points',
+    "  orientation  null (default: as the preset is) or 'landscape', which swaps width and height,",
+    "               for a preset and for an explicit {width, height} alike: a landscape A4 is",
+    "               {page:'A4', orientation:'landscape'}, an odd format {page:{width:841.89,",
+    '               height:595.28}}',
+    '  margin       one number or {top, right, bottom, left}, default 57 pt (2 cm)',
+    '  The text area is the page minus the left and right margins, minus the top and bottom margins,',
+    '  minus 2.2 x size per header line and per footer line: 481.28 pt wide and 727.89 pt high on',
+    '  A4 with 57 pt margins (44 pt less with a header and a footer at size 10). Every width and',
+    '  every column share in this library is a share of that area.',
     '',
     'Elements (every call returns the report, so calls chain)',
     '  heading(text, {level, size, spaceBefore, spaceAfter, align, color})',
@@ -1729,9 +1799,23 @@ function help() {
     '         zebraFill, spaceBefore, spaceAfter})',
     '  flowchart({nodes:[{id,label}], edges:[[from,to]], size, gap, rankGap, nodeHeight})',
     '  diagram(scene, {spaceBefore, spaceAfter, fit, scale})   // a scene from the diagram module,',
-    "                                 // drawn vector; fit: 'page' (default) shrinks it into one page",
+    '                                 // drawn as vector graphics and centred; see Diagrams below',
     '  rule({color, lineWidth, spaceBefore, spaceAfter})',
     '  spacer(pt), pageBreak(), header(text), footer(text)   // {page} and {pages} are replaced',
+    '',
+    'Diagrams (a scene from the diagram module, drawn as vector graphics)',
+    "  fit: 'page' (default)  shrink until the drawing fits the text area of one page",
+    "  fit: 'width'           shrink until it fits the width - a tall drawing may run off the page",
+    "  fit: 'none'            keep the size; a note says when it does not fit",
+    '  scale: <f>             a fixed factor; it wins over fit. Scaling only ever shrinks, so a',
+    '                         small drawing keeps its size',
+    '  A drawing that does not fit is scaled, never cut, and horizontally centred. What the run',
+    '  reports: result.diagrams[] - one entry per diagram block with {index, page, fit,',
+    '  requestedScale, appliedScale, width, height, drawingWidth, drawingHeight, smallestFont,',
+    '  legible, fits, warning}. smallestFont is the size the smallest label ends up at - a drawing',
+    '  that only fits at 45 % has 4.5 pt labels, and that is the number to read before the page',
+    '  count. The same question before the fact is diagram.fit(scene, {page, margin, orientation}),',
+    '  which uses the same table and the same formula.',
     '',
     'Column widths (cols[i].width) - the unit is the form of the value',
     '  30       a number is POINTS and includes the padding: with padding 4 pt on each side a',
@@ -1753,8 +1837,16 @@ function help() {
     '                    column and row) - and a header wider than the text area. A word is never',
     '                    broken, so a dropped entry is a layout decision still to make: a wider',
     '                    column, a shorter text, a smaller size.',
-    '  Both are plain strings. Read them: they are the only thing between you and a page that looks',
-    '  fine in the op list and wrong on paper.',
+    '  result.page       the page that was used: {width, height, orientation}',
+    '  result.diagrams[] the fit answer of every diagram block (see Diagrams), empty when there is',
+    '                    none - the numbers behind the note a scaled drawing produces',
+    '  Both notes and dropped are plain strings. Read them: they are the only thing between you and',
+    '  a page that looks fine in the op list and wrong on paper - and the cheapest check is to look',
+    '  at the page (image.preview/describe take a path or the bytes):',
+    "    var png = pdfedit.render(result.file, {page:1, dpi:150}).data;",
+    "    fs.writeBytes('seite1.png', png);",
+    "    console.log(image.preview('seite1.png', {width:80}));   // a coarse text view, no tokens",
+    "    image.describe('seite1.png');                            // the vision model",
     '',
     'Limits',
     '  no hyphenation, no font fallback, no bidi. A table row is not split across pages (a row',

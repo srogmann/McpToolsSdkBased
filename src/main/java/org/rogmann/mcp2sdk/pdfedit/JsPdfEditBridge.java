@@ -15,7 +15,7 @@ import java.util.Map;
  * Bridge between GraalVM JavaScript and {@link JsPdfEdit}.
  * <p>
  * Creates the {@code pdfedit} namespace: {@code create}, {@code edit}, {@code verify},
- * {@code status} and {@code help}. The op list is converted from JavaScript to plain Java
+ * {@code render}, {@code status} and {@code help}. The op list is converted from JavaScript to plain Java
  * structures before it reaches the module - an op is data, not code - and the result's
  * {@code data} leaves as a real {@code Uint8Array} (the byte contract of the JS tool family).
  * </p>
@@ -37,13 +37,13 @@ public class JsPdfEditBridge implements JsModuleInterface {
     @Override
     public String getSummary() {
         return "`pdfedit.help()` creates and changes PDFs (PDFBox): pages, content streams,"
-                + " annotations, forms, merges of other documents, embedded fonts, and verify()"
-                + " with the project's own reader";
+                + " annotations, forms, merges of other documents, embedded fonts, verify()"
+                + " with the project's own reader and render() to a PNG/JPEG of a page";
     }
 
     @Override
     public String getHelpTip() {
-        return "pdfedit.help() (create/edit PDFs, verify)";
+        return "pdfedit.help() (create/edit PDFs, verify, render to PNG)";
     }
 
     @Override
@@ -126,6 +126,27 @@ public class JsPdfEditBridge implements JsModuleInterface {
 
         methods.put("status", (ProxyExecutable) args ->
                 GraalProxies.toProxyObject(JsPdfEdit.status()));
+
+        methods.put("render", (ProxyExecutable) args -> {
+            requireArgs(args, 1, "render(input[, {page, dpi, region, format, quality}])");
+            Map<String, Object> options = optionsArg(args, 1);
+            Value input = argOrNull(args, 0);
+            if (input == null) {
+                throw PdfEditException.usage("render: the input is missing",
+                        "render(input) takes a project path or a Uint8Array of PDF bytes");
+            }
+            if (input.isString()) {
+                return result(JsPdfEdit.render(input.asString(), options), uint8ArrayCtor);
+            }
+            if (input.hasArrayElements()) {
+                String name = input.hasMembers() && input.hasMember("path")
+                        ? String.valueOf(GraalProxies.fromValue(input.getMember("path"))) : null;
+                return result(JsPdfEdit.render(GraalProxies.toByteArray(input), name, options),
+                        uint8ArrayCtor);
+            }
+            throw PdfEditException.usage("render: the input is " + GraalProxies.describeType(input),
+                    "render(input) takes a project path (string) or a Uint8Array of PDF bytes");
+        });
 
         methods.put("help", (ProxyExecutable) args -> JsPdfEdit.help());
 
