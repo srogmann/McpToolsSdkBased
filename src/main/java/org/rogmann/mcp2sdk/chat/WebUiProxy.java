@@ -56,8 +56,9 @@ import java.util.zip.GZIPInputStream;
  * <p>Server-side Web UI settings (the replacement for llama.cpp's {@code --ui-config}, which this
  * application does not have because it serves the UI itself): {@code /chat/props} carries a
  * {@code ui_settings} object built from {@code webui.uiConfig} / {@code webui.customCss} /
- * {@code webui.mcpServer.*}. The Web UI treats it as its default - a browser that already stores
- * its own settings (Developer settings such as "Custom CSS" included) keeps them.</p>
+ * {@code webui.systemMessage} / {@code webui.mcpServer.*}. The Web UI treats it as its default - a
+ * browser that already stores its own settings (Developer settings such as "Custom CSS" included)
+ * keeps them.</p>
  *
  * <p>That part lives in {@link UiSettings} (docs/webui.md §2 R7); this controller keeps the entry
  * point {@link #getProps(HttpServletRequest)} and the llama.cpp model properties around it, because

@@ -21,8 +21,9 @@ import java.util.Map;
  *
  * <p>Split out of the controller because it is a contract of its own with no HTTP, no streaming and
  * no model knowledge (docs/webui.md §2, R7): llama.cpp's {@code --ui-config} counterpart, which this
- * application assembles from {@value #PROP_UI_CONFIG}, {@value #PROP_CUSTOM_CSS} and the MCP seed
- * below. {@code WebUiProxy.getProps} stays the entry point (headers, caching, request origin) and
+ * application assembles from {@value #PROP_UI_CONFIG}, {@value #PROP_CUSTOM_CSS},
+ * {@value #PROP_SYSTEM_MESSAGE} and the MCP seed below. {@code WebUiProxy.getProps} stays the entry
+ * point (headers, caching, request origin) and
  * {@code buildJsonProps} stays there too - it needs the model properties and the chat template,
  * which the completion path owns as well.</p>
  *
@@ -39,6 +40,13 @@ import java.util.Map;
  * <p>Note also that the Web UI only consults {@code ui_settings} when the generation settings of
  * {@code default_generation_settings.params} yielded at least one known parameter (its sync step
  * returns early otherwise) - those are part of {@code buildJsonProps} and must stay there.</p>
+ *
+ * <p><b>The system prompt is always part of it.</b> Besides the two settings an operator writes
+ * ({@code uiConfig}, {@code customCss}) the node carries the {@code systemMessage} - without it a
+ * fresh browser would start with an empty one, and the model would not know that this backend can
+ * read files through its MCP tools. The shipped value is {@value #DEFAULT_SYSTEM_MESSAGE} unless
+ * {@value #PROP_SYSTEM_MESSAGE} or a {@code systemMessage} entry of {@code uiConfig} names another
+ * one (see {@link #resolveSystemMessage(ObjectNode)}), so the node is never empty.</p>
  */
 @Component
 public class UiSettings {
@@ -55,6 +63,21 @@ public class UiSettings {
 
     /** Convenience accessor for the single {@code customCss} UI setting (the "Custom CSS" field). */
     static final String PROP_CUSTOM_CSS = "webui.customCss";
+
+    /**
+     * System prompt shipped to a Web UI without settings of its own (property
+     * {@value #PROP_SYSTEM_MESSAGE}). Unset - the normal case - means the built-in
+     * {@value #DEFAULT_SYSTEM_MESSAGE}; see {@link #resolveSystemMessage(ObjectNode)}.
+     */
+    static final String PROP_SYSTEM_MESSAGE = "webui.systemMessage";
+
+    /**
+     * The system prompt a fresh Web UI starts with ("System Message" field of the chat): the model
+     * is told that it is a local assistant which reads {@code AGENTS.md} - the file that carries
+     * the project's own conventions, see {@code AGENTS.md} in the project root.
+     */
+    static final String DEFAULT_SYSTEM_MESSAGE =
+            "You are a local coach, and for many use cases, you may be the right one. Read AGENTS.md (if present).";
 
     /**
      * Switches the {@code mcpServers} seed on. Without a configured MCP server the Web UI has no
@@ -79,6 +102,17 @@ public class UiSettings {
 
     /** Key of the "Custom CSS" setting inside {@code ui_settings} (Web UI: {@code customCss}). */
     static final String SETTING_CUSTOM_CSS = "customCss";
+
+    /**
+     * Key of the system prompt inside {@code ui_settings} (Web UI settings key:
+     * {@code systemMessage}, the "System Message" field of the settings dialog).
+     *
+     * <p>Unlike {@code mcpServers} the value is a plain string, not a JSON string: the Web UI keeps
+     * it as it is and sends it as the top-level {@code systemMessage} parameter of the completion
+     * request (bundle: {@code e.systemMessage && (n.systemMessage = e.systemMessage)}). This proxy
+     * forwards that field unchanged - {@code ChatRequestPreparer} neither reads nor rewrites it.</p>
+     */
+    static final String SETTING_SYSTEM_MESSAGE = "systemMessage";
 
     /**
      * Key of the MCP server list inside {@code ui_settings} (Web UI settings key:
@@ -122,6 +156,15 @@ public class UiSettings {
     String customCss;
 
     /**
+     * The system prompt the Web UI is seeded with (property {@value #PROP_SYSTEM_MESSAGE}). Blank -
+     * the normal case, i.e. no explicit configuration - means the built-in
+     * {@value #DEFAULT_SYSTEM_MESSAGE}, which a {@code systemMessage} entry of
+     * {@link #uiConfigJson} still wins over; see {@link #resolveSystemMessage(ObjectNode)}.
+     */
+    @Value("${" + PROP_SYSTEM_MESSAGE + ":}")
+    String systemMessage;
+
+    /**
      * Whether the Web UI is seeded with a default MCP server (property
      * {@value #PROP_MCP_SERVER_ENABLED}, default true).
      *
@@ -158,7 +201,7 @@ public class UiSettings {
     /**
      * Builds the {@code ui_settings} node for a caller without a request (the startup log).
      *
-     * @return the node to serve, empty when nothing is configured
+     * @return the node to serve; never empty, because the system prompt is always shipped
      */
     ObjectNode build() {
         return build(null);
@@ -170,7 +213,7 @@ public class UiSettings {
      * @param requestBaseUrl origin the page was requested from ({@code scheme://host:port} plus
      *                       context path, no trailing slash), or {@code null} to derive the MCP
      *                       server URL from the configuration
-     * @return the node to serve, empty when nothing is configured
+     * @return the node to serve; never empty, because the system prompt is always shipped
      */
     ObjectNode build(String requestBaseUrl) {
         ObjectNode uiSettings = jsonMapper.createObjectNode();
@@ -196,6 +239,12 @@ public class UiSettings {
             uiSettings.put(SETTING_CUSTOM_CSS, customCss);
         }
 
+        // System prompt of the chat (the "System Message" field). A browser without settings of its
+        // own would otherwise start with an empty one, i.e. the model would not know that this
+        // backend reads AGENTS.md.
+        String prompt = resolveSystemMessage(uiSettings);
+        uiSettings.put(SETTING_SYSTEM_MESSAGE, prompt);
+
         // Default MCP server (docs/webui.md §6). An entry the operator wrote into uiConfig wins:
         // that is a deliberate configuration, this is only the built-in convenience.
         if (!uiSettings.has(SETTING_MCP_SERVERS)) {
@@ -206,6 +255,43 @@ public class UiSettings {
         }
 
         return uiSettings;
+    }
+
+    /**
+     * Determines the system prompt to ship, in three steps:
+     *
+     * <ol>
+     *   <li>{@value #PROP_SYSTEM_MESSAGE}, if set (trimmed): the operator knows best - it is the
+     *       dedicated switch, the counterpart of the {@code customCss} property and therefore more
+     *       specific than the generic JSON blob,</li>
+     *   <li>a {@code systemMessage} entry of {@link #uiConfigJson}, if the operator wrote one
+     *       there (that is the way to seed an <em>empty</em> prompt: {@code {"systemMessage": ""}}),</li>
+     *   <li>the built-in {@value #DEFAULT_SYSTEM_MESSAGE} - the reason this method exists: a fresh
+     *       browser must not start with an empty system prompt.</li>
+     * </ol>
+     *
+     * <p>Note that a blank property is not a value but "not configured": an operator who wants no
+     * system prompt at all writes the empty entry into {@code webui.uiConfig}, which is the channel
+     * meant for a whole settings object.</p>
+     *
+     * <p>Package-private so the unit test can drive the decision without a running application.</p>
+     *
+     * @param uiSettings the settings built so far (the {@code uiConfig} entries are already in it)
+     * @return the prompt to serve, never {@code null}
+     */
+    String resolveSystemMessage(ObjectNode uiSettings) {
+        if (systemMessage != null && !systemMessage.isBlank()) {
+            return systemMessage.trim();
+        }
+        JsonNode configured = uiSettings.get(SETTING_SYSTEM_MESSAGE);
+        if (configured != null) {
+            if (configured.isString()) {
+                return configured.asString();
+            }
+            LOG.warn("{} must be a string, ignoring it (value: {}); the built-in default system prompt"
+                    + " is shipped instead", SETTING_SYSTEM_MESSAGE, configured);
+        }
+        return DEFAULT_SYSTEM_MESSAGE;
     }
 
     /**
@@ -386,17 +472,16 @@ public class UiSettings {
     @PostConstruct
     public void logUiSettingsConfig() {
         ObjectNode uiSettings = build();
-        if (uiSettings.isEmpty()) {
-            LOG.debug("No {} / {} configured, the Web UI keeps its own defaults.",
-                    PROP_UI_CONFIG, PROP_CUSTOM_CSS);
-            return;
-        }
         List<String> keys = uiSettings.properties().stream().map(Map.Entry::getKey).toList();
-        LOG.info("Web UI defaults via /props {}={}: {} setting(s), customCss {} chars. They act as"
-                        + " defaults only: a browser with its own stored settings keeps those, they"
-                        + " are applied on the first visit or after 'Reset Settings to Default'.",
+        boolean promptConfigured = systemMessage != null && !systemMessage.isBlank();
+        LOG.info("Web UI defaults via /props {}={}: {} setting(s), customCss {} chars, systemMessage"
+                        + " ({}): \"{}\". They act as defaults only: a browser with its own stored"
+                        + " settings keeps those, they are applied on the first visit or after"
+                        + " 'Reset Settings to Default'.",
                 PROPS_FIELD, keys, keys.size(),
-                customCss == null ? 0 : customCss.length());
+                customCss == null ? 0 : customCss.length(),
+                promptConfigured ? PROP_SYSTEM_MESSAGE : "built-in default",
+                uiSettings.get(SETTING_SYSTEM_MESSAGE).asString());
 
         // The MCP seed is the one setting whose effect an operator cannot see in the browser (it
         // appears in a dialog, and only once), so name the URL that would be shipped. Note that
