@@ -13,8 +13,10 @@ import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -53,7 +55,7 @@ import org.slf4j.LoggerFactory;
  * chunks using a sliding window approach. Each chunk is embedded separately, and all resulting
  * vectors are stored along with their character offset intervals.
  */
-public class EmbeddingClient {
+public class EmbeddingClient implements EmbeddingModel {
 
     /** Logger instance. */
     private static final Logger LOG = LoggerFactory.getLogger(EmbeddingClient.class);
@@ -66,6 +68,12 @@ public class EmbeddingClient {
 
     /** Model name to use for embedding computation. */
     private final String model;
+
+    /** Optional bearer token sent to the endpoint ({@code null}: a placeholder is sent). */
+    private final String apiKey;
+
+    /** Connect and read timeout of the embedding calls. */
+    private final Duration requestTimeout;
 
     /** Shared HTTP client for API calls. */
     private final HttpClient httpClient;
@@ -98,9 +106,44 @@ public class EmbeddingClient {
      * @param model the model name to use for embedding computation (e.g. {@code "nomic-embed-text-v1.5"})
      */
     public EmbeddingClient(String url, String model) {
-        this.url = url;
-        this.model = model;
-        this.httpClient = HttpClient.newHttpClient();
+        this(url, model, null, Duration.ofSeconds(20));
+    }
+
+    /**
+     * Constructs a client with an explicit API key and timeout.
+     *
+     * @param url            the URL of the OpenAI-compatible embedding API
+     * @param model          the model name
+     * @param apiKey         the bearer token, or {@code null}
+     * @param requestTimeout connect and read timeout of the calls
+     */
+    public EmbeddingClient(String url, String model, String apiKey, Duration requestTimeout) {
+        if (url == null || url.isBlank()) {
+            throw new IllegalArgumentException("EmbeddingClient: url must not be null or blank");
+        }
+        if (model == null || model.isBlank()) {
+            throw new IllegalArgumentException("EmbeddingClient: model must not be null or blank");
+        }
+        this.url = url.trim();
+        this.model = model.trim();
+        this.apiKey = (apiKey == null || apiKey.isBlank()) ? null : apiKey.trim();
+        this.requestTimeout = requestTimeout != null ? requestTimeout : Duration.ofSeconds(20);
+        this.httpClient = HttpClient.newBuilder()
+                .connectTimeout(this.requestTimeout)
+                .build();
+    }
+
+    /**
+     * Returns the loaded entries of the database, in insertion (file) order.
+     * <p>
+     * Package-private read access for {@link RAGProviderCSV}, so that a CSV source does
+     * not have to duplicate the line parser of this class.
+     * </p>
+     *
+     * @return an unmodifiable view of the entries
+     */
+    Map<String, Entry> entries() {
+        return Collections.unmodifiableMap(new LinkedHashMap<>(entries));
     }
 
     // ---- Configuration of chunking parameters ----
@@ -402,6 +445,27 @@ public class EmbeddingClient {
     }
 
     /**
+     * Computes the embedding of a text and packages it as a chunk.
+     * <p>
+     * This is the {@link EmbeddingModel} seam used by a RAG search: the query is
+     * embedded once per search, and a test can replace it with a fake.
+     * </p>
+     *
+     * @param id   the caller-defined identifier of the text (carried into the chunk)
+     * @param text the text to embed
+     * @return the chunk with the vector, the model name and the prompt token count
+     * @throws IOException if an I/O error occurs during the API call
+     */
+    @Override
+    public EmbeddingChunk computeEmbedding(String id, String text) throws IOException {
+        String chunkId = (id == null || id.isBlank()) ? "embedding" : id;
+        String content = text == null ? "" : text;
+        EmbeddingResult result = computeEmbedding(content);
+        return new EmbeddingChunk(chunkId, 0, content.length(), result.promptTokens(), model,
+                result.embedding(), null, Map.of());
+    }
+
+    /**
      * Computes an embedding vector for the given text by calling the OpenAI-compatible API.
      *
      * @param text the input text to embed
@@ -417,8 +481,9 @@ public class EmbeddingClient {
         try {
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(url))
+                    .timeout(requestTimeout)
                     .header("Content-Type", "application/json")
-                    .header("Authorization", "Bearer no-key")
+                    .header("Authorization", "Bearer " + (apiKey != null ? apiKey : "no-key"))
                     .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
                     .build();
 

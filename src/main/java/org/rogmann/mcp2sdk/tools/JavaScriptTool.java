@@ -31,6 +31,7 @@ import org.rogmann.mcp2sdk.js.JsM2Bridge;
 import org.rogmann.mcp2sdk.js.JsMcpProxyBridge;
 import org.rogmann.mcp2sdk.js.JsModuleInterface;
 import org.rogmann.mcp2sdk.js.JsPdfBridge;
+import org.rogmann.mcp2sdk.js.JsRagBridge;
 import org.rogmann.mcp2sdk.js.JsSearchBridge;
 import org.rogmann.mcp2sdk.js.JsSQLiteBridge;
 import org.rogmann.mcp2sdk.js.JsXmlBridge;
@@ -128,6 +129,18 @@ public class JavaScriptTool {
     /** Maximum length of an exception message (suffix, longer messages can be clipped) */
     private static final int MAX_EXCEPTION_MESSAGE_TAIL = 400;
 
+    /**
+     * Upper bound of the help hint appended to a JavaScript error.
+     * <p>
+     * The hint travels with every error; a hint longer than the error it explains is noise (and
+     * costs tokens in every retry of a correction loop).
+     * </p>
+     */
+    private static final int MAX_HINT_CHARS = 300;
+
+    /** How many module help tips the hint names at most (the ones the error mentions). */
+    private static final int MAX_HINT_MODULES = 3;
+
     /** Counter for readable worker thread names. */
     private static final AtomicInteger THREAD_COUNTER = new AtomicInteger();
 
@@ -209,6 +222,15 @@ public class JavaScriptTool {
         // display paths ('report.docx#word/media/image1.png', read per level from memory) or raw
         // bytes. Disable with -Dmcp.js.image.enabled=false.
         modules.put("image", new JsImageBridge());
+        // Semantic search in the RAG sources registered on the server (docs/js/rag.md):
+        // the query is embedded once, the chunks of the sources of a topic (or of one named
+        // source) are scored by cosine similarity, and the best n hits are returned with
+        // their provenance (provider, title, source URL) and text. Registered sources are a
+        // server-side configuration (mcp.rag.sources, mcp.rag.embedding.*) - the sandbox
+        // itself opens no connection, the module only calls the endpoints the server names.
+        // Sources are loaded lazily on the first search; -Dmcp.rag.enabled=false hides the
+        // module entirely.
+        modules.put("rag", new JsRagBridge());
         // The message board of a running prefix_fork batch (docs/subagent.md §14). Two switches,
         // on purpose: the property names it in the tool description at all (off by default), and
         // the caller decides whether anything is bound - a script outside a fork thread has no
@@ -958,8 +980,12 @@ public class JavaScriptTool {
                 return buildTimeoutResult(e, sourceName, timeoutSeconds, baosOut);
             }
             StringBuilder sbMsg = new StringBuilder("Error during JavaScript execution: ");
-            sbMsg.append(shortenMessage(e.getMessage()));
+            String thrownMessage = shortenMessage(e.getMessage());
+            sbMsg.append(thrownMessage);
             String identifierHint = GraalProxies.unknownIdentifierHint(e.getMessage(), MODULE_MEMBERS);
+            // The stable code goes before the details: a caller can branch on it instead of
+            // matching the prose (docs/js/modules.md, 'Error codes').
+            sbMsg.append("\nError code: ").append(errorCode(e, identifierHint));
             if (!identifierHint.isEmpty()) {
                 sbMsg.append('\n').append(identifierHint);
             }
@@ -968,15 +994,21 @@ public class JavaScriptTool {
                     sbMsg.append("\nThe script contains a JavaScript syntax error.");
                 }
                 if (pe.isHostException() && pe.asHostException() != null) {
-                    // Unwrap to show the original user-facing message (e.g. from fs.*/poi.*).
-                    sbMsg.append("\nRoot cause: ").append(shortenMessage(pe.asHostException().getMessage()));
+                    // Unwrap to show the original user-facing message (e.g. from fs.*/poi.*) - but
+                    // only when it says something new: GraalVM's wrapper repeats the host message,
+                    // and printing a 400-character message twice costs the reader the whole message
+                    // for nothing.
+                    String cause = shortenMessage(pe.asHostException().getMessage());
+                    if (!thrownMessage.contains(cause)) {
+                        sbMsg.append("\nRoot cause: ").append(cause);
+                    }
                 }
                 if (pe.getSourceLocation() != null) {
                     SourceSection loc = pe.getSourceLocation();
                     sbMsg.append(String.format("\nSource location: (line %d, column %d)",
                             loc.getStartLine(), loc.getStartColumn()));
                 }
-                sbMsg.append(buildHint());
+                sbMsg.append(buildHint(e.getMessage()));
             }
             String errorMessage = sbMsg.toString();
             // The exception (and with it the Java stack trace, GraalVM also prints the JavaScript
@@ -1087,6 +1119,7 @@ public class JavaScriptTool {
         StringBuilder sb = new StringBuilder("Error during JavaScript execution: The script was "
                 + "cancelled because it exceeded its timeout of " + timeoutSeconds + " s (source: "
                 + sourceName + ").");
+        sb.append("\nError code: ").append(JsErrorCode.JS_TIMEOUT);
         sb.append("\nIt probably contains an endless loop, recurses without end or computes far "
                 + "too much.");
         if (cause instanceof PolyglotException pe) {
@@ -1246,37 +1279,102 @@ public class JavaScriptTool {
     }
 
     /**
-     * Builds a help-hint for JavaScript error messages from the enabled,
-     * require()-aliasable modules.
-     * @return the hint text (starting with a newline and "Hint: ")
+     * The stable error code of a failed JavaScript call (see {@link JsErrorCode}).
+     * <p>
+     * Precedence: the code a user-facing exception carries, then the shapes GraalVM can classify
+     * itself (syntax error, unknown identifier, host exception). An
+     * {@link IllegalArgumentException} becomes {@code ARGUMENT_INVALID} - that is the JVM
+     * convention every module of this server follows for a runtime argument check, and it covers
+     * the checks that predate the codes.
+     * </p>
+     * @param e the exception that ended the call
+     * @param identifierHint the "did you mean" hint (empty when the identifier is known)
+     * @return the code, never null
      */
-    private String buildHint() {
-        List<String> tips = new ArrayList<>();
-        List<String> names = new ArrayList<>();
-        for (JsModuleInterface m : modules.values()) {
-            if (m.isEnabled() && m.hasRequireAlias()) {
-                tips.add(m.getHelpTip());
-                names.add(m.getNamespace());
+    private static String errorCode(Throwable e, String identifierHint) {
+        if (e instanceof JsErrorCode coded) {
+            return coded.getCode();
+        }
+        if (e instanceof IllegalArgumentException) {
+            return JsErrorCode.ARGUMENT_INVALID;
+        }
+        if (e instanceof PolyglotException pe) {
+            if (pe.isSyntaxError()) {
+                return JsErrorCode.JS_SYNTAX_ERROR;
+            }
+            if (pe.isHostException() && pe.asHostException() != null) {
+                Throwable host = pe.asHostException();
+                if (host instanceof JsErrorCode hostCoded) {
+                    return hostCoded.getCode();
+                }
+                return host instanceof IllegalArgumentException
+                        ? JsErrorCode.ARGUMENT_INVALID : JsErrorCode.USER_ERROR;
+            }
+            if (!identifierHint.isEmpty() || isNotDefined(pe)) {
+                return JsErrorCode.JS_UNKNOWN_IDENTIFIER;
             }
         }
-        StringBuilder sb = new StringBuilder("\nHint: Use ");
-        if (tips.size() == 1) {
-            sb.append(tips.get(0));
-        } else if (tips.size() >= 2) {
-            sb.append(String.join(", ", tips.subList(0, tips.size() - 1)));
-            sb.append(" or ").append(tips.get(tips.size() - 1));
+        return JsErrorCode.JS_SCRIPT_ERROR;
+    }
+
+    /**
+     * Whether the guest failed on a name that does not exist (a {@code ReferenceError}).
+     * <p>
+     * The "did you mean" hint only fires when the name is close to something the sandbox knows;
+     * a name that is far from every module member would otherwise fall through to the generic
+     * script error, although "this name does not exist here" is exactly what it is.
+     * </p>
+     * @param pe the guest exception
+     * @return true for a {@code … is not defined} error
+     */
+    private static boolean isNotDefined(PolyglotException pe) {
+        String message = pe.getMessage();
+        return message != null && message.contains("is not defined");
+    }
+
+    /**
+     * Builds a short help-hint for a JavaScript error message.
+     * <p>
+     * The hint names only the modules the message mentions (a usage error of {@code search.grep}
+     * gets the search tip, not all of them) and otherwise stays a one-liner. The previous form
+     * concatenated the tips of every enabled module - with 23 modules that was well over a
+     * thousand characters on <em>every</em> error, longer than the error itself and repeated on
+     * each retry of a correction loop. The full list lives in the tool description, where it is
+     * read once instead of on every failure.
+     * </p>
+     * @param message the error message (may be null)
+     * @return the hint text (starting with a newline and "Hint: "), at most
+     *         {@link #MAX_HINT_CHARS} characters
+     */
+    private String buildHint(String message) {
+        List<String> tips = new ArrayList<>();
+        for (JsModuleInterface m : modules.values()) {
+            if (!m.isEnabled() || !m.hasRequireAlias()) {
+                continue;
+            }
+            if (message != null && message.contains(m.getNamespace() + ".")) {
+                tips.add(m.getHelpTip());
+                if (tips.size() >= MAX_HINT_MODULES) {
+                    break;
+                }
+            }
         }
-        sb.append(". The script runs in a sandboxed GraalVM JS context "
-                + "(no Node.js require for arbitrary packages, no process, no Buffer, "
-                + "no network; '.js' project files can be loaded with "
-                + "require('./file.js') or load('./file.js')); ");
-        if (names.isEmpty()) {
-            sb.append("no modules are bound globally.");
+        StringBuilder sb = new StringBuilder("\nHint: ");
+        if (tips.isEmpty()) {
+            sb.append("Only the modules this tool binds exist (no Node.js require for arbitrary"
+                    + " packages, no process, no network of the script itself); each one answers"
+                    + " <name>.help(), e.g. fs.help(), and the tool description lists them all.");
         } else {
-            sb.append("'").append(String.join("', '", names))
-              .append("' are bound globally.");
+            sb.append("Use ").append(String.join(", ", tips))
+              .append(". Sandboxed GraalVM JS: no Node.js, no process, no network of the script"
+                      + " itself (modules may call the endpoints the server configured); project"
+                      + " files load with load('./file.js').");
         }
-        return sb.toString();
+        String hint = sb.toString();
+        if (hint.length() > MAX_HINT_CHARS) {
+            hint = hint.substring(0, MAX_HINT_CHARS - 3) + "...";
+        }
+        return hint;
     }
 
     /**

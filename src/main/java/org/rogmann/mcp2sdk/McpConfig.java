@@ -18,6 +18,7 @@ import org.rogmann.mcp2sdk.image.ImageLimits;
 import org.rogmann.mcp2sdk.image.JsImage;
 import org.rogmann.mcp2sdk.image.VisionClient;
 import org.rogmann.mcp2sdk.m2.PomWatch;
+import org.rogmann.mcp2sdk.rag.RagConfiguration;
 import org.rogmann.mcp2sdk.review.ReviewStore;
 import org.rogmann.mcp2sdk.security.McpLockdownFilter;
 import org.rogmann.mcp2sdk.security.WebUiSessionFilter;
@@ -212,6 +213,17 @@ public class McpConfig {
                 }));
 
         registry.registerToolDefinition(GlossaryTool.createToolInstance());
+
+        // Skills of the workspace (docs/skills.md): only when a skills directory exists - an empty
+        // tool would cost tokens in every request and answer nothing.
+        if (SkillsTool.isAvailable()) {
+            registry.registerToolDefinition(SkillsTool.createToolInstance());
+        }
+
+        // RAG sources and their embedding endpoint (docs/js/rag.md): the limits are resolved
+        // once and strictly, the source registry and the embedding client are configured here,
+        // the vectors are loaded lazily on the first rag.search().
+        RagConfiguration.apply(environment);
 
         registry.registerToolDefinition(JavaScriptTool.createToolInstance());
 
