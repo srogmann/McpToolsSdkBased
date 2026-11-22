@@ -512,6 +512,16 @@ function itemBounds(item) {
     // The exact text extent needs the font; use a conservative estimate around the anchor.
     var estimated = item.text.length * item.size * 0.62;
     var half = item.anchor === 'middle' ? estimated / 2 : (item.anchor === 'end' ? estimated : 0);
+    if (item.rotation === 90) {
+      // A label rotated clockwise runs downwards: the length is in y, not in x.
+      return [item.x - item.size, item.y - half, item.x + item.size * 0.3,
+        item.y - half + estimated];
+    }
+    if (item.rotation === 270) {
+      // ... and counter-clockwise it runs upwards.
+      return [item.x - item.size, item.y - estimated + half, item.x + item.size * 0.3,
+        item.y + half];
+    }
     return [item.x - half, item.y - item.size, item.x - half + estimated, item.y + item.size * 0.3];
   }
   if (item.points && item.points.length && item.curve) {
@@ -619,6 +629,42 @@ function orient(scene, direction, box) {
 }
 
 /**
+ * Rotates a whole scene by a right angle and re-normalises it.
+ * <p>
+ * The rotation is about the drawing's own centre, so the result is the same picture turned - the
+ * items keep their relation to each other. It is the answer to "this diagram is wide, put it on a
+ * portrait page" when the page is shared with text and {@code orientation: 'landscape'} is not an
+ * option: the drawing becomes tall, and {@code fit()} then measures the rotated scene.
+ * </p>
+ * <p>
+ * The label of a node turns with the drawing (a text item carries {@code rotation}, which the SVG
+ * and the PDF backend both write). The title of a group band does not: it is placed in the corner
+ * of the band as before, so a rotated subgraph keeps a readable caption - turning it would put it
+ * along the band's edge, where it runs out of the band.
+ * </p>
+ * @param {object} scene the scene (modified)
+ * @param {number} degrees 0, 90, 180 or 270 (clockwise on screen)
+ * @param {number} [padding] the margin {@link normalize} leaves (default 8)
+ * @returns {object} the scene
+ */
+function rotate(scene, degrees, padding) {
+  var deg = normalizeRotation(degrees);
+  if (deg !== 0) {
+    var box = bounds(scene.items);
+    if (!box.empty) {
+      var sumX = box.minX + box.maxX;
+      var sumY = box.minY + box.maxY;
+      for (var i = 0; i < scene.items.length; i++) {
+        rotateItem(scene.items[i], deg, sumX, sumY);
+      }
+    }
+    normalize(scene, padding);
+  }
+  scene.rotation = deg;
+  return scene;
+}
+
+/**
  * Mirrors one item vertically about {@code y = sum / 2}.
  * @param {object} item the item
  * @param {number} sum the sum of the drawing's min and max y
@@ -656,6 +702,53 @@ function flipX(item, sum) {
       item.points[p][0] = sum - item.points[p][0];
     }
   }
+}
+
+/**
+ * Rotates one item by 90, 180 or 270 degrees around the drawing's bounds.
+ * <p>
+ * Only right angles are needed: they keep every box axis-parallel, so a rect stays a rect (with
+ * swapped width and height), an ellipse keeps rx/ry, and text stays text - it only carries a
+ * {@code rotation} that both backends honour. Anything else would turn boxes into polygons and
+ * ellipses into bezier paths, i.e. into a different drawing.
+ * </p>
+ * @param {object} item the item (modified)
+ * @param {number} deg 90 | 180 | 270
+ * @param {number} sumX the sum of the drawing's min and max x
+ * @param {number} sumY the sum of the drawing's min and max y
+ */
+function rotateItem(item, deg, sumX, sumY) {
+  if (deg === 90) {
+    swapXY(item);
+    flipY(item, sumX);
+  } else if (deg === 180) {
+    flipX(item, sumX);
+    flipY(item, sumY);
+  } else {
+    swapXY(item);
+    flipX(item, sumY);
+  }
+  if (item.kind === 'text') {
+    item.rotation = ((item.rotation || 0) + deg) % 360;
+  }
+}
+
+/**
+ * Normalizes a rotation to 0, 90, 180 or 270 degrees.
+ * @param {number} degrees the requested rotation
+ * @returns {number} the normalized rotation
+ * @throws {Error} for anything that is not a right angle
+ */
+function normalizeRotation(degrees) {
+  if (typeof degrees !== 'number' || !isFinite(degrees)) {
+    throw new Error('diagram: rotate needs a number of degrees, but was: ' + String(degrees));
+  }
+  var deg = ((Math.round(degrees) % 360) + 360) % 360;
+  if (deg % 90 !== 0) {
+    throw new Error('diagram: rotate supports 0, 90, 180 and 270 degrees (a right angle keeps '
+      + 'boxes axis-parallel), but was: ' + degrees);
+  }
+  return deg;
 }
 
 /**
@@ -989,6 +1082,7 @@ module.exports = {
   translate: translate,
   normalize: normalize,
   orient: orient,
+  rotate: rotate,
   round: round,
   nodeCentres: nodeCentres,
   diff: diff

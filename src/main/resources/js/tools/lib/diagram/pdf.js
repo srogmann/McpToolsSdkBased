@@ -388,18 +388,19 @@ function emitGroup(item, dx, dy, font, widthOf, out, pageHeight) {
 function emitText(item, dx, dy, font, defaultColor, widthOf, out) {
   var size = item.size || 10;
   var width = widthOf(item.text, size);
-  var x = item.x + dx;
-  if (item.anchor === 'middle') {
-    x -= width / 2;
-  } else if (item.anchor === 'end') {
-    x -= width;
-  }
-  var y = item.y + dy;
+  // The anchor is an offset ALONG the text line - with a rotated label that is not the x axis
+  // (a middle-anchored 90-degree label has to move up by half its width, not left).
+  var shift = item.anchor === 'middle' ? width / 2 : (item.anchor === 'end' ? width : 0);
+  var angle = (item.rotation || 0) * Math.PI / 180;
+  var x = item.x + dx - shift * Math.cos(angle);
+  var y = item.y + dy - shift * Math.sin(angle);
   if (item.baseline !== 'alphabetic') {
     // The scene places a middle-anchored line by its vertical centre; text.put wants a baseline.
-    y += size * 0.35;
+    // That is a step down the glyph axis, which a turned label takes sideways.
+    x += size * 0.35 * -Math.sin(angle);
+    y += size * 0.35 * Math.cos(angle);
   }
-  out.push({
+  var op = {
     op: 'text.put',
     space: 'page',
     x: round(x),
@@ -408,7 +409,22 @@ function emitText(item, dx, dy, font, defaultColor, widthOf, out) {
     font: font,
     size: size,
     color: item.fill || defaultColor
-  });
+  };
+  if (item.rotation) {
+    op.rotate = pdfRotation(item.rotation);
+  }
+  out.push(op);
+}
+
+/**
+ * Converts a scene rotation (clockwise on screen, y downwards) into the value {@code text.put}
+ * expects (degrees counterclockwise on the page, y upwards): the vertical mirror between the two
+ * spaces reverses the sense, so the sign flips.
+ * @param {number} deg the scene rotation (90, 180 or 270)
+ * @returns {number} the rotation for {@code text.put}
+ */
+function pdfRotation(deg) {
+  return 360 - deg;
 }
 
 /**

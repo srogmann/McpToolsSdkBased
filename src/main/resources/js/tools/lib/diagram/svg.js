@@ -230,6 +230,12 @@ function renderText(item) {
   if (item.bold) {
     attrs += ' font-weight="bold"';
   }
+  if (item.rotation) {
+    // Right angles only (scene.rotate): the anchor stays where it is, the line turns around it.
+    // SVG counts clockwise, which is the sense scene.rotate documents.
+    attrs += ' transform="rotate(' + round(item.rotation) + ' ' + round(item.x) + ' '
+      + round(item.y) + ')"';
+  }
   return '<text ' + attrs + '>' + escapeXml(item.text) + '</text>';
 }
 

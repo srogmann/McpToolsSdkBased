@@ -4,6 +4,9 @@ import org.apache.poi.sl.draw.DrawPaint;
 import org.apache.poi.sl.usermodel.PaintStyle;
 import org.apache.poi.sl.usermodel.PlaceableShape;
 import org.apache.poi.sl.usermodel.ShapeType;
+import org.apache.poi.sl.usermodel.StrokeStyle;
+import org.apache.poi.sl.usermodel.TextParagraph;
+import org.apache.poi.sl.usermodel.VerticalAlignment;
 import org.openxmlformats.schemas.drawingml.x2006.main.CTLineEndProperties;
 import org.openxmlformats.schemas.drawingml.x2006.main.CTLineProperties;
 import org.openxmlformats.schemas.drawingml.x2006.main.CTShapeProperties;
@@ -39,6 +42,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -614,19 +618,41 @@ public class PptxToolBox {
 
     /**
      * Creates an arrow line from a start point to an end point.
-     * <p>
-     * The line is drawn as a {@code LINE} auto shape spanning the bounding box of the two
-     * points, with horizontal/vertical flips applied so that it always points from
-     * {@code (x1,y1)} to {@code (x2,y2)}, plus an arrowhead at the end.
-     * </p>
      * @param slideHandle slide handle
      * @param x1 start x
      * @param y1 start y
      * @param x2 end x
      * @param y2 end y
      * @return shape handle
+     * @see #createLine(String, double, double, double, double, boolean)
      */
     public String createLine(String slideHandle, double x1, double y1, double x2, double y2) {
+        return createLine(slideHandle, x1, y1, x2, y2, true);
+    }
+
+    /**
+     * Creates a line from a start point to an end point, with or without an arrowhead.
+     * <p>
+     * The line is drawn as a {@code LINE} auto shape spanning the bounding box of the two
+     * points, with horizontal/vertical flips applied so that it always points from
+     * {@code (x1,y1)} to {@code (x2,y2)}.
+     * </p>
+     * <p>
+     * {@code arrow=false} is what a drawer of its own arrowheads needs: the diagram module
+     * ({@code diagram/pptx.js}) draws a routed edge as a chain of segments and puts one triangle
+     * of its own at the end - an arrowhead on every segment would put a head in the middle of the
+     * line.
+     * </p>
+     * @param slideHandle slide handle
+     * @param x1 start x
+     * @param y1 start y
+     * @param x2 end x
+     * @param y2 end y
+     * @param arrow true to put a triangle arrowhead at the end, false for a bare line
+     * @return shape handle
+     */
+    public String createLine(String slideHandle, double x1, double y1, double x2, double y2,
+            boolean arrow) {
         XSLFSlide slide = getSlide(slideHandle);
         requireCoord(x1, "x1");
         requireCoord(y1, "y1");
@@ -642,6 +668,9 @@ public class PptxToolBox {
         // A LINE shape draws from top-left to bottom-right by default; flips reverse the direction.
         shape.setFlipHorizontal(dx < 0);
         shape.setFlipVertical(dy < 0);
+        if (!arrow) {
+            return registerShape(shape, slideShow.get(slideHandle));
+        }
         // Arrowhead at the end of the line (set directly in the XML a:ln/a:tailEnd)
         CTShape ct = (CTShape) shape.getXmlObject();
         CTShapeProperties spPr = ct.getSpPr();
@@ -697,7 +726,7 @@ public class PptxToolBox {
     }
 
     /**
-     * Changes the geometry of an auto shape (e.g. "RECT", "OVAL", "ROUND_RECT").
+     * Changes the geometry of an auto shape (e.g. "RECT", "ELLIPSE", "ROUND_RECT").
      * @param shapeHandle shape handle
      * @param typeName geometry type name
      */
@@ -708,10 +737,11 @@ public class PptxToolBox {
                     "Shape is not an auto shape (geometry cannot be changed): " + shapeHandle);
         }
         try {
-            auto.setShapeType(ShapeType.valueOf(typeName.trim().toUpperCase().replace('-', '_')));
+            auto.setShapeType(ShapeType.valueOf(typeName.trim().toUpperCase(Locale.ROOT)
+                    .replace('-', '_')));
         } catch (IllegalArgumentException e) {
             throw new PoiUserRuntimeException("Unknown shape geometry: '" + typeName + "'. "
-                    + "Known types include e.g. RECT, ROUND_RECT, OVAL, LINE.");
+                    + "Known types include e.g. RECT, ROUND_RECT, ELLIPSE, TRIANGLE, LINE.");
         }
     }
 
@@ -762,6 +792,153 @@ public class PptxToolBox {
         XSLFSimpleShape simple = asSimple(shapeHandle);
         requireNumber(width, 0.0, MAX_LINE_WIDTH_PT, "line width (pt)");
         simple.setLineWidth(width);
+    }
+
+    /**
+     * Sets the fill and the outline of a shape in one call, including "none" for both.
+     * <p>
+     * The three separate setters above ({@link #setShapeFillColor}, {@link #setShapeLineColor},
+     * {@link #setShapeLineWidth}) cannot express "no fill" or "no outline": a drawer that wants a
+     * frame without a background (a diagram edge, a label) would have to paint it white and would
+     * then hide whatever lies behind it. An empty colour string means "no fill" resp. "no
+     * outline" - that is the convention of this call, and it is why the argument is a string and
+     * not a {@code Color}.
+     * </p>
+     * @param shapeHandle shape handle
+     * @param fillHex fill colour ("729FCF" or "#729FCF"), empty for no fill
+     * @param lineHex outline colour, empty for no outline
+     * @param widthPt outline width in points, 0.0 .. 500.0 (ignored without an outline colour)
+     * @param dashName line dash: "solid", "dot", "dash", "dash_dot", "lg_dash", "lg_dash_dot",
+     *        "lg_dash_dot_dot" (empty or null means "solid")
+     */
+    public void setShapeStyle(String shapeHandle, String fillHex, String lineHex, double widthPt,
+            String dashName) {
+        XSLFSimpleShape simple = asSimple(shapeHandle);
+        XSLFShape shape = simple;
+        if (isBlank(fillHex)) {
+            setNoFill(shape);
+        } else {
+            CTShapeProperties spPr = shapeProperties(shape);
+            if (spPr.isSetNoFill()) {
+                spPr.unsetNoFill();
+            }
+            simple.setFillColor(PoiColorUtil.parseHexColor(fillHex));
+        }
+        if (isBlank(lineHex)) {
+            setNoLine(shape);
+            return;
+        }
+        CTLineProperties ln = lineProperties(shape);
+        if (ln.isSetNoFill()) {
+            ln.unsetNoFill();
+        }
+        requireNumber(widthPt, 0.0, MAX_LINE_WIDTH_PT, "line width (pt)");
+        simple.setLineColor(PoiColorUtil.parseHexColor(lineHex));
+        simple.setLineWidth(widthPt);
+        simple.setLineDash(dashOf(dashName));
+    }
+
+    /**
+     * Sets the horizontal alignment of every paragraph of a text shape.
+     * @param shapeHandle shape handle of a text shape
+     * @param align "left", "center", "right" or "justify"
+     */
+    public void setShapeTextAlign(String shapeHandle, String align) {
+        XSLFTextShape textShape = asTextShapeChecked(shapeHandle);
+        TextParagraph.TextAlign value = textAlignOf(align);
+        for (XSLFTextParagraph paragraph : textShape.getTextParagraphs()) {
+            paragraph.setTextAlign(value);
+        }
+    }
+
+    /**
+     * Sets the vertical anchoring of the text inside its shape.
+     * @param shapeHandle shape handle of a text shape
+     * @param anchor "top", "center" or "bottom"
+     */
+    public void setShapeVerticalAlign(String shapeHandle, String anchor) {
+        XSLFTextShape textShape = asTextShapeChecked(shapeHandle);
+        textShape.setVerticalAlignment(verticalAlignOf(anchor));
+    }
+
+    /**
+     * Sets the inner distances of a text shape (the space between the edge of the shape and its
+     * text).
+     * <p>
+     * DrawingML has defaults (0.1 inch left and right, 0.05 inch top and bottom, i.e. 7.2 and
+     * 3.6 pt). A caller that computes a box <b>around a string</b> - {@code diagram/pptx.js} does
+     * exactly that - has to be able to say "no inner distance": otherwise the text area is 14.4 pt
+     * narrower than the box, and a label that fits its box is wrapped by PowerPoint into two lines
+     * ("Web" / "UI"). With zero insets the box is the text area, and the centring a caller computed
+     * is what the reader sees.
+     * </p>
+     * @param shapeHandle shape handle of a text shape
+     * @param left left inset in points, 0.0 .. 1000000.0
+     * @param right right inset in points
+     * @param top top inset in points
+     * @param bottom bottom inset in points
+     */
+    public void setShapeTextInsets(String shapeHandle, double left, double right, double top,
+            double bottom) {
+        XSLFTextShape textShape = asTextShapeChecked(shapeHandle);
+        requireNumber(left, 0.0, MAX_SIZE_PT, "left inset (pt)");
+        requireNumber(right, 0.0, MAX_SIZE_PT, "right inset (pt)");
+        requireNumber(top, 0.0, MAX_SIZE_PT, "top inset (pt)");
+        requireNumber(bottom, 0.0, MAX_SIZE_PT, "bottom inset (pt)");
+        textShape.setLeftInset(left);
+        textShape.setRightInset(right);
+        textShape.setTopInset(top);
+        textShape.setBottomInset(bottom);
+    }
+
+    /**
+     * Whether the text of a shape may wrap at the width of the shape.
+     * <p>
+     * {@code wrap=false} keeps a label on one line, whatever the width of the box: it overflows
+     * symmetrically instead of being broken. For a one-line label (a diagram node, an edge name)
+     * that is the safer setting - a wrong estimate of the string width then costs a little overlap,
+     * not a two-line label in a box that has room for one line.
+     * </p>
+     * @param shapeHandle shape handle of a text shape
+     * @param wrap true to wrap at the shape's width, false to keep one line
+     */
+    public void setShapeWordWrap(String shapeHandle, boolean wrap) {
+        XSLFTextShape textShape = asTextShapeChecked(shapeHandle);
+        textShape.setWordWrap(wrap);
+    }
+
+    /**
+     * Formats the characters of a text shape: size, weight, colour and family, applied to every
+     * run of every paragraph.
+     * <p>
+     * The run setters exist one by one ({@link #setRunFontSize(String, double)} and friends), but
+     * they need run handles that a caller only gets from {@link #getSlides(String)} - i.e. not for
+     * a shape it has just created. This call is the "style this label" shorthand.
+     * </p>
+     * @param shapeHandle shape handle of a text shape
+     * @param sizePt font size in points, 1.0 .. 4000.0
+     * @param bold true for bold
+     * @param colorHex font colour, empty to keep the current one
+     * @param fontFamily font name (e.g. "Arial"), empty to keep the current one
+     */
+    public void setShapeFont(String shapeHandle, double sizePt, boolean bold, String colorHex,
+            String fontFamily) {
+        XSLFTextShape textShape = asTextShapeChecked(shapeHandle);
+        requireNumber(sizePt, MIN_FONT_PT, MAX_FONT_PT, "font size (pt)");
+        var color = isBlank(colorHex) ? null : PoiColorUtil.parseHexColor(colorHex);
+        String family = isBlank(fontFamily) ? null : fontFamily;
+        for (XSLFTextParagraph paragraph : textShape.getTextParagraphs()) {
+            for (XSLFTextRun run : paragraph.getTextRuns()) {
+                run.setFontSize(sizePt);
+                run.setBold(bold);
+                if (color != null) {
+                    run.setFontColor(color);
+                }
+                if (family != null) {
+                    run.setFontFamily(family);
+                }
+            }
+        }
     }
 
     // ========================================================================
@@ -890,11 +1067,29 @@ public class PptxToolBox {
                 pptx.setShapePosition(sp,x,y)   - Move a shape
                 pptx.setShapeSize(sp,w,h)       - Resize a shape
                 pptx.setShapeRotation(sp,deg)   - Rotate a shape
-                pptx.setShapeGeometry(sp,type)  - Set geometry (RECT, OVAL, ROUND_RECT, ...)
+                pptx.setShapeGeometry(sp,type)  - Set geometry (RECT, ROUND_RECT, ELLIPSE, ...)
                 pptx.createLine(slide,x1,y1,x2,y2)- Create an arrow line between two points
+                pptx.createLine(slide,x1,y1,x2,y2,arrow)
+                                                - the same; arrow=false leaves the line bare (a
+                                                  caller that draws its own arrowheads)
                 pptx.setShapeFillColor(sp,c)    - Set filling color of a shape
                 pptx.setShapeLineColor(sp,c)    - Set line (outline) color
                 pptx.setShapeLineWidth(sp,w)    - Set line width in points (0 - 500)
+                pptx.setShapeStyle(sp, fill, line, w, dash)
+                                                - Fill and outline in one call; an empty string
+                                                  means "no fill" resp. "no outline" (the two
+                                                  cannot be expressed with the setters above),
+                                                  dash: solid, dot, dash, dash_dot, lg_dash,
+                                                  lg_dash_dot, lg_dash_dot_dot
+                pptx.setShapeTextAlign(sp,align)      - left | center | right | justify
+                pptx.setShapeVerticalAlign(sp,anchor) - top | center | bottom
+                pptx.setShapeTextInsets(sp,l,r,t,b)   - Inner distances of a text shape in points;
+                                                        DrawingML defaults to 7.2/7.2/3.6/3.6, so a
+                                                        box computed around a string needs 0 0 0 0
+                pptx.setShapeWordWrap(sp,wrap)        - true to wrap at the shape's width, false to
+                                                        keep one line (a one-line label)
+                pptx.setShapeFont(sp,size,bold,colorHex,fontFamily)
+                                                - Format every run of a text shape in one call
                 pptx.removeShape(sp)            - Remove a shape
 
                 --- Run formatting (runs from getSlides) ---
@@ -940,6 +1135,167 @@ public class PptxToolBox {
         requireCoord(y, "y");
         requireNumber(width, 0.0, MAX_SIZE_PT, "width (pt)");
         requireNumber(height, 0.0, MAX_SIZE_PT, "height (pt)");
+    }
+
+    /** The dash names {@link #setShapeStyle} accepts. */
+    private static final List<String> DASH_NAMES = List.of("solid", "dot", "dash", "dash_dot",
+            "lg_dash", "lg_dash_dot", "lg_dash_dot_dot");
+
+    /** Whether a colour/font argument means "the caller did not ask for one". */
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
+    }
+
+    /**
+     * The {@code a:spPr} element of a shape, created when the shape has none.
+     * <p>
+     * "No fill" and "no line" have no setter in POI's slide API ({@code setFillColor} always
+     * writes a colour), so those two are written as the empty fill/line elements of the drawing
+     * schema. The XmlBeans {@code addNew…} calls insert at the position the schema declares, so
+     * the element order stays valid even when an {@code a:ln} already exists.
+     * </p>
+     * @param shape the shape
+     * @return its shape properties
+     */
+    private static CTShapeProperties shapeProperties(XSLFShape shape) {
+        if (!(shape.getXmlObject() instanceof CTShape ct)) {
+            throw new PoiUserRuntimeException(
+                    "Shape has no drawing properties (not a p:sp element): " + shape.getShapeName());
+        }
+        CTShapeProperties spPr = ct.getSpPr();
+        return spPr != null ? spPr : ct.addNewSpPr();
+    }
+
+    /**
+     * The {@code a:ln} element of a shape, created when the shape has none.
+     * @param shape the shape
+     * @return its line properties
+     */
+    private static CTLineProperties lineProperties(XSLFShape shape) {
+        CTShapeProperties spPr = shapeProperties(shape);
+        return spPr.isSetLn() ? spPr.getLn() : spPr.addNewLn();
+    }
+
+    /**
+     * Removes the filling of a shape (it becomes transparent).
+     * @param shape the shape
+     */
+    private static void setNoFill(XSLFShape shape) {
+        CTShapeProperties spPr = shapeProperties(shape);
+        if (spPr.isSetSolidFill()) {
+            spPr.unsetSolidFill();
+        }
+        if (!spPr.isSetNoFill()) {
+            spPr.addNewNoFill();
+        }
+    }
+
+    /**
+     * Removes the outline of a shape.
+     * @param shape the shape
+     */
+    private static void setNoLine(XSLFShape shape) {
+        CTLineProperties ln = lineProperties(shape);
+        if (ln.isSetSolidFill()) {
+            ln.unsetSolidFill();
+        }
+        if (!ln.isSetNoFill()) {
+            ln.addNewNoFill();
+        }
+    }
+
+    /**
+     * The {@link StrokeStyle.LineDash} of a dash name.
+     * <p>
+     * A slide knows dash presets, not a pattern. An unknown name is an error that lists the known
+     * ones, so a caller does not silently get a solid line where it asked for a dotted one.
+     * </p>
+     * @param name the name ("solid", "dot", "dash", "dash_dot", "lg_dash", "lg_dash_dot",
+     *        "lg_dash_dot_dot"); null or blank means "solid"
+     * @return the dash
+     * @throws PoiUserRuntimeException for an unknown name (the message lists the known ones)
+     */
+    private static StrokeStyle.LineDash dashOf(String name) {
+        if (isBlank(name)) {
+            return StrokeStyle.LineDash.SOLID;
+        }
+        String key = name.trim().toLowerCase(Locale.ROOT).replace('-', '_');
+        if (key.startsWith("long_")) {
+            key = "lg_" + key.substring("long_".length());
+        }
+        switch (key) {
+            case "solid":
+                return StrokeStyle.LineDash.SOLID;
+            case "dot":
+            case "dots":
+            case "dotted":
+                return StrokeStyle.LineDash.DOT;
+            case "dash":
+            case "dashed":
+                return StrokeStyle.LineDash.DASH;
+            case "dash_dot":
+                return StrokeStyle.LineDash.DASH_DOT;
+            case "lg_dash":
+                return StrokeStyle.LineDash.LG_DASH;
+            case "lg_dash_dot":
+                return StrokeStyle.LineDash.LG_DASH_DOT;
+            case "lg_dash_dot_dot":
+                return StrokeStyle.LineDash.LG_DASH_DOT_DOT;
+            default:
+                throw new PoiUserRuntimeException("Unknown line dash: '" + name + "' (known: "
+                        + String.join(", ", DASH_NAMES) + ").");
+        }
+    }
+
+    /**
+     * The {@link TextParagraph.TextAlign} of a name.
+     * @param align "left", "center", "right" or "justify"
+     * @return the alignment
+     * @throws PoiUserRuntimeException for an unknown name
+     */
+    private static TextParagraph.TextAlign textAlignOf(String align) {
+        if (isBlank(align)) {
+            return TextParagraph.TextAlign.LEFT;
+        }
+        switch (align.trim().toLowerCase(Locale.ROOT)) {
+            case "left":
+                return TextParagraph.TextAlign.LEFT;
+            case "center":
+            case "centre":
+                return TextParagraph.TextAlign.CENTER;
+            case "right":
+                return TextParagraph.TextAlign.RIGHT;
+            case "justify":
+                return TextParagraph.TextAlign.JUSTIFY;
+            default:
+                throw new PoiUserRuntimeException("Unknown text alignment: '" + align
+                        + "' (known: left, center, right, justify).");
+        }
+    }
+
+    /**
+     * The {@link VerticalAlignment} of a name.
+     * @param anchor "top", "middle" (or "center") or "bottom"
+     * @return the anchoring
+     * @throws PoiUserRuntimeException for an unknown name
+     */
+    private static VerticalAlignment verticalAlignOf(String anchor) {
+        if (isBlank(anchor)) {
+            return VerticalAlignment.TOP;
+        }
+        switch (anchor.trim().toLowerCase(Locale.ROOT)) {
+            case "top":
+                return VerticalAlignment.TOP;
+            case "center":
+            case "centre":
+            case "middle":
+                return VerticalAlignment.MIDDLE;
+            case "bottom":
+                return VerticalAlignment.BOTTOM;
+            default:
+                throw new PoiUserRuntimeException("Unknown vertical alignment: '" + anchor
+                        + "' (known: top, center, bottom).");
+        }
     }
 
     /**

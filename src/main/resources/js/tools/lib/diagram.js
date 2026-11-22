@@ -1,5 +1,5 @@
 /**
- * diagram - parse Mermaid/DOT, lay it out yourself, draw it as SVG (PDF/PPTX later).
+ * diagram - parse Mermaid/DOT, lay it out yourself, draw it as SVG, PDF or PPTX.
  *
  * The facade of the diagram module: {@code parse()} turns text into a model (JSON),
  * {@code layout()} turns a model into a scene (JSON), {@code render()} turns a scene into a string.
@@ -10,10 +10,12 @@
  *     var model = diagram.parse('flowchart LR\n  A --> B');
  *     var scene = diagram.layout(model, {measure: function (r) { return r.text.length * 5; }});
  *     var svg = diagram.render(scene);              // scene → SVG string
+ *     diagram.pptx(scene, {file: 'folien.pptx'});   // scene → shapes on a slide
  *
  * Nothing here knows about a font or a page: text measurement is injected
  * ({@code measure({font, size, text}) -> width}), and the outputs are plain strings/JSON. The one
- * Java component this module needs is the test-only ELK oracle; there is no runtime dependency.
+ * Java component this module needs is the test-only ELK oracle; a PDF is written by {@code pdftext}
+ * and a slide by the {@code pptx} bridge, both on top of this scene.
  *
  * Limits: 300 nodes, 600 edges, 50 groups (depth 8), 50 000 text bytes, a label of 200 characters,
  * 8 ordering sweeps and 5 000 ms per phase. Every overrun is a named error or a note - never a
@@ -31,6 +33,7 @@ var mermaidLib = require('./diagram/parse-mermaid.js');
 var stateLib = require('./diagram/parse-state.js');
 var fitLib = require('./diagram/fit.js');
 var metricLib = require('./diagram/metric.js');
+var pptxLib = require('./diagram/pptx.js');
 
 /** The module version. */
 var VERSION = '0.1.0';
@@ -121,6 +124,11 @@ function layout(model, options) {
 
 /**
  * Renders a scene.
+ * <p>
+ * {@code 'svg'} is the one string format this module writes. A PDF comes out of {@code pdftext}
+ * ({@code doc.diagram(scene)}), a slide out of {@link pptxExport} - both walk the same scene, and
+ * neither is a string.
+ * </p>
  * @param {object|string} scene the scene (or its JSON)
  * @param {object} [options] {format: 'svg', background, title}
  * @returns {string} the rendered document
@@ -132,8 +140,75 @@ function render(scene, options) {
   if (format === 'svg') {
     return svgLib.render(resolved, opts);
   }
-  throw new Error("diagram: unknown output format '" + format + "' (implemented: svg; the PDF"
-    + ' backend is milestone M5, docs/js/diagram-plan.md §10)');
+  throw new Error("diagram: unknown output format '" + format + "' (implemented: svg; for a PDF"
+    + ' use pdftext.diagram(scene), for a slide diagram.pptx(scene, {file}) -'
+    + ' docs/js/diagram-plan.md §10)');
+}
+
+/**
+ * Draws a scene onto a PowerPoint slide - a new file, a new slide or an existing slide.
+ * <p>
+ * The PPTX backend is the one that stays editable: every node box is an auto shape, every routed
+ * edge a chain of line shapes, every label a text box, so a reader of the deck can still move a
+ * box. The drawing is placed with the same arithmetic as a page ({@code fit()}), but against the
+ * slide: it is scaled down until it fits, never enlarged, and the report names the size the
+ * smallest label ends up at.
+ * </p>
+ * <pre>{@code
+ * var scene = diagram.layout(diagram.parse('flowchart LR\n  A --> B'));
+ * diagram.pptx(scene, {file: 'target/diagram.pptx'});                   // a new file
+ * diagram.pptx(scene, {file: 'deck.pptx', mode: 'append'});             // a new slide in it
+ * diagram.pptx(scene, {file: 'deck.pptx', mode: 'slide', slide: 2});    // onto slide 2
+ * // {file, mode, slideNumber, scale, width, height, shapes, lines, labels, skipped,
+ * //  approximations, smallestFont, legible, fits, warning, notes}
+ * }</pre>
+ * @param {object|string} scene the scene (or its JSON)
+ * @param {object} options {file, mode: 'new'|'append'|'slide', slide, saveAs, margin, fit, scale,
+ *        align, valign, widthOf, font}
+ * @returns {object} the report
+ * @throws {Error} without a {@code pptx} namespace in the sandbox, without a file, for an unknown
+ *         mode or a slide that does not exist
+ */
+function pptxExport(scene, options) {
+  return pptxLib.write(scene, options || {});
+}
+
+/**
+ * Draws a scene onto a slide handle the caller already holds (no file is opened or written).
+ * @param {string} slideHandle the slide handle (e.g. from {@code pptx.createBlankSlide(show)})
+ * @param {object|string} scene the scene (or its JSON)
+ * @param {object} [options] {page|pageSize, show, margin, fit, scale, align, valign, widthOf, font}
+ * @returns {object} the report of {@link pptxExport} without the file fields
+ */
+function pptxDraw(slideHandle, scene, options) {
+  return pptxLib.draw(slideHandle, scene, options || {});
+}
+
+/**
+ * The drawing operations a scene becomes on a slide, without a presentation - the inspection call.
+ * <p>
+ * {@code {op: 'shape'|'line'|'text'}} with slide coordinates (already scaled and placed), so a
+ * caller can check what would be drawn, count it, or hand it to a test - without a pptx bridge and
+ * without writing a file.
+ * </p>
+ * @param {object|string} scene the scene (or its JSON)
+ * @param {object} [options] {page: {width, height}, margin, fit, scale, align, valign, widthOf,
+ *        font}
+ * @returns {Array<object>} the operations in drawing order
+ */
+function pptxOps(scene, options) {
+  return pptxLib.ops(scene, options || {});
+}
+
+/**
+ * How a scene is placed on a slide: the factor, the offset and the smallest label.
+ * @param {object|string} scene the scene (or its JSON)
+ * @param {object} [options] {page: {width, height}, margin, fit, scale, align, valign}
+ * @returns {object} {page, textArea, scale, width, height, offsetX, offsetY, fits, smallestFont,
+ *   legible, warning}
+ */
+function pptxPlace(scene, options) {
+  return pptxLib.place(scene, options || {});
 }
 
 /**
@@ -252,12 +327,201 @@ function metric(font, size) {
 }
 
 /**
+ * Rotates a scene by a right angle (the picture, not the page).
+ * <p>
+ * The answer to "this drawing is wide and the page is portrait" when a landscape page is not an
+ * option (the drawing shares the page with text, or the reader turns the sheet). Right angles keep
+ * every box axis-parallel, so nothing is re-laid out: the drawing is turned and re-normalised, and
+ * the labels turn with it (both backends write the rotation). {@code fit()} measures the result as
+ * it is - a wide drawing becomes a tall one, so the scale changes.
+ * </p>
+ * <pre>{@code
+ * var scene = diagram.layout(model);                      // e.g. 720 x 240 pt
+ * var tall  = diagram.rotate(scene, 90);                  // 240 x 720 pt, labels turned
+ * var f     = diagram.fit(tall, {page: 'A4'});            // measured on the rotated scene
+ * }</pre>
+ * @param {object|string} scene the scene (or its JSON)
+ * @param {number} degrees 0, 90, 180 or 270 (clockwise on screen); anything else is an error,
+ *        because a box cannot be a tilted rectangle in this scene format
+ * @returns {object} the rotated scene (a copy - the input is not changed)
+ */
+function rotate(scene, degrees) {
+  var copy = JSON.parse(typeof scene === 'string' ? scene : JSON.stringify(scene));
+  return sceneLib.rotate(copy, degrees);
+}
+
+/**
+ * Turns a node/link contract into Mermaid or DOT source - the front door for a graph that is
+ * already data (a {@code dynsgraph} contract, a JSON export, a query result).
+ * <p>
+ * The layout module reads <em>text</em>; a caller usually has objects. The mapping is mechanical
+ * and deliberately tolerant about the field names, because a contract has its own names for the
+ * same two things:
+ * </p>
+ * <pre>{@code
+ * var src = diagram.fromContract({nodes: [{id: 'MODA', label: 'Modul A'}],
+ *                                 links: [{from: 'MODA', to: 'MODB', label: 'liest'}]});
+ * // 'flowchart LR\n  MODA["Modul A"]\n  MODB["Modul B"]\n  MODA -->|liest| MODB\n'
+ * var scene = diagram.layout(diagram.parse(src));
+ * }</pre>
+ * <p>
+ * node id: {@code id|name|key|nodeId}, node label: {@code label|title|text|name};
+ * link ends: {@code from|source|src|start} and {@code to|target|tgt|end}, link label:
+ * {@code label|text|title|name}. A node that no link mentions is emitted too (an isolated box is
+ * information). Ids are sanitized to {@code [A-Za-z0-9_]} and kept unique, the label is quoted, so
+ * the result parses back with the same names.
+ * </p>
+ * @param {object} graph {nodes: [...], links: [...]} (links may be omitted)
+ * @param {object} [options] {format: 'mermaid' (default)|'dot', direction: 'TB' (default for dot)
+ *        'LR' (default for mermaid), id: 'G' (DOT graph name)}
+ * @returns {string} the source text
+ * @throws {Error} for a missing nodes array, a node without an id or more nodes/links than the
+ *         module's limits allow
+ */
+function fromContract(graph, options) {
+  var opts = options || {};
+  if (graph === null || typeof graph !== 'object') {
+    throw new Error('diagram.fromContract: argument graph must be an object {nodes: [...],'
+      + ' links: [...]}, but was: ' + String(graph));
+  }
+  var nodes = graph.nodes || graph.vertices || graph.knoten;
+  if (!Array.isArray(nodes)) {
+    throw new Error('diagram.fromContract: argument graph.nodes must be an array of '
+      + '{id, label} objects');
+  }
+  var links = graph.links || graph.edges || graph.kanten || [];
+  if (!Array.isArray(links)) {
+    throw new Error('diagram.fromContract: argument graph.links must be an array of '
+      + '{from, to, label} objects');
+  }
+  var caps = limits();
+  if (nodes.length > caps.maxNodes) {
+    throw new Error('diagram.fromContract: ' + nodes.length + ' nodes exceed the limit of '
+      + caps.maxNodes + ' (diagram.limits())');
+  }
+  if (links.length > caps.maxEdges) {
+    throw new Error('diagram.fromContract: ' + links.length + ' links exceed the limit of '
+      + caps.maxEdges + ' (diagram.limits())');
+  }
+  var format = opts.format || 'mermaid';
+  if (format !== 'mermaid' && format !== 'dot') {
+    throw new Error("diagram.fromContract: option 'format' must be 'mermaid' or 'dot', but was: '"
+      + format + "'");
+  }
+  var ids = {};
+  var names = {};
+  var order = [];
+  function register(raw, label) {
+    var key = String(raw);
+    if (ids[key] !== undefined) {
+      return ids[key];
+    }
+    var safe = sanitizeId(key);
+    var unique = safe;
+    for (var n = 2; names[unique] !== undefined; n++) {
+      unique = safe + '_' + n;
+    }
+    ids[key] = unique;
+    names[unique] = true;
+    order.push({name: unique, label: label === undefined || label === null ? '' : String(label)});
+    return unique;
+  }
+  for (var i = 0; i < nodes.length; i++) {
+    var node = nodes[i];
+    if (node === null || typeof node !== 'object') {
+      throw new Error('diagram.fromContract: graph.nodes[' + i + '] must be an object with an id');
+    }
+    var raw = node.id !== undefined ? node.id : (node.name !== undefined ? node.name
+      : (node.key !== undefined ? node.key : node.nodeId));
+    if (raw === undefined || raw === null || String(raw) === '') {
+      throw new Error('diagram.fromContract: graph.nodes[' + i + '] has no id (looked for'
+        + ' id, name, key, nodeId)');
+    }
+    register(raw, firstOf(node, ['label', 'title', 'text', 'name']));
+  }
+  var edges = [];
+  for (var e = 0; e < links.length; e++) {
+    var link = links[e];
+    if (link === null || typeof link !== 'object') {
+      throw new Error('diagram.fromContract: graph.links[' + e + '] must be an object'
+        + ' {from, to}');
+    }
+    var from = firstOf(link, ['from', 'source', 'src', 'start']);
+    var to = firstOf(link, ['to', 'target', 'tgt', 'end']);
+    if (from === undefined || to === undefined) {
+      throw new Error('diagram.fromContract: graph.links[' + e + '] needs both ends (from/to,'
+        + ' source/target)');
+    }
+    edges.push({from: register(from), to: register(to),
+      label: firstOf(link, ['label', 'text', 'title', 'name'])});
+  }
+  var lines = [];
+  if (format === 'dot') {
+    lines.push('digraph ' + (opts.id ? sanitizeId(opts.id) : 'G') + ' {');
+    lines.push('  rankdir=' + (opts.direction || 'TB') + ';');
+  } else {
+    lines.push('flowchart ' + (opts.direction || 'LR'));
+  }
+  for (var n2 = 0; n2 < order.length; n2++) {
+    var label = order[n2].label;
+    if (format === 'dot') {
+      lines.push('  ' + order[n2].name + (label ? ' [label="' + quoteDot(label) + '"]' : '') + ';');
+    } else {
+      lines.push('  ' + order[n2].name + (label ? '["' + quoteMermaid(label) + '"]' : ''));
+    }
+  }
+  for (var m = 0; m < edges.length; m++) {
+    var l = edges[m].label;
+    if (format === 'dot') {
+      lines.push('  ' + edges[m].from + ' -> ' + edges[m].to
+        + (l ? ' [label="' + quoteDot(l) + '"]' : '') + ';');
+    } else {
+      lines.push('  ' + edges[m].from + ' -->' + (l ? '|' + quoteMermaid(l) + '|' : '')
+        + ' ' + edges[m].to);
+    }
+  }
+  if (format === 'dot') {
+    lines.push('}');
+  }
+  return lines.join('\n') + '\n';
+}
+
+/** The first defined value of a list of field names (a contract names the same thing twice). */
+function firstOf(object, names) {
+  for (var i = 0; i < names.length; i++) {
+    if (object[names[i]] !== undefined && object[names[i]] !== null) {
+      return object[names[i]];
+    }
+  }
+  return undefined;
+}
+
+/** An identifier the Mermaid/DOT parsers accept (letters, digits, underscore, a leading letter). */
+function sanitizeId(raw) {
+  var text = String(raw).replace(/[^A-Za-z0-9_]/g, '_');
+  if (text === '' || /^[0-9]/.test(text)) {
+    text = 'N' + text;
+  }
+  return text;
+}
+
+/** A label for a Mermaid {@code ["..."]} - quotes and line breaks would end the node. */
+function quoteMermaid(text) {
+  return String(text).replace(/"/g, "'").replace(/[\r\n]+/g, ' ');
+}
+
+/** A label for a DOT {@code [label="..."]}. */
+function quoteDot(text) {
+  return String(text).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]+/g, ' ');
+}
+
+/**
  * The help text - the manual a caller reads before the first line.
  * @returns {string} the help text
  */
 function help() {
   return [
-    'diagram - parse Mermaid/DOT, lay it out, draw it as SVG (PDF/PPTX later).',
+    'diagram - parse Mermaid/DOT, lay it out, draw it as SVG, PDF or PPTX.',
     '',
     '  var diagram = loadShipped(\'diagram\');',
     '  var model = diagram.parse(\'flowchart LR\\n  A --> B\');',
@@ -280,7 +544,33 @@ function help() {
     '  fit(scene, {page, margin, orientation, fit, scale, headerSpace, footerSpace})',
     '                 -> {scale, width, height, smallestFont, legible, fits, warning, ...}',
     "  metric(font, size)                                      -> {width(text), measure(request)}",
+    '  rotate(scene, 90|180|270)                               -> scene (turned + re-normalised)',
+    '  fromContract({nodes, links}, {format})                  -> Mermaid/DOT source text',
+    '  pptx(scene, {file, mode, slide, saveAs, margin, ...})   -> report (draws on a slide)',
+    '  pptxDraw(slideHandle, scene, {page|show, ...})          -> report (slide the caller holds)',
+    '  pptxOps(scene, {page: {width, height}, ...})            -> [{op:"shape"|"line"|"text"}]',
+    '  pptxPlace(scene, {page, margin, fit, scale, align})     -> {scale, offsetX, offsetY, ...}',
     '  version(), limits(overrides), help()',
+    '',
+    'From a node/link contract (dynsgraph, a JSON export, a query result) to a picture - the',
+    'front door for a graph that is already data, so that nobody writes Mermaid by hand:',
+    '  var src = diagram.fromContract({',
+    '    nodes: [{id: "MODA", label: "Modul A"}, {id: "MODB", label: "Modul B"}],',
+    '    links: [{from: "MODA", to: "MODB", label: "liest"}]',
+    '  });                                     // flowchart LR ... MODA -->|liest| MODB',
+    '  diagram.draw(src);                      // or parse + layout + render separately',
+    '  field names are tolerant: node id/name/key, label/title/text, link from/source/src/start,',
+    '  to/target/tgt/end, label/text; a node no link mentions is emitted too. Ids are sanitized',
+    '  to [A-Za-z0-9_] and kept unique, labels are quoted, {format: "dot"} gives DOT instead.',
+    '',
+    'Turning the picture (a wide drawing on a portrait page):',
+    '  var tall = diagram.rotate(scene, 90);   // right angles only - a box cannot be tilted in',
+    '                                          // this scene format, and re-layout would move nodes',
+    '  diagram.fit(tall, {page: "A4"});        // measured on the rotated scene, labels turned',
+    '  Both backends write the rotation: SVG as transform="rotate(deg x y)", PDF as',
+    '  text.put rotate. 180 turns labels upside down - use it to correct a mirrored export, not',
+    '  to save space. If the page allows it, orientation:"landscape" in fit() is the better answer',
+    '  (the text stays upright).',
     '',
     'Mermaid subset: flowchart/graph TB/TD/BT/LR/RL; shapes A[ ] A( ) A([ ]) A[[ ]] A[( )]',
     'A{ } A(( )) A{{ }}; edges --> -.-> ==> --- ~~~ <--> with |label|; subgraph ... end with',
@@ -462,6 +752,9 @@ function help() {
     '  and smallestFont, the size the smallest label ends up at, with legible:false below about',
     '  6 pt and one warning sentence. Read that number: a drawing that only fits at 45 % does not',
     '  have a page problem, it has a legibility problem.',
+    '  render() knows nothing about a page, so an SVG alone never says "too small" - call fit()',
+    '  before drawing and read smallestFont/legible. The SVG is vector and scales losslessly, so',
+    '  a small scale is never an artefact of the format.',
     '  Drawing it: pdfedit ops come from diagram/pdf.js, the normal way is pdftext -',
     "    doc.diagram(scene, {fit:'page'});            // factor in result.diagrams[0].appliedScale",
     "    var result = doc.save('out.pdf');",
@@ -470,6 +763,36 @@ function help() {
     "    fs.writeBytes('seite1.png', png);",
     "    console.log(image.preview('seite1.png', {width:80}));   // coarse text view, no tokens",
     "    image.describe('seite1.png');                            // the vision model",
+    '',
+    'Onto a slide (PowerPoint .pptx) - the one output that stays editable:',
+    '  Every node box becomes an auto shape, every routed edge a chain of line shapes, every label',
+    '  a transparent text shape (centred paragraph, no fill, no outline, no inner margin, one line),',
+    '  every arrowhead a filled triangle - so a reader of the deck can still move a box.',
+    "  It needs the pptx namespace of the sandbox (pptx.help()); ops/place work without it.",
+    '    diagram.pptx(scene, {file: "target/diagram.pptx"})              // a new file',
+    '    diagram.pptx(scene, {file: "deck.pptx", mode: "append"})        // one more slide',
+    '    diagram.pptx(scene, {file: "deck.pptx", mode: "slide", slide: 2})   // onto slide 2',
+    '    diagram.pptx(scene, {file: "vorlage.pptx", mode: "slide", slide: 1,',
+    '                         saveAs: "target/bericht.pptx"})            // read A, write B',
+    '  mode is "new" (default: a new presentation, overwriting file), "append" (a blank slide at the',
+    '  end) or "slide" (draw ONTO an existing slide, its shapes stay). The mode is never guessed: a',
+    '  file that cannot be opened must not silently become a new one.',
+    '  Placement is the arithmetic of fit(), against the slide (a default POI slide is 720 x 540 pt,',
+    '  i.e. 4:3): margin 36 (half an inch), fit:"page"|"width"|"none", scale, align:"center"|',
+    '  "left"|"right", valign:"middle"|"top"|"bottom". A drawing that does not fit is reported',
+    '  (fits:false), not clipped.',
+    '  The report: {file, mode, slideNumber, scale, width, height, offsetX, offsetY, shapes, lines,',
+    '  labels, skipped, items, approximations, smallestFont, legible, fits, warning, notes}. Read',
+    '  smallestFont - a slide is smaller than a page, so a diagram is scaled down more often.',
+    '  What a slide cannot express, and what happens instead (counted in "approximations", so it is',
+    '  never silent): a curve is sampled into segments (scene.curveSegments, the same control',
+    '  points both other backends draw), a rounded box keeps PowerPoint\'s corner radius, an',
+    '  arrowhead is the preset triangle turned into its direction, a dash pattern becomes the',
+    '  closest preset (dot | dash). Nothing else is approximated - the geometry stays exact.',
+    '  Before drawing, pptxOps(scene, {page: {width: 720, height: 540}}) answers what would be',
+    '  drawn ({op:"shape"|"line"|"text"} with slide coordinates, already scaled and placed), and',
+    '  pptxPlace(scene, {...}) answers the scale and the offset. pptxDraw(slideHandle, scene, {show})',
+    '  draws onto a slide the caller already holds and writes no file.',
     '',
     'The scene carries a "phases" block (layout, ranks, layers,',
     'crossings, drawnCrossings, crossingPairs, drawnOverlaps, nearOverlaps, backwardEdges,',
@@ -507,6 +830,16 @@ module.exports = {
   diff: diff,
   fit: fit,
   metric: metric,
+  rotate: rotate,
+  fromContract: fromContract,
+  /** A scene onto a PowerPoint slide (a new file, a new slide or an existing slide). */
+  pptx: pptxExport,
+  /** A scene onto a slide handle the caller holds - no file is opened or written. */
+  pptxDraw: pptxDraw,
+  /** The drawing operations a scene becomes on a slide (no presentation needed). */
+  pptxOps: pptxOps,
+  /** How a scene is placed on a slide (scale, offset, smallest label). */
+  pptxPlace: pptxPlace,
   /** The IR module (for a caller who builds a model step by step). */
   model: modelLib
 };

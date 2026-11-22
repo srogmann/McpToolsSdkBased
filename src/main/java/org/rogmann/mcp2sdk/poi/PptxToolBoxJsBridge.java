@@ -135,11 +135,16 @@ public class PptxToolBoxJsBridge implements JsModuleInterface {
         });
         methods.put("createLine", (ProxyExecutable) args -> {
             PoiJsArgs.Call c = A.bind("createLine", args);
+            // The arrowhead is optional: a caller that draws its own (diagram/pptx.js) needs a
+            // bare line, otherwise every segment of a routed edge would carry a head.
+            Value arrowArg = c.optionalValue(5);
+            boolean arrow = arrowArg == null || arrowArg.isNull() || c.bool("arrow", 5);
             return box.createLine(c.string("slideHandle", 0),
                     c.number("x1", 1, -PptxToolBox.MAX_COORD_PT, PptxToolBox.MAX_COORD_PT),
                     c.number("y1", 2, -PptxToolBox.MAX_COORD_PT, PptxToolBox.MAX_COORD_PT),
                     c.number("x2", 3, -PptxToolBox.MAX_COORD_PT, PptxToolBox.MAX_COORD_PT),
-                    c.number("y2", 4, -PptxToolBox.MAX_COORD_PT, PptxToolBox.MAX_COORD_PT));
+                    c.number("y2", 4, -PptxToolBox.MAX_COORD_PT, PptxToolBox.MAX_COORD_PT),
+                    arrow);
         });
         methods.put("getShapeText", (ProxyExecutable) args ->
                 box.getShapeText(shape("getShapeText", args)));
@@ -200,6 +205,47 @@ public class PptxToolBoxJsBridge implements JsModuleInterface {
             PoiJsArgs.Call c = A.bind("setShapeLineWidth", args);
             box.setShapeLineWidth(c.string("shapeHandle", 0),
                     c.number("widthPt", 1, 0.0, PptxToolBox.MAX_LINE_WIDTH_PT));
+            return null;
+        });
+        methods.put("setShapeStyle", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("setShapeStyle", args);
+            // An empty colour is "none" - see PptxToolBox.setShapeStyle.
+            box.setShapeStyle(c.string("shapeHandle", 0), c.optionalString("fill", 1),
+                    c.optionalString("line", 2),
+                    c.number("widthPt", 3, 0.0, PptxToolBox.MAX_LINE_WIDTH_PT),
+                    c.optionalString("dash", 4));
+            return null;
+        });
+        methods.put("setShapeTextAlign", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("setShapeTextAlign", args);
+            box.setShapeTextAlign(c.string("shapeHandle", 0), c.string("align", 1));
+            return null;
+        });
+        methods.put("setShapeVerticalAlign", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("setShapeVerticalAlign", args);
+            box.setShapeVerticalAlign(c.string("shapeHandle", 0), c.string("anchor", 1));
+            return null;
+        });
+        methods.put("setShapeTextInsets", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("setShapeTextInsets", args);
+            box.setShapeTextInsets(c.string("shapeHandle", 0),
+                    c.number("left", 1, 0.0, PptxToolBox.MAX_SIZE_PT),
+                    c.number("right", 2, 0.0, PptxToolBox.MAX_SIZE_PT),
+                    c.number("top", 3, 0.0, PptxToolBox.MAX_SIZE_PT),
+                    c.number("bottom", 4, 0.0, PptxToolBox.MAX_SIZE_PT));
+            return null;
+        });
+        methods.put("setShapeWordWrap", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("setShapeWordWrap", args);
+            box.setShapeWordWrap(c.string("shapeHandle", 0), c.bool("wrap", 1));
+            return null;
+        });
+        methods.put("setShapeFont", (ProxyExecutable) args -> {
+            PoiJsArgs.Call c = A.bind("setShapeFont", args);
+            box.setShapeFont(c.string("shapeHandle", 0),
+                    c.number("sizePt", 1, PptxToolBox.MIN_FONT_PT, PptxToolBox.MAX_FONT_PT),
+                    c.bool("bold", 2), c.optionalString("colorHex", 3),
+                    c.optionalString("fontFamily", 4));
             return null;
         });
 

@@ -5,7 +5,7 @@
   },
   "diagram": {
     "file": "lib/diagram.js",
-    "summary": "`loadShipped('diagram')` parses a Mermaid/DOT subset into a JSON model, lays it out itself (built-in base-14 widths, or a measure function of your own) and draws it as SVG - `help()` lists the subset, the `%%`-directives (pin/rank/port/weight/route/curve/layout), the two placement strategies (`layout: 'layered' | 'force'`), `fit()` (does a scene fit a page, at which scale, how small does the text get), `metric()` and the limits"
+    "summary": "`loadShipped('diagram')` parses a Mermaid/DOT subset into a JSON model, lays it out itself (built-in base-14 widths, or a measure function of your own) and draws it as SVG or onto a PowerPoint slide (`pptx()`, editable shapes) - `help()` lists the subset, the `%%`-directives (pin/rank/port/weight/route/curve/layout), the two placement strategies (`layout: 'layered' | 'force'`), `fit()` (does a scene fit a page, at which scale, how small does the text get), `metric()` and the limits"
   },
   "diagram-model": {
     "file": "lib/diagram/model.js",
@@ -50,5 +50,9 @@
   "diagram-pdf": {
     "file": "lib/diagram/pdf.js",
     "summary": "internal building block of `diagram` and `pdftext`: the PDF backend that turns a scene into pdfedit ops (draw.rect/draw.line/text.put/content.append)"
+  },
+  "diagram-pptx": {
+    "file": "lib/diagram/pptx.js",
+    "summary": "internal building block of `diagram`: the PPTX backend - place()/ops() turn a scene into slide coordinates and drawing ops, draw()/write() perform them through the pptx bridge (a new file, a new slide or an existing slide)"
   }
 }

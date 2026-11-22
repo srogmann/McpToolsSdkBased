@@ -341,8 +341,8 @@ function fitWarning(answer, scale, opts) {
   }
   if (answer.legible === false) {
     sentences.push('the smallest text would be ' + answer.smallestFont + ' pt - below about '
-      + metricLib.MIN_LEGIBLE_SIZE + ' pt a label is hard to read; a larger page, a smaller'
-      + ' margin or a split diagram helps');
+      + metricLib.MIN_LEGIBLE_SIZE + ' pt a label is hard to read; a larger page, orientation'
+      + ' landscape, a smaller margin, a split diagram or diagram.rotate(scene, 90) helps');
   }
   if (!answer.fits) {
     sentences.push('the drawing is ' + answer.width + ' x ' + answer.height + ' pt, the text area'
