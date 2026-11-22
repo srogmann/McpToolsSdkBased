@@ -1,5 +1,6 @@
 package org.rogmann.mcp2sdk.chat;
 
+import org.rogmann.mcp2sdk.skills.SkillsRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -276,10 +277,56 @@ public class UiSettings {
      *
      * <p>Package-private so the unit test can drive the decision without a running application.</p>
      *
+     * <p>Whatever the three steps yield, the index of the workspace's skills is appended
+     * (docs/skills.md §5): the Web UI has no other place to tell the model that reusable
+     * instructions exist, and a skill the model never hears about is a skill it never loads.
+     * The index carries ids and descriptions, never bodies; {@code -Dskills.inject=false} turns
+     * it off. Note the limit of this seam: the browser owns the system message, so an operator
+     * who edits it in the settings dialog sends their own text and the index is gone with it.</p>
+     *
      * @param uiSettings the settings built so far (the {@code uiConfig} entries are already in it)
      * @return the prompt to serve, never {@code null}
      */
     String resolveSystemMessage(ObjectNode uiSettings) {
+        return withSkills(resolveConfiguredSystemMessage(uiSettings));
+    }
+
+    /**
+     * Appends the skill index of the workspace to a system prompt.
+     *
+     * @param prompt the configured prompt
+     * @return the prompt, with the skill index when the workspace has an advertised one
+     */
+    private static String withSkills(String prompt) {
+        if (prompt == null || prompt.isBlank()) {
+            // An operator who ships no prompt at all meant it - appending an index would
+            // contradict that (`{"systemMessage": ""}` is the documented way to say so).
+            return prompt;
+        }
+        if (!SkillsRegistry.injectionEnabled()) {
+            return prompt;
+        }
+        String block;
+        try {
+            block = SkillsRegistry.getInstance().indexBlock(null);
+        }
+        catch (IllegalStateException e) {
+            LOG.warn("Skill index not shipped: {}", e.getMessage());
+            return prompt;
+        }
+        if (block == null) {
+            return prompt;
+        }
+        return prompt + "\n\n" + block;
+    }
+
+    /**
+     * The three-step decision of {@link #resolveSystemMessage(ObjectNode)}, without the skills.
+     *
+     * @param uiSettings the settings built so far
+     * @return the configured prompt, never {@code null}
+     */
+    private String resolveConfiguredSystemMessage(ObjectNode uiSettings) {
         if (systemMessage != null && !systemMessage.isBlank()) {
             return systemMessage.trim();
         }

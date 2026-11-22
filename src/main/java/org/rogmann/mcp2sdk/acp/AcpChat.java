@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
@@ -27,6 +28,8 @@ import org.rogmann.mcp2sdk.ToolSpecWithState;
 import org.rogmann.mcp2sdk.agent.ChatContextStore;
 import org.rogmann.mcp2sdk.browser.BrowserReviewService;
 import org.rogmann.mcp2sdk.m2.MavenGuard;
+import org.rogmann.mcp2sdk.skills.Skill;
+import org.rogmann.mcp2sdk.skills.SkillsRegistry;
 import org.rogmann.mcp2sdk.tools.JavaScriptTool;
 
 import com.agentclientprotocol.sdk.agent.AcpAgent;
@@ -203,6 +206,13 @@ final class AcpChat {
 
     /** Compaction-fork counter per session — child chat ids read {@code session + "_c" + n}. */
     private static final Map<String, Integer> compactSeqBySession = new ConcurrentHashMap<>();
+
+    /**
+     * The workspace a client named at {@code session/new} ({@code cwd}): the base the
+     * {@code /skills} command resolves its sources against, so it agrees with the seed
+     * {@link #startHistory} built for that very session (docs/skills.md §11).
+     */
+    private static final Map<String, String> sessionCwd = new ConcurrentHashMap<>();
 
     /**
      * The chat id of the tool loop running right now, read by the transport-context
@@ -402,7 +412,9 @@ final class AcpChat {
     /**
      * Advertises the chat's slash commands right after session/new, before the response —
      * the same channel the load replay uses — so the client renders them in its "/" menu.
-     * Commands are answered locally: they never reach the model or the history.
+     * Commands are answered locally: they never reach the model or the history — except
+     * {@code /skills <id>}, which appends the skill's instructions to the history (docs/skills.md
+     * §11).
      */
     private void advertiseCommands(String sessionId) {
         agent.sendSessionUpdate(sessionId, new AcpSchema.AvailableCommandsUpdate(null, List.of(
@@ -412,6 +424,9 @@ final class AcpChat {
                         "List the active and the disabled tools", null),
                 new AcpSchema.AvailableCommand("modules",
                         "List the JS modules of the js tool", null),
+                new AcpSchema.AvailableCommand("skills",
+                        "List the workspace's skills, or load one into this conversation",
+                        new AcpSchema.AvailableCommandInput("<id>")),
                 new AcpSchema.AvailableCommand("chat",
                         "Show the numbered entries of this conversation (the numbers /compact"
                                 + " consumes)",
@@ -440,6 +455,7 @@ final class AcpChat {
                 case "help" -> context.sendMessage(commandHelpText());
                 case "tools" -> context.sendMessage(commandToolsText());
                 case "modules" -> context.sendMessage(commandModulesText());
+                case "skills" -> context.sendMessage(commandSkillsText(ids, args));
                 case "chat" -> {
                     if (!args.isEmpty() && !"list".equals(args)) {
                         context.sendMessage("(Unknown /chat argument '" + args
@@ -470,11 +486,15 @@ final class AcpChat {
                 - `/help` — this text
                 - `/tools` — the active and the disabled tools (live ToolRegistry state)
                 - `/modules` — the JS modules of the js tool
+                - `/skills` — the skills of this workspace; `/skills <id>` loads one into the conversation
                 - `/chat list` — the numbered entries of this conversation, with sizes and previews
                 - `/compact 4-7 12` or `/compact top 3` — compact entries into summaries and continue in a forked chat
 
-                Commands are answered locally: they neither reach the model nor the history,
-                and an unknown `/...` passes through to the model as a normal prompt.
+                Commands are answered locally: they neither reach the model nor the history -
+                the one exception is `/skills <id>`, which puts the skill's instructions into
+                the conversation on purpose.
+
+                And an unknown `/...` passes through to the model as a normal prompt.
 
                 The context usage is reported after every request (`usage_update`); hints appear
                 when the conversation passes 75%, 90% and 95% of the window —
@@ -523,6 +543,68 @@ final class AcpChat {
         }
         sb.append("\nEvery module documents itself in the tool description (e.g. `fs.help()`, `archive.help()`).");
         return sb.toString();
+    }
+
+    /**
+     * The {@code /skills} command (docs/skills.md §11): without an argument the skills of the
+     * session workspace, with an id the skill itself - and that one goes **into** the
+     * conversation, unlike every other command of this chat.
+     *
+     * <p>Why a command at all: the index in the seed is only a suggestion. After a
+     * {@code /compact}, or when the model ignored a skill, a human wants to say "use this one
+     * now" - and that is a statement about the next prompt, not about the transcript. The
+     * instructions are appended as a user turn, i.e. exactly what the model would have asked
+     * the {@code skills} tool for itself.</p>
+     *
+     * @param ids  the session and its live chat
+     * @param args the skill id, or empty/{@code list}
+     * @return the text shown in the chat
+     */
+    private String commandSkillsText(ChatIds ids, String args) {
+        Path base = sessionBase(ids.sessionId());
+        SkillsRegistry registry = SkillsRegistry.getInstance();
+        if (args.isEmpty() || "list".equals(args)) {
+            String list = registry.listReport(base);
+            return list == null ? noSkillsText() : list;
+        }
+        Optional<Skill> found = registry.find(base, args);
+        if (found.isEmpty()) {
+            String list = registry.listReport(base);
+            return "**Unknown skill id '" + args + "'.**"
+                    + (list == null ? " This workspace has no skills." : "\n\n" + list);
+        }
+        Skill skill = found.get();
+        List<ObjectNode> history = histories.computeIfAbsent(ids.chatId(), id -> new ArrayList<>());
+        LOCK.lock();
+        try {
+            history.add(message("user", registry.loadReport(base, skill)));
+        }
+        finally {
+            LOCK.unlock();
+        }
+        return "**Skill '" + skill.id() + "' loaded** - its instructions are in this conversation"
+                + " from now on (one entry, " + skill.body().length() + " chars).\n\n"
+                + "Base directory: `" + skill.baseDir() + "` - every path written inside the skill"
+                + " is relative to it.";
+    }
+
+    /** Where skills are looked for, said once (both commands and the tool repeat it). */
+    private static String noSkillsText() {
+        return "**No skill found.** Skills live in " + SkillsRegistry.SKILLS_DIR + " (or "
+                + SkillsRegistry.SKILLS_DIR_OPENCODE + ") as `<id>/SKILL.md` or as `<id>.md` at"
+                + " the directory's root - see docs/skills.md.";
+    }
+
+    /**
+     * The workspace of a session as a path.
+     *
+     * @param sessionId the session the client opened
+     * @return the {@code cwd} of {@code session/new}, {@code null} when unknown (the registry
+     *         then falls back to the project base)
+     */
+    private static Path sessionBase(String sessionId) {
+        String cwd = sessionCwd.get(sessionId);
+        return cwd == null || cwd.isBlank() ? null : Path.of(cwd);
     }
 
     /**
@@ -1403,19 +1485,53 @@ final class AcpChat {
 
     /**
      * Seeds the chat history for a new session: AGENTS.md of the workspace as the system
-     * message (S5), so the model knows how to work in this project from the first prompt.
+     * message (S5), so the model knows how to work in this project from the first prompt,
+     * followed by the index of the workspace's skills (docs/skills.md §5).
      */
     private void startHistory(String sessionId, String cwd) {
+        if (cwd != null && !cwd.isBlank()) {
+            sessionCwd.put(sessionId, cwd);
+        }
         List<ObjectNode> history = histories.computeIfAbsent(sessionId, id -> new ArrayList<>());
-        String agentsMd = readAgentsMd(cwd);
-        if (agentsMd != null) {
+        String seed = readAgentsMd(cwd);
+        String skills = readSkills(cwd);
+        if (seed == null) {
+            seed = skills;
+        }
+        else if (skills != null) {
+            seed = seed + "\n\n" + skills;
+        }
+        if (seed != null) {
             LOCK.lock();
             try {
-                history.add(message("system", agentsMd));
+                history.add(message("system", seed));
             }
             finally {
                 LOCK.unlock();
             }
+        }
+    }
+
+    /**
+     * The skill index of the session workspace: id, name and description of every advertised
+     * skill, never a body - the bodies are read on demand through the {@code skills} tool, which
+     * is what keeps a workspace with thirty skills from eating the context window.
+     *
+     * <p>Switched by {@code skills.inject} (default on). A broken skill file does not abort the
+     * session: the seed says so instead, so it is visible in the chat and not only in the log.</p>
+     */
+    private static String readSkills(String cwd) {
+        if (!SkillsRegistry.injectionEnabled()) {
+            return null;
+        }
+        Path base = cwd == null || cwd.isBlank() ? null : Path.of(cwd);
+        try {
+            return SkillsRegistry.getInstance().indexBlock(base);
+        }
+        catch (IllegalStateException e) {
+            LOG.warn("Skill index not injected: {}", e.getMessage());
+            return "Skills of this workspace could not be read - fix the skill file: "
+                    + e.getMessage();
         }
     }
 
