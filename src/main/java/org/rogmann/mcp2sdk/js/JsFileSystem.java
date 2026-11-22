@@ -209,7 +209,7 @@ public class JsFileSystem {
             int slash = withoutLeading.indexOf('/');
             String mountName = slash < 0 ? withoutLeading : withoutLeading.substring(0, slash);
             if (mountName.isEmpty()) {
-                throw new JsUserRuntimeException("Access denied: invalid path: "
+                throw accessDenied("Access denied: invalid path: "
                         + abbreviateForMessage(filePath));
             }
             Path addonRoot = WorkProject.addonPath(mountName);
@@ -224,7 +224,7 @@ public class JsFileSystem {
         if (!resolved.startsWith(mountRoot)) {
             LOG.warn("Path traversal attempt detected: filePath='{}' resolved to '{}'",
                     abbreviateForMessage(filePath), resolved);
-            throw new JsUserRuntimeException(
+            throw accessDenied(
                     "Access denied: the specified path is not within the permitted directory.");
         }
         // Symlink check: resolve the nearest existing ancestor and verify it stays in the mount.
@@ -235,18 +235,18 @@ public class JsFileSystem {
                 existing = existing.getParent();
             }
             if (existing == null) {
-                throw new JsUserRuntimeException("Access denied: cannot resolve path: "
+                throw accessDenied("Access denied: cannot resolve path: "
                         + abbreviateForMessage(filePath));
             }
             Path realExisting = existing.toRealPath();
             if (!realExisting.startsWith(realRoot)) {
                 LOG.warn("Symbolic link escapes base directory: filePath='{}'",
                         abbreviateForMessage(filePath));
-                throw new JsUserRuntimeException(
+                throw accessDenied(
                         "Access denied: symbolic links outside the permitted directory are not allowed.");
             }
         } catch (IOException e) {
-            throw new JsUserRuntimeException("Access denied: cannot resolve path: "
+            throw accessDenied("Access denied: cannot resolve path: "
                     + abbreviateForMessage(filePath), e);
         }
         return resolved;
@@ -344,12 +344,32 @@ public class JsFileSystem {
      */
     private static JsUserRuntimeException unknownAddonFolder(String mountName) {
         if (WorkProject.hasAddonDirectories()) {
-            return new JsUserRuntimeException(
+            return new JsUserRuntimeException(JsErrorCode.NOT_FOUND,
                     "Unknown add-on folder '/" + abbreviateForMessage(mountName)
                             + "'. Available add-on folders: " + WorkProject.addonNames());
         }
-        return new JsUserRuntimeException(
+        return accessDenied(
                 "Access denied: absolute paths are not permitted (no add-on folders configured).");
+    }
+
+    /**
+     * A user error of the kind {@link JsErrorCode#ACCESS_DENIED}: the path is outside the permitted
+     * directories (parent-directory traversal, an unknown mount, a symbolic link leaving the base).
+     * @param message the message for the caller
+     * @return the exception to throw
+     */
+    private static JsUserRuntimeException accessDenied(String message) {
+        return new JsUserRuntimeException(JsErrorCode.ACCESS_DENIED, message);
+    }
+
+    /**
+     * A user error of the kind {@link JsErrorCode#ACCESS_DENIED} with a cause.
+     * @param message the message for the caller
+     * @param cause the underlying cause (logged, not shown)
+     * @return the exception to throw
+     */
+    private static JsUserRuntimeException accessDenied(String message, Throwable cause) {
+        return new JsUserRuntimeException(JsErrorCode.ACCESS_DENIED, message, cause);
     }
 
     // ========================================================================
@@ -896,7 +916,8 @@ public class JsFileSystem {
     public static Map<String, Object> detectCharset(String filePath, int maxBytes) {
         Path path = resolveSafePath(filePath);
         if (!Files.isRegularFile(path)) {
-            throw new JsUserRuntimeException("File not found: " + toRelativeForMessage(path));
+            throw new JsUserRuntimeException(JsErrorCode.NOT_FOUND,
+                    "File not found: " + toRelativeForMessage(path));
         }
         long fileSize;
         try {
@@ -1309,7 +1330,8 @@ public class JsFileSystem {
         String policy = normalizeErrorPolicy(errors);
         Path path = resolveSafePath(filePath);
         if (!Files.isRegularFile(path)) {
-            throw new JsUserRuntimeException("File not found: " + toRelativeForMessage(path));
+            throw new JsUserRuntimeException(JsErrorCode.NOT_FOUND,
+                    "File not found: " + toRelativeForMessage(path));
         }
         byte[] data;
         try {
@@ -1336,8 +1358,9 @@ public class JsFileSystem {
             return new JsUserRuntimeException(action + ": " + toRelativeForMessage(path), e);
         }
         String where = lineNo != null && lineNo > 0 ? " near line " + lineNo : "";
-        return new JsUserRuntimeException(action + ": " + toRelativeForMessage(path) + where + " - the file is not valid "
-                + cs.name() + ". Pass the real charset (e.g. \"CP-1252\" or \"ISO-8859-1\"),"
+        return new JsUserRuntimeException(JsErrorCode.ENCODING_INVALID, action + ": "
+                + toRelativeForMessage(path) + where + " - the file is not valid " + cs.name()
+                + ". Pass the real charset (e.g. \"CP-1252\" or \"ISO-8859-1\"),"
                 + " check fs.detectCharset(path), or pass errors 'replace' to read it anyway.", e);
     }
 
@@ -1405,7 +1428,8 @@ public class JsFileSystem {
         String policy = normalizeErrorPolicy(errors);
         Path path = resolveSafePath(filePath);
         if (!Files.isRegularFile(path)) {
-            throw new JsUserRuntimeException("File not found: " + toRelativeForMessage(path));
+            throw new JsUserRuntimeException(JsErrorCode.NOT_FOUND,
+                    "File not found: " + toRelativeForMessage(path));
         }
         if (startLine < 1) {
             startLine = 1;
@@ -1476,7 +1500,8 @@ public class JsFileSystem {
         String policy = normalizeErrorPolicy(errors);
         Path path = resolveSafePath(filePath);
         if (!Files.isRegularFile(path)) {
-            throw new JsUserRuntimeException("File not found: " + toRelativeForMessage(path));
+            throw new JsUserRuntimeException(JsErrorCode.NOT_FOUND,
+                    "File not found: " + toRelativeForMessage(path));
         }
         try {
             return new LineReader(path, newReader(path, cs, policy), cs);
@@ -1824,7 +1849,8 @@ public class JsFileSystem {
     public static long size(String filePath) {
         Path path = resolveSafePath(filePath);
         if (!Files.isRegularFile(path)) {
-            throw new JsUserRuntimeException("File not found: " + toRelativeForMessage(path));
+            throw new JsUserRuntimeException(JsErrorCode.NOT_FOUND,
+                    "File not found: " + toRelativeForMessage(path));
         }
         try {
             return Files.size(path);
@@ -1858,7 +1884,8 @@ public class JsFileSystem {
         }
         Path path = resolveSafePath(filePath);
         if (!Files.isRegularFile(path)) {
-            throw new JsUserRuntimeException("File not found: " + toRelativeForMessage(path));
+            throw new JsUserRuntimeException(JsErrorCode.NOT_FOUND,
+                    "File not found: " + toRelativeForMessage(path));
         }
         long fileSize;
         try {
@@ -1980,7 +2007,8 @@ public class JsFileSystem {
                 writeBytes(filePath, data);
                 return;
             }
-            throw new JsUserRuntimeException("File not found: " + toRelativeForMessage(path)
+            throw new JsUserRuntimeException(JsErrorCode.NOT_FOUND,
+                    "File not found: " + toRelativeForMessage(path)
                     + " (fs.writeBytes(path, data, offset) patches an EXISTING file at an offset;"
                     + " to create a new file use fs.writeBytes(path, data) without an offset)");
         }
@@ -2025,7 +2053,8 @@ public class JsFileSystem {
         }
         Path path = resolveSafePath(filePath);
         if (!Files.isRegularFile(path)) {
-            throw new JsUserRuntimeException("File not found: " + toRelativeForMessage(path));
+            throw new JsUserRuntimeException(JsErrorCode.NOT_FOUND,
+                    "File not found: " + toRelativeForMessage(path));
         }
         try {
             return new BinaryBlockReader(path, blockSize);
@@ -2177,7 +2206,8 @@ public class JsFileSystem {
                 Controlled access to the project base directory (system property IDE_PROJECT_DIR).
                 All paths are relative to the base directory. '..' is not allowed; absolute paths
                 and symbolic links leaving the base directory are rejected.
-                Results and error messages contain only relative (or add-on-prefixed) paths.
+                Results and error messages contain only relative (or add-on-prefixed) paths -
+                fs.baseDir() is the one exception and has to be asked for.
 
                 --- Add-on directories ---
                 A path starting with '/addonName/...' addresses an optionally configured add-on
@@ -2212,10 +2242,21 @@ public class JsFileSystem {
                                                              not a silent U+FFFD.
                                                              'buffer' returns raw bytes (Uint8Array).
                 fs.readLines(path, startLine, endLine[, encoding|options])
-                                                          - Read a 1-based line range (inclusive).
+                                                          - Read a 1-based line range (inclusive) as
+                                                             ONE String: the lines joined with '\\n',
+                                                             no trailing newline, '' if the range
+                                                             is empty. It is NOT an array - there is
+                                                             no .length/.map/.join on it.
                                                              Defaults: startLine=1, endLine=startLine+499.
                                                              Also fs.readLines(path, {startLine,
-                                                             endLine, encoding, errors}).
+                                                             endLine, encoding, errors}), and with
+                                                             {asArray: true} one string per line:
+                                                               var lines = fs.readLines("log.txt",
+                                                                   {startLine: 1, endLine: 30, asArray: true});
+                                                               lines.filter(function (l) { return l.length; })
+                                                             The first 30 lines are
+                                                             fs.readLines(path, 1, 30) - no reader
+                                                             needed for a small range.
                 fs.createLineReader(path[, encoding|options])
                                                           - Open a streaming line reader for large files:
                     var r = fs.createLineReader("big.csv");
@@ -2230,13 +2271,25 @@ public class JsFileSystem {
                     r.close()                             - close the reader early
 
                 --- List / inspect ---
-                fs.readdir(path)                          - List entry names of a directory (default ".").
-                fs.listFiles(path)                        - List entries as relative paths.
+                fs.readdir(path)                          - List entry NAMES of a directory (default "."):
+                                                             ["lib", "modules.json"] - no directory
+                                                             part, nothing to strip.
+                fs.listFiles(path)                        - List entries as paths RELATIVE TO THE BASE
+                                                             DIRECTORY (not to `path`!):
+                                                             fs.listFiles("src") -> ["src/main", "src/test"].
+                                                             Both results can be fed back into any
+                                                             fs call as they are; the two differ only
+                                                             in the prefix (use readdir for names, for
+                                                             example to build a table).
                 fs.stat(path)                             - {name, path, size, isFile, isDirectory,
                                                              isSymbolicLink, lastModified, created}
                 fs.exists(path)                           - true if the path exists.
                 fs.isFile(path)                           - true if the path is a regular file.
                 fs.isDirectory(path)                      - true if the path is a directory.
+                fs.baseDir()                              - absolute path of the base directory, e.g.
+                                                             to name a file to an OS command. The only
+                                                             call that returns an absolute path - every
+                                                             other result is relative to the base.
 
                 --- Write / edit ---
                 fs.writeFile(path, content[, encoding|options])
@@ -2284,6 +2337,17 @@ public class JsFileSystem {
                 Text methods default to UTF-8 and are STRICT: bytes that are not valid for the
                 chosen charset are an error (reporting the byte offset and a hex window), not a
                 silent U+FFFD - a silent replacement would corrupt readFile -> writeFile round-trips.
+                Any charset name of the JVM is accepted, not only the aliases above - the EBCDIC
+                code pages of a mainframe data set included (the JVM ships them in jdk.charsets):
+                    fs.readFile("kdaten.dat", "IBM273")     // German EBCDIC (also CP273, Cp273)
+                    fs.readFile("kdaten.dat", "IBM01141")   // German EBCDIC with euro (CP1141)
+                    fs.readFile("dump.bin",   "IBM037")     // US EBCDIC (CP037)
+                    fs.readFile("mix.dat",    "IBM1047")    // EBCDIC variant (CP1047)
+                    fs.readFile("dump.bin",   "x-IBM930")   // any other name the JVM knows
+                    fs.encode("Preis: 12 €", "IBM01141")    // 0x9F is the euro sign there
+                    fs.encode("Preis: 12 €", "IBM273")      // error: IBM273 has no euro (0x9F = ¤)
+                detectCharset() proposes UTF-8/UTF-16*/ISO-8859-1/CP-1252 only, so it never suggests
+                an EBCDIC reading - name the charset explicitly.
                 fs.detectCharset(path[, maxBytes])         - Heuristic analysis of a file:
                     {path, size, bom, nulBytes, highBytes, utf8, looksBinary,
                      candidates: [{encoding, penalty, plausible, sample, note}],
@@ -2313,7 +2377,12 @@ public class JsFileSystem {
                     reader.close();
 
                 Example (read a section of a file):
-                    var chunk = fs.readLines("data.csv", 1, 500); // first 500 lines
+                    var chunk = fs.readLines("data.csv", 1, 500); // first 500 lines, one String
+                    var lines = fs.readLines("data.csv", 1, 500, {asArray: true}); // one per line
+                    var count = chunk.split("\\n").length;        // lines of the String form
+
+                Example (EBCDIC data set, e.g. a z/OS extract):
+                    var text = fs.readFile("extract.dat", "IBM037");   // named, never guessed
 
                 Example (legacy Latin-1 / CP-1252 file):
                     var info = fs.detectCharset("alt/protokoll.txt");   // check first

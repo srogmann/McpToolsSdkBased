@@ -97,6 +97,7 @@ public class JsFileSystemBridge implements JsModuleInterface {
             int startLine = 1;
             int endLine = 0; // 0 lets JsFileSystem apply the default range
             EncodingArg enc = EncodingArg.DEFAULT;
+            boolean asArray = false;
             if (args.length > 1 && !args[1].isNull()) {
                 Value second = args[1];
                 if (second.isNumber()) {
@@ -116,20 +117,43 @@ public class JsFileSystemBridge implements JsModuleInterface {
                     if (end != null) {
                         endLine = end;
                     }
+                    Boolean array = memberBoolean(second, "asArray");
+                    asArray = array != null && array;
                     enc = hasEncodingSettings(second) ? encodingArg(second) : EncodingArg.DEFAULT;
                 } else {
                     throw new IllegalArgumentException("Usage: fs.readLines(path[, startLine[, endLine"
                             + "[, encoding|options]]]) - startLine must be a number or an options object"
-                            + " {startLine, endLine, encoding, errors}");
+                            + " {startLine, endLine, encoding, errors, asArray}");
                 }
             }
             if (args.length > 2 && !args[2].isNull()) {
                 endLine = args[2].asInt();
             }
             if (args.length > 3 && !args[3].isNull()) {
-                enc = encodingArg(args[3]);
+                // The fourth argument is "encoding | options" - an options object that only holds
+                // asArray is allowed and must not be read as an encoding (it has neither
+                // 'encoding' nor 'errors').
+                Value last = args[3];
+                if (last.hasMembers()) {
+                    Boolean array = memberBoolean(last, "asArray");
+                    asArray = array != null && array;
+                    if (hasEncodingSettings(last)) {
+                        enc = encodingArg(last);
+                    }
+                } else {
+                    enc = encodingArg(last);
+                }
             }
-            return JsFileSystem.readLines(path, startLine, endLine, enc.encoding(), enc.errors());
+            String text = JsFileSystem.readLines(path, startLine, endLine, enc.encoding(), enc.errors());
+            if (!asArray) {
+                return text;
+            }
+            // Same content, one entry per line: a caller who wants to map/filter/join lines does
+            // not have to split the string (and does not have to know that it is one).
+            if (text.isEmpty()) {
+                return createStringProxyArray(List.of());
+            }
+            return createStringProxyArray(List.of(text.split("\n", -1)));
         });
 
         methods.put("createLineReader", (ProxyExecutable) args -> {
@@ -230,6 +254,12 @@ public class JsFileSystemBridge implements JsModuleInterface {
             requireArgs(args, 1, "isDirectory(path)");
             return JsFileSystem.isDirectory(args[0].asString());
         });
+
+        // The one deliberate exception to "results carry relative paths only": the caller has to
+        // ask for it, and it is the only way to name a file to a tool that knows nothing about
+        // this base directory (an OS command, a log line, a report).
+        methods.put("baseDir", (ProxyExecutable) args ->
+                JsFileSystem.projectBase().toAbsolutePath().normalize().toString());
 
         // ---- Write / edit ----
         methods.put("writeFile", (ProxyExecutable) args -> {
@@ -437,6 +467,28 @@ public class JsFileSystemBridge implements JsModuleInterface {
             throw new IllegalArgumentException("option '" + name + "' must be a string (e.g. 'CP-1252')");
         }
         return v.asString();
+    }
+
+    /**
+     * Reads a boolean member of an options object. Only {@code true}/{@code false} are accepted -
+     * a truthy 1 or "yes" is an error, not a silent conversion.
+     * @param obj the object value
+     * @param name member name
+     * @return the value, or null if absent or null
+     * @throws IllegalArgumentException if the member exists but is not a boolean
+     */
+    private static Boolean memberBoolean(Value obj, String name) {
+        if (!obj.hasMember(name)) {
+            return null;
+        }
+        Value v = obj.getMember(name);
+        if (v == null || v.isNull()) {
+            return null;
+        }
+        if (!v.isBoolean()) {
+            throw new IllegalArgumentException("option '" + name + "' must be true or false");
+        }
+        return v.asBoolean();
     }
 
     /**
