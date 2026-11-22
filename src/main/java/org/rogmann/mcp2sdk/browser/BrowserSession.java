@@ -75,6 +75,50 @@ public final class BrowserSession {
     private volatile int frameCount;
     private volatile String bridgeError = "";
 
+    /**
+     * What the connected bridge said about itself in {@code hello}: the channel protocol it speaks and
+     * the command types it can execute (docs/browser.md §6). Two facts, two purposes - the protocol
+     * version tells us whether it is <em>older</em> than this server, the command list tells us what we
+     * must not send at all. Both start empty/zero: nothing was reported, so nothing is claimed. An
+     * empty command list means "undeclared", not "supports nothing" - a document whose first hello has
+     * not arrived yet must still get its first snapshot.
+     */
+    private final AtomicInteger bridgeProtocol = new AtomicInteger(0);
+    private volatile Set<String> bridgeCommands = Set.of();
+    private final AtomicBoolean bridgeAgeWarned = new AtomicBoolean(false);
+
+    /**
+     * Submits waiting for the reviewer's decision - the non-blocking form of the gate
+     * (docs/browser.md §7.4). Keyed by review id: what a later
+     * {@code browser(action=resume, reviewId=…)} needs in order to press the button a human approved,
+     * and what {@link #markClosed()} must expire so that no request keeps sitting on the reviewer's
+     * page after its session is gone.
+     */
+    private final Map<String, PendingSubmit> pendingSubmits = new ConcurrentHashMap<>();
+
+    /**
+     * One submit filed for review without blocking the tool call - the browser's version of an
+     * interrupt the caller comes back to (AG-UI's {@code Interrupt}, docs/browser.md §13).
+     *
+     * <p>The fingerprint is the one the snapshot published for that control ({@code fp.role} /
+     * {@code fp.label}): on resume the element is located again and the fingerprint compared, so a
+     * button that was re-rendered into another one is not pressed on the strength of an older
+     * approval - the counterpart of the Python workflow's SHA-256 check. {@code page} and {@code rev}
+     * name the document the approval belongs to; a page border voids it.</p>
+     *
+     * @param reviewId    id of the review entry ({@code /review} shows it under {@code browser.submit})
+     * @param ref         element address of the button ({@code f0/e12})
+     * @param role        fingerprint role of the control (may be empty)
+     * @param label       fingerprint label of the control (may be empty)
+     * @param buttonLabel what the button reads (for the answer, never for the comparison)
+     * @param page        page the submit was prepared on
+     * @param rev         snapshot revision the ref came from
+     * @param createdAt   when it was filed
+     */
+    public record PendingSubmit(String reviewId, String ref, String role, String label,
+            String buttonLabel, String page, long rev, Instant createdAt) {
+    }
+
     /** View. */
     private final AtomicLong rev = new AtomicLong();
     private final AtomicLong snapshotAt = new AtomicLong();
@@ -226,6 +270,7 @@ public final class BrowserSession {
                 pageUrl = message.path("url").asString("");
                 pageTitle = message.path("title").asString("");
                 frameCount = message.path("frames").asInt(1);
+                noteBridgeAbilities(message);
                 clearJournal("page load");
                 LOG.info("browser: bridge connected (session {}, page {})", id, pageUrl);
             }
@@ -258,12 +303,100 @@ public final class BrowserSession {
                 bridgeError = message.path("message").asString("unknown error");
                 LOG.warn("browser: bridge reports an error in {}: {}", id, bridgeError);
             }
-            default -> LOG.debug("browser: unknown bridge report {} in {}", type, id);
+            default -> LOG.info("browser: unknown bridge report '{}' in session {} - ignored (a newer "
+                    + "bridge, or a hand-written post; docs/browser.md §6)", type, id);
         }
         ObjectNode reply = BrowserSessions.get().mapper().createObjectNode();
         reply.put("ok", true);
         reply.put("rev", rev.get());
         return reply;
+    }
+
+    /**
+     * Files what the bridge said about itself in {@code hello} - protocol version and the command
+     * types it knows - and says once when the document is older than this server.
+     *
+     * <p>This is the server's half of the tolerance rule in docs/browser.md §6: unrecognised material
+     * is not an error. The bridge's own list is what makes the rule usable <em>before</em> a round
+     * trip - {@link #supportsCommand(String)} lets the server refuse to send a command an older script
+     * would only answer with {@code unsupported-command}.</p>
+     *
+     * @param hello the bridge's hello report
+     */
+    private void noteBridgeAbilities(JsonNode hello) {
+        int protocol = hello.path("protocolVersion").asInt(0);
+        bridgeProtocol.set(protocol);
+        JsonNode declared = hello.path("commands");
+        Set<String> commands = new LinkedHashSet<>();
+        if (declared.isArray()) {
+            for (JsonNode item : declared) {
+                String name = item.asString("");
+                if (!name.isBlank()) {
+                    commands.add(name);
+                }
+            }
+        }
+        bridgeCommands = Set.copyOf(commands);
+        if (protocol > 0 && protocol < BrowserRewriter.PROTOCOL_VERSION
+                && bridgeAgeWarned.compareAndSet(false, true)) {
+            LOG.info("browser: session {} runs bridge protocol {} while the server speaks {} - a "
+                    + "document loaded before the update. Nothing breaks (unknown material is "
+                    + "dropped, not failed), but the page should be reloaded to get the current "
+                    + "script", id, protocol, BrowserRewriter.PROTOCOL_VERSION);
+        }
+    }
+
+    /**
+     * True when the connected bridge declared that it can execute this command type.
+     *
+     * <p>An empty declaration answers {@code true}: a document whose hello has not arrived yet must
+     * still get its first snapshot, and "nothing was said" is not "nothing is possible" (the same rule
+     * AG-UI states for capabilities).</p>
+     *
+     * @param type the command type ({@code snapshot}, {@code fill}, …)
+     * @return false only when the bridge declared a list that does not contain the type
+     */
+    public boolean supportsCommand(String type) {
+        Set<String> declared = bridgeCommands;
+        return declared.isEmpty() || declared.contains(type);
+    }
+
+    /**
+     * Remembers what a non-blocking submit needs in order to be executable later: the ref, the
+     * fingerprint and the page it belongs to.
+     *
+     * @param submit the submit
+     */
+    public void rememberPendingSubmit(PendingSubmit submit) {
+        pendingSubmits.put(submit.reviewId(), submit);
+        LOG.info("browser: session {} filed review request {} for '{}' without blocking - resume "
+                + "clicks it once a human approved", id, submit.reviewId(), submit.buttonLabel());
+    }
+
+    /**
+     * @param reviewId the review request id
+     * @return the pending submit, or {@code null} when this session does not hold it
+     */
+    public PendingSubmit pendingSubmit(String reviewId) {
+        return reviewId == null ? null : pendingSubmits.get(reviewId.trim());
+    }
+
+    /**
+     * @return the review ids this session is still waiting for
+     */
+    public Set<String> pendingSubmitIds() {
+        return Set.copyOf(pendingSubmits.keySet());
+    }
+
+    /**
+     * Drops a pending submit - it was executed, denied or voided, so nothing is left to press.
+     *
+     * @param reviewId the review request id
+     */
+    public void forgetPendingSubmit(String reviewId) {
+        if (reviewId != null) {
+            pendingSubmits.remove(reviewId.trim());
+        }
     }
 
     private void storeSnapshot(JsonNode message) {
@@ -379,6 +512,7 @@ public final class BrowserSession {
      * @return the bridge's report, or an error node
      */
     public JsonNode requestResult(ObjectNode command, long waitMillis) {
+        requireCommand(command.path("t").asString(""));
         String commandId = "c-" + commandSeq.incrementAndGet();
         command.put("id", commandId);
         CompletableFuture<JsonNode> future = new CompletableFuture<>();
@@ -498,6 +632,29 @@ public final class BrowserSession {
     }
 
     /**
+     * Refuses to send a command the connected bridge declared it cannot execute.
+     *
+     * <p>The rule of docs/browser.md §6 is <em>unrecognised material is not an error</em> - but the
+     * place to honour it is here, before the round trip, not after it: a command outside the bridge's
+     * declared list would come back as {@code unsupported-command} and the model would read a failed
+     * operation where the truth is "this document runs an older script". One line, said once, with the
+     * remedy the model cannot perform itself (a human has to reload the page) is worth more than a
+     * well-formed non-answer.</p>
+     *
+     * @param type the command type about to be sent
+     * @throws IllegalArgumentException when the bridge declared a list without this type
+     */
+    private void requireCommand(String type) {
+        if (type == null || type.isBlank() || supportsCommand(type)) {
+            return;
+        }
+        throw new IllegalArgumentException("The page's bridge (protocol " + bridgeProtocol.get()
+                + ") does not know the command '" + type + "' - the document was loaded before the "
+                + "server was updated. Nothing was sent; ask the user to reload the page and try "
+                + "again (docs/browser.md §6).");
+    }
+
+    /**
      * Completes a waiting command with a generic result report from the bridge. Snapshots are
      * completed in {@link #storeSnapshot}; every write command answers as
      * {@code {"t":"result","id":…}}.
@@ -506,6 +663,14 @@ public final class BrowserSession {
         String commandId = message.path("id").asString("");
         if (commandId.isEmpty()) {
             return;
+        }
+        String failure = message.path("error").asString("");
+        if ("unsupported-command".equals(failure)) {
+            // The guard in requestResult should have caught this; reaching it means the bridge changed
+            // its declaration between hello and now (a page that reloaded into an older cached script).
+            LOG.warn("browser: session {} - the bridge does not know the command '{}' (protocol {}); "
+                    + "the document runs an older script and has to be reloaded (docs/browser.md §6)",
+                    id, message.path("op").asString("?"), message.path("protocolVersion").asInt(0));
         }
         CompletableFuture<JsonNode> waiter = awaiting.remove(commandId);
         if (waiter != null) {
@@ -944,6 +1109,18 @@ public final class BrowserSession {
         node.put("quiescent", snapshotQuiescent.get());
         node.put("requests", requestCount.get());
         node.put("events", eventSeq.get());
+        if (bridgeProtocol.get() > 0) {
+            // What the document said about itself in hello: the protocol it speaks and the commands it
+            // can execute. Both are the answer to "why did that command not run?" without a round trip.
+            node.put("bridgeProtocol", bridgeProtocol.get());
+        }
+        if (!bridgeCommands.isEmpty()) {
+            ArrayNode commands = node.putArray("bridgeCommands");
+            bridgeCommands.forEach(commands::add);
+        }
+        if (!pendingSubmits.isEmpty()) {
+            node.put("pendingReviews", pendingSubmits.size());
+        }
         if (closed.get()) {
             node.put("closed", true);
         }
@@ -980,9 +1157,23 @@ public final class BrowserSession {
 
     /**
      * Marks the session as closed; the command wait loops stop early on this (docs/browser.md §7).
+     *
+     * <p>It also ends every submit that was waiting for a decision: a request whose session is gone can
+     * never be executed, so it must not keep sitting on the reviewer's page as if someone could still
+     * decide it - the same guarantee the Python workflow gets from its {@code PendingRequestTracker}
+     * (docs/browser.md §7.4, §13). The reviewer sees the expiry with its reason, not a request that
+     * silently stops being answerable.</p>
      */
     public void markClosed() {
         this.closed.set(true);
+        if (pendingSubmits.isEmpty()) {
+            return;
+        }
+        BrowserReviewService reviews = new BrowserReviewService();
+        for (String reviewId : pendingSubmitIds()) {
+            reviews.expire(reviewId, "expired: the browser session was closed before the submit ran");
+            pendingSubmits.remove(reviewId);
+        }
     }
 
     /**
@@ -1207,6 +1398,27 @@ public final class BrowserSession {
         node.put("budget", BrowserSessions.get().settings().snapshotBudget());
         node.put("bridgeVersion", BrowserRewriter.BRIDGE_VERSION);
         node.put("pollSeconds", BrowserSessions.get().settings().pollSeconds());
+        // What this server speaks and what it can do - the AG-UI-shaped part of the exchange
+        // (docs/browser.md §6, §13). Informative, not binding: an omitted field is undeclared, never
+        // "not supported", and the bridge keeps working when it reads none of this (the flat fields
+        // above stay for exactly that reason - this block is additive).
+        node.put("protocolVersion", BrowserRewriter.PROTOCOL_VERSION);
+        ObjectNode capabilities = node.putObject("capabilities");
+        capabilities.put("snapshots", true);
+        capabilities.put("deltas", false);
+        capabilities.put("observe", BrowserSessions.get().settings().fieldsOn());
+        capabilities.put("write", BrowserSessions.get().settings().writeEnabled()
+                ? "enabled" : "disabled");
+        capabilities.put("interruptResume", true);
+        ArrayNode transports = capabilities.putArray("transports");
+        transports.add("longpoll");
+        ObjectNode limits = capabilities.putObject("limits");
+        limits.put("maxBodyBytes", BrowserSessions.get().settings().maxBodyBytes());
+        limits.put("pollSeconds", BrowserSessions.get().settings().pollSeconds());
+        limits.put("snapshotBudget", BrowserSessions.get().settings().snapshotBudget());
+        limits.put("quiesceMs", BrowserSessions.get().settings().quiesceMillis());
+        capabilities.put("note", "informative, not binding: an omitted capability means undeclared, "
+                + "not unsupported - check it before relying on a feature, never to reject a peer");
         ArrayNode secretKeys = node.putArray("secrets");
         new java.util.LinkedHashSet<>(BrowserSecrets.DEFAULT_KEYS).forEach(secretKeys::add);
         app.sensitiveKeys().forEach(secretKeys::add);

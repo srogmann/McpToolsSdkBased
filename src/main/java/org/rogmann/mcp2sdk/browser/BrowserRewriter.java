@@ -59,9 +59,26 @@ public final class BrowserRewriter {
      * <p>It is the cache key of the script URL, so it moves whenever the script changes something the
      * <em>server</em> relies on: a stale cached bridge must not be able to talk as if it were current.
      * v4 is the channel parameter {@code ?s=<session>} (§2b) - an old script would silently keep sending
-     * requests without it and be counted as "nameless" instead of being checked.</p>
+     * requests without it and be counted as "nameless" instead of being checked. v5 is the
+     * {@code hello} that reports the protocol and the command list, and the tolerance rule of §6 (an
+     * unknown command is answered {@code unsupported-command}, not {@code unknown-command}) - the server
+     * reads both to decide what not to send.</p>
      */
-    public static final int BRIDGE_VERSION = 4;
+    public static final int BRIDGE_VERSION = 5;
+
+    /**
+     * Version of the <em>channel protocol</em> between server and bridge - deliberately separate from
+     * {@link #BRIDGE_VERSION}, which numbers a piece of code.
+     *
+     * <p>A code version moves with every change the server relies on (and is the script's cache key);
+     * the protocol version moves only when the meaning of a message changes. The two answer different
+     * questions, and the bridge reports both in its {@code hello}: what it is ({@code bridgeVersion})
+     * and what it speaks ({@code protocolVersion}, plus the command types it understands). That is the
+     * vocabulary of AG-UI's {@code AgentCapabilities} (docs/browser.md §13) - informative, not binding:
+     * an omitted capability is undeclared, never unsupported, and a newer server must not fail because
+     * an older bridge does not know a command it can simply not send.</p>
+     */
+    public static final int PROTOCOL_VERSION = 1;
 
     private final BrowserApp app;
     private final BrowserApps registry;

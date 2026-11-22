@@ -19,6 +19,7 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.node.ArrayNode;
 import tools.jackson.databind.node.ObjectNode;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -37,9 +38,12 @@ import java.util.Map;
  * Submitting is the gate: {@code submit} (and {@code click} on a {@code type=submit} button) takes the
  * diff from the session's fill journal, creates a four-eyes request via
  * {@link org.rogmann.mcp2sdk.browser.BrowserReviewService} and sends the click only after a human
- * approved. Applications listed in {@code browser.apps.withoutReviews} (development bypass, L9)
- * submit without the entry - visibly, in the log and at startup. Secret fields are writable but never
- * readable: their values are redacted in snapshot, readback, diff and this tool's own log.</p>
+ * approved. The gate has two forms (§7.4): blocking (default) and - with {@code wait:false} - filed and
+ * picked up later by {@code resume}/{@code renew}, so a request can outlive the call that made it and a
+ * reviewer who is away from the screen does not turn into a timeout. Applications listed in
+ * {@code browser.apps.withoutReviews} (development bypass, L9) submit without the entry - visibly, in
+ * the log and at startup. Secret fields are writable but never readable: their values are redacted in
+ * snapshot, readback, diff and this tool's own log.</p>
  *
  * <p><b>M2 adds knowledge, not permission</b> (docs/browser.md §7a): with
  * {@code browser.fields.mode=observe|strict} every write operation reports which fields the application
@@ -116,8 +120,25 @@ public final class BrowserTool {
                 prefer submit for saving.
               submit    - the gated save: a review entry (tool id browser.submit) with the field \
                 diff, the validation messages and one line "what I could not check"; the click \
-                runs only after a human APPROVED it (blocks this call, window `waitSeconds`, \
-                default 300 s).
+                runs only after a human APPROVED it. Default: this call BLOCKS (window \
+                `waitSeconds`, default 300 s). With `wait:false` the request is only filed - the \
+                answer carries the reviewId, the window and nothing has been clicked. \
+                Ask the user, end your turn, and later call resume: \
+              resume    - the second half of a non-blocking submit: reads the decision. On \
+                APPROVED it clicks the button now (the page has to be the one the approval \
+                belongs to - otherwise nothing is clicked and the request is marked voided) and \
+                returns the readback; on PENDING it says how long the window still runs; on \
+                DENIED/EXPIRED it says so and does not click. Needs only `reviewId`.
+              renew     - re-arms a non-blocking submit whose window ran out (same id, same page, \
+                same diff, `note` shown to the reviewer). Never approves anything; a DENIED \
+                request cannot be re-armed - file a new submit instead. Limited to 5 re-arms.
+
+            Approval without watching (why wait:false exists):
+              a blocked tool call dies with its timeout, and the reviewer may be away from the \
+              screen. Filed without blocking, the request survives the call, the reviewer gets the \
+              signal on the review page, and you come back with resume. A submit whose session is \
+              closed is expired honestly by the server - never left on the review page as if \
+              somebody could still decide it.
 
             Important:
               * ref addresses only hold for the revision (rev) delivered with them. Pull "state" \
@@ -159,8 +180,8 @@ public final class BrowserTool {
         Map<String, Object> properties = new LinkedHashMap<>();
         properties.put("action", Map.of("type", "string", "enum", List.of(
                 "apps", "open", "sessions", "state", "refresh", "find", "locator", "events",
-                "requests", "request", "log", "fill", "undo", "click", "submit", "classify",
-                "fields"),
+                "requests", "request", "log", "fill", "undo", "click", "submit", "resume",
+                "renew", "classify", "fields"),
                 "description", "What is being asked"));
         properties.put("sessionId", Map.of("type", "string",
                 "description", "session id, taken from 'sessions'"));
@@ -194,7 +215,15 @@ public final class BrowserTool {
                 "description", "only for submit/click: why this action is wanted "
                         + "(shown to the reviewer)"));
         properties.put("waitSeconds", Map.of("type", "integer",
-                "description", "only for submit: approval window in seconds (default 300)"));
+                "description", "only for submit/renew: approval window in seconds (default 300)"));
+        properties.put("wait", Map.of("type", "boolean",
+                "description", "only for submit: true (default) blocks this call until the reviewer "
+                        + "decided; false files the request and returns the reviewId at once, which "
+                        + "action=resume/renew pick up later"));
+        properties.put("reviewId", Map.of("type", "string",
+                "description", "only for resume/renew: the reviewId a non-blocking submit returned"));
+        properties.put("note", Map.of("type", "string",
+                "description", "only for renew: why the request is re-armed (shown to the reviewer)"));
 
         JsonSchema schema = new JsonSchema("object", properties, List.of("action"), null, null, null);
         McpSchema.Tool tool = McpSchema.Tool.builder()
@@ -251,15 +280,20 @@ public final class BrowserTool {
                 case "click" -> click(backend, string(raw, "sessionId"), string(raw, "ref"),
                         string(raw, "reason"), arguments);
                 case "submit" -> submit(backend, string(raw, "sessionId"), string(raw, "ref"),
-                        string(raw, "reason"), integer(raw, "waitSeconds", 0), arguments);
+                        string(raw, "reason"), integer(raw, "waitSeconds", 0),
+                        !raw.containsKey("wait") || bool(raw, "wait"), arguments);
+                case "resume" -> resume(backend, string(raw, "reviewId"), arguments);
+                case "renew" -> renew(backend, string(raw, "reviewId"),
+                        integer(raw, "waitSeconds", 0), string(raw, "note"), arguments);
                 default -> error("unknown action '" + action + "'. Allowed: apps, open, sessions, "
                         + "state, refresh, find, locator, events, requests, request, log, "
-                        + "classify, fields, fill, undo, click, submit.");
+                        + "classify, fields, fill, undo, click, submit, resume, renew.");
             };
             // Write actions record themselves: they know their outcome (denied, expired, partial)
             // and carry redacted arguments - the generic recording below would log both wrong.
             boolean writeAction = action.equals("fill") || action.equals("undo")
-                    || action.equals("click") || action.equals("submit");
+                    || action.equals("click") || action.equals("submit")
+                    || action.equals("resume") || action.equals("renew");
             if (!action.equals("apps") && !action.equals("sessions") && !action.equals("classify")
                     && !writeAction) {
                 String sessionId = string(raw, "sessionId");
@@ -921,7 +955,7 @@ public final class BrowserTool {
         boolean submitButton = element.path("role").asString("").equals("button")
                 && "submit".equalsIgnoreCase(element.path("type").asString(""));
         if (submitButton) {
-            return gatedSubmit(backend, session, ref, element, reason, 0, arguments);
+            return gatedSubmit(backend, session, ref, element, reason, 0, true, arguments);
         }
         int beforeSeq = session.eventCount();
         String pageBefore = session.pageForDisplay();
@@ -943,20 +977,26 @@ public final class BrowserTool {
     }
 
     /**
-     * The gated save: review entry with the field diff, blocking wait, click only after APPROVED
-     * (decision L8) - or directly when the application is listed in
-     * {@code browser.apps.withoutReviews} (decision L9, visibly).
+     * The gated save: review entry with the field diff and the click only after APPROVED (decision L8)
+     * - or directly when the application is listed in {@code browser.apps.withoutReviews} (decision L9,
+     * visibly).
+     *
+     * <p>{@code wait} decides the <em>form</em> of the gate, not its strength (docs/browser.md §7.4):
+     * with {@code true} (default) this call blocks until a human decided; with {@code false} the
+     * request is only filed and the answer names the {@code reviewId}, which
+     * {@code browser(action=resume)} picks up later. The gate itself is the same in both cases - the
+     * click leaves the server only on APPROVED.</p>
      */
     private String submit(BrowserSessions backend, String sessionId, String ref, String reason,
-            int waitSeconds, JsonNode arguments) {
+            int waitSeconds, boolean wait, JsonNode arguments) {
         BrowserSession session = requireSession(backend, sessionId);
         requireWriteEnabled(backend);
         JsonNode element = requireElement(session, ref);
-        return gatedSubmit(backend, session, ref, element, reason, waitSeconds, arguments);
+        return gatedSubmit(backend, session, ref, element, reason, waitSeconds, wait, arguments);
     }
 
     private String gatedSubmit(BrowserSessions backend, BrowserSession session, String ref,
-            JsonNode element, String reason, int waitSeconds, JsonNode arguments) {
+            JsonNode element, String reason, int waitSeconds, boolean wait, JsonNode arguments) {
         String buttonLabel = element.path("label").asString("");
         if (buttonLabel.isEmpty()) {
             buttonLabel = ref;
@@ -1037,6 +1077,31 @@ public final class BrowserTool {
                 + session.app().id() + " - " + session.pageForDisplay(), ReviewAttributes.MAX_TITLE_CHARS);
 
         BrowserReviewService reviews = new BrowserReviewService();
+        if (!wait) {
+            // The interrupt form (docs/browser.md §7.4): file it, hand the id to the model, click
+            // nothing. The request outlives this call - that is the whole point, because a blocked call
+            // dies with its timeout while the reviewer may be away from the screen.
+            ReviewEntry entry = reviews.fileRequest(title, reason == null ? "" : reason, attributes,
+                    waitSeconds > 0 ? waitSeconds : null);
+            JsonNode fp = element.path("fp");
+            session.rememberPendingSubmit(new BrowserSession.PendingSubmit(entry.id(), ref,
+                    fp.path("role").asString(element.path("role").asString("")),
+                    fp.path("label").asString(""), buttonLabel, session.pageForDisplay(),
+                    session.rev(), Instant.now()));
+            session.recordAction("submit", args, "pending",
+                    "review=" + entry.id() + " (filed without waiting; resume presses the button)");
+            ObjectNode out = backend.mapper().createObjectNode();
+            out.put("reviewId", entry.id());
+            out.put("status", entry.status().display());
+            out.put("expiresAt", entry.expiresAtMillis());
+            out.put("remainingSeconds", entry.remainingSeconds());
+            out.put("submitted", false);
+            out.put("note", "filed for review, nothing was clicked. Tell the user the review id, end "
+                    + "your turn, and later call action=resume with this reviewId - it clicks the "
+                    + "button once a human approved. If the window runs out, action=renew re-arms it "
+                    + "(never approves anything).");
+            return out.toPrettyString();
+        }
         BrowserReviewService.Decision decision = reviews.awaitDecision(title,
                 reason == null ? "" : reason, attributes,
                 waitSeconds > 0 ? waitSeconds : null);
@@ -1051,8 +1116,25 @@ public final class BrowserTool {
                     + decision.status().display() + (decision.comment().isEmpty()
                     ? "." : " - comment: " + decision.comment());
         }
-        // Approved: now, and only now, does the click leave the server. The attribution note lets
-        // the capture tell this POST from a user submit (best effort, §7.5).
+        return executeApprovedSubmit(backend, session, ref, element, buttonLabel, entry, args);
+    }
+
+    /**
+     * The click of an approved submit - the same work whether the approval arrived at a blocking call or
+     * at a later {@code resume}. Only here, and only on APPROVED, does the click leave the server.
+     *
+     * @param backend     administration
+     * @param session     the session the approval belongs to
+     * @param ref         element address of the button
+     * @param element     the element from the current revision (fingerprint source)
+     * @param buttonLabel what the button reads (for the answer and the review entry)
+     * @param entry       the approved review request
+     * @param args        the model's arguments, for the action log
+     * @return the answer for the tool call
+     */
+    private String executeApprovedSubmit(BrowserSessions backend, BrowserSession session, String ref,
+            JsonNode element, String buttonLabel, ReviewEntry entry, JsonNode args) {
+        // The attribution note lets the capture tell this POST from a user submit (best effort, §7.5).
         int beforeSeq = session.eventCount();
         String pageBefore = session.pageForDisplay();
         session.beginLlmSubmit(entry.id());
@@ -1064,7 +1146,7 @@ public final class BrowserTool {
                 || ("no-answer-from-bridge".equals(failure)
                     && navigationFollowed(session, beforeSeq, pageBefore));
         boolean answerLost = !failure.isEmpty() && clicked;
-        reviews.submitResult(entry, clicked
+        new BrowserReviewService().submitResult(entry, clicked
                 ? ReviewResponseEntry.completed("click executed on '" + buttonLabel + "'"
                         + (answerLost ? " (answer lost on unload, navigation followed)" : ""),
                         List.of(), 0L)
@@ -1087,6 +1169,164 @@ public final class BrowserTool {
             out.put("note", "if the answer lacks a navigation, check action=events for 'nav' - the "
                     + "bridge's answer can be lost on unload");
         }
+        return out.toPrettyString();
+    }
+
+    /**
+     * The second half of a non-blocking submit (docs/browser.md §7.4, §13): read the decision and, on
+     * APPROVED, press the button the reviewer approved.
+     *
+     * <p>Three checks stand between an old approval and a click, and all three exist because the page
+     * may have moved on while nobody was looking - the counterpart of the Python workflow's SHA-256
+     * check before execution:</p>
+     * <ul>
+     *   <li>the session that filed the request must still exist (else the request is reported as an
+     *       error, not left "approved" as if somebody could still honour it),</li>
+     *   <li>the page must be the one the submit was prepared on (a page border voids the approval),</li>
+     *   <li>the element behind the ref must still be there and carry the same fingerprint (role +
+     *       label) - otherwise the request becomes {@code voided} and nothing is clicked.</li>
+     * </ul>
+     * <p>On PENDING it reports how long the window still runs; on DENIED/EXPIRED it says so honestly
+     * and clicks nothing. Idempotent: a completed request answers from the review entry.</p>
+     *
+     * @param backend  administration
+     * @param reviewId the review id a non-blocking submit returned
+     * @param args     the model's arguments, for the action log
+     * @return the answer for the tool call
+     */
+    private String resume(BrowserSessions backend, String reviewId, JsonNode args) {
+        BrowserReviewService reviews = new BrowserReviewService();
+        ReviewEntry entry = reviews.statusOf(reviewId);
+
+        BrowserSession session = null;
+        BrowserSession.PendingSubmit pending = null;
+        for (BrowserSession candidate : backend.sessions()) {
+            BrowserSession.PendingSubmit found = candidate.pendingSubmit(entry.id());
+            if (found != null) {
+                session = candidate;
+                pending = found;
+            }
+        }
+
+        if (entry.status() == ReviewStatus.PENDING) {
+            if (session != null) {
+                session.recordAction("resume", args, "pending", "review=" + entry.id());
+            }
+            ObjectNode out = backend.mapper().createObjectNode();
+            out.put("reviewId", entry.id());
+            out.put("status", entry.status().display());
+            out.put("expiresAt", entry.expiresAtMillis());
+            out.put("remainingSeconds", entry.remainingSeconds());
+            out.put("submitted", false);
+            out.put("note", "the reviewer has not decided yet - nothing was clicked. Ask the user, "
+                    + "end your turn and come back with action=resume, or action=renew to extend the "
+                    + "window.");
+            return out.toPrettyString();
+        }
+        if (entry.status() == ReviewStatus.DENIED) {
+            if (session != null) {
+                session.forgetPendingSubmit(entry.id());
+                session.recordAction("resume", args, "denied", "review=" + entry.id());
+            }
+            return "Not executed: review request " + entry.id() + " was DENIED"
+                    + (entry.comment().isEmpty() ? "." : " - comment: " + entry.comment())
+                    + " Nothing was clicked, and a denial cannot be re-armed: address the comment and "
+                    + "file a new submit if the action is still wanted.";
+        }
+        if (entry.status() == ReviewStatus.EXPIRED) {
+            if (session != null) {
+                session.recordAction("resume", args, "expired", "review=" + entry.id());
+            }
+            return "Not executed: the approval window of review request " + entry.id() + " ran out"
+                    + (entry.comment().isEmpty() ? "." : " (" + entry.comment() + ")")
+                    + " Nothing was clicked. action=renew with that reviewId opens the window again "
+                    + "(same page, same diff; a human still decides).";
+        }
+        if (entry.status() != ReviewStatus.APPROVED) {
+            return "Review request " + entry.id() + " is already " + entry.status().display()
+                    + " - use action=log or the review page to see what happened.";
+        }
+        // APPROVED: the only path that clicks - and only for the page and the control that was approved.
+        if (session == null || pending == null) {
+            String why = "no session of this server holds the pending submit any more (a restart clears "
+                    + "sessions; a closed tab ends them) - nothing was clicked";
+            reviews.submitResult(entry, ReviewResponseEntry.error("approved, not executed", why));
+            return "Review request " + entry.id() + " is APPROVED, but " + why + ".";
+        }
+        if (!pending.page().equals(session.pageForDisplay())) {
+            String why = "the session is on '" + session.pageForDisplay() + "' now, the approval "
+                    + "belongs to '" + pending.page() + "' - a page border voids it";
+            reviews.submitResult(entry, new ReviewResponseEntry(ReviewStatus.VOIDED, false,
+                    "approved, not executed: the page changed", List.of(), why, 0L));
+            session.forgetPendingSubmit(entry.id());
+            session.recordAction("resume", args, "voided", "review=" + entry.id() + ": " + why);
+            return "Not executed: " + why + ". Nothing was clicked - take a fresh state and submit "
+                    + "again if the action is still wanted.";
+        }
+        JsonNode element = session.element(pending.ref());
+        if (element == null) {
+            String why = "ref '" + pending.ref() + "' is not in revision " + session.rev()
+                    + " any more - the button the reviewer approved does not exist";
+            reviews.submitResult(entry, new ReviewResponseEntry(ReviewStatus.VOIDED, false,
+                    "approved, not executed: the button is gone", List.of(), why, 0L));
+            session.forgetPendingSubmit(entry.id());
+            session.recordAction("resume", args, "voided", "review=" + entry.id() + ": " + why);
+            return "Not executed: " + why + ". Nothing was clicked - take a fresh state and submit "
+                    + "again if the action is still wanted.";
+        }
+        JsonNode fp = element.path("fp");
+        String role = fp.path("role").asString(element.path("role").asString(""));
+        String label = fp.path("label").asString("");
+        if (!role.equals(pending.role()) || !label.equals(pending.label())) {
+            String why = "the control at '" + pending.ref() + "' is now '" + role + "|" + label
+                    + "' instead of '" + pending.role() + "|" + pending.label() + "' - the reviewer "
+                    + "approved another button";
+            reviews.submitResult(entry, new ReviewResponseEntry(ReviewStatus.VOIDED, false,
+                    "approved, not executed: the control changed", List.of(), why, 0L));
+            session.forgetPendingSubmit(entry.id());
+            session.recordAction("resume", args, "voided", "review=" + entry.id() + ": " + why);
+            return "Not executed: " + why + ". Nothing was clicked.";
+        }
+        session.forgetPendingSubmit(entry.id());
+        return executeApprovedSubmit(backend, session, pending.ref(), element,
+                pending.buttonLabel(), entry, args);
+    }
+
+    /**
+     * Re-arms a non-blocking submit whose approval window ran out - same id, same page, same diff, so
+     * the model does not have to transmit the whole request again. It never approves anything (a human
+     * still decides) and never touches a decided request: a denial is final (see
+     * {@link BrowserReviewService#renewEntry}).
+     *
+     * @param backend     administration
+     * @param reviewId    the review id a non-blocking submit returned
+     * @param waitSeconds new window in seconds, 0 keeps the previous one
+     * @param note        why the request is re-armed (shown to the reviewer)
+     * @param args        the model's arguments, for the action log
+     * @return the answer for the tool call
+     */
+    private String renew(BrowserSessions backend, String reviewId, int waitSeconds, String note,
+            JsonNode args) {
+        BrowserReviewService reviews = new BrowserReviewService();
+        ReviewEntry entry = reviews.renewEntry(reviewId, waitSeconds > 0 ? waitSeconds : null, note);
+        BrowserSession session = null;
+        for (BrowserSession candidate : backend.sessions()) {
+            if (candidate.pendingSubmit(entry.id()) != null) {
+                session = candidate;
+                candidate.recordAction("renew", args, entry.status().display(),
+                        "review=" + entry.id() + " (attempt " + entry.renewCount() + ")");
+            }
+        }
+        ObjectNode out = backend.mapper().createObjectNode();
+        out.put("reviewId", entry.id());
+        out.put("status", entry.status().display());
+        out.put("expiresAt", entry.expiresAtMillis());
+        out.put("remainingSeconds", entry.remainingSeconds());
+        out.put("renewCount", entry.renewCount());
+        out.put("submitted", false);
+        out.put("session", session == null ? "" : session.id());
+        out.put("note", "the window is open again and the reviewer sees that you asked again - nothing "
+                + "was approved or clicked. End your turn and come back with action=resume.");
         return out.toPrettyString();
     }
 

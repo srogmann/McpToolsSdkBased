@@ -31,6 +31,17 @@
   var session = params.get('s') || '';
   var expectVersion = parseInt(params.get('v') || '1', 10);
 
+  /* The channel protocol this script speaks - separate from the code version above: the version moves
+     with every fix, the protocol only when the meaning of a message changes. Both travel in hello, so
+     the server can tell "what is here" from "what it understands" (docs/browser.md §6, §13). */
+  var PROTOCOL_VERSION = 1;
+
+  /* Every command type this script can execute. The server reads the list from hello and does not
+     send anything else: a command outside it would be answered "unsupported-command" and cost a round
+     trip, and a page can only be reloaded by a human. */
+  var COMMANDS = ['ping', 'snapshot', 'scroll', 'stop', 'observe', 'fill', 'set', 'select', 'paste',
+                  'click', 'submit', 'undo'];
+
   // Secure this before every patch: the bridge itself talks over the original APIs.
   var nativeFetch = window.fetch ? window.fetch.bind(window) : null;
 
@@ -1280,7 +1291,20 @@
       }
       return doUndo(command);
     }
-    return Promise.resolve({ t: 'result', id: command.id, ok: false, error: 'unknown-command' });
+    // Unrecognised material is not a failure of this page (AG-UI's processing model, docs/browser.md
+    // §6): a newer server asked for something this script does not know. The answer stays a
+    // well-formed result - the channel survives, the server does not wait out its ceiling - but it
+    // says *unsupported* rather than *failed*, so the server can name the real remedy (reload the page
+    // to load the current script) instead of reporting a broken operation.
+    if (window.console && console.warn) {
+      console.warn('bridge: unsupported command "' + type + '" (protocol ' + PROTOCOL_VERSION
+                   + ') - the server is newer than this document; reload the page', command);
+    }
+    return Promise.resolve({ t: 'result', id: command.id, ok: false, op: type,
+                             error: 'unsupported-command', unsupported: true,
+                             protocolVersion: PROTOCOL_VERSION, commands: COMMANDS,
+                             hint: 'this document runs a bridge that does not know "' + type
+                                   + '" - reload the page (the server is newer than the script)' });
   }
 
   function pollLoop() {
@@ -1365,7 +1389,8 @@
         paintBadge();
         post({ t: 'hello', frame: framePath, url: location.pathname + location.search,
            title: trimText(document.title, 120),
-               frames: frameCount(), bridgeVersion: expectVersion, write: !!CONFIG.write });
+               frames: frameCount(), bridgeVersion: expectVersion, write: !!CONFIG.write,
+               protocolVersion: PROTOCOL_VERSION, commands: COMMANDS });
         // The first snapshot comes by itself as soon as the page rests: otherwise the LLM would always
         // have to pay one channel round trip first before seeing anything at all.
         quiescent(2500).then(function () { return snapshot(null, true); })
