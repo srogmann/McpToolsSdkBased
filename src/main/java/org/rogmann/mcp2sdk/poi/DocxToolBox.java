@@ -28,6 +28,7 @@ import org.apache.xmlbeans.XmlCursor;
 import org.apache.xmlbeans.XmlException;
 import org.apache.xmlbeans.XmlObject;
 import org.apache.xmlbeans.XmlToken;
+import org.rogmann.mcp2sdk.js.JsErrorCode;
 import org.openxmlformats.schemas.drawingml.x2006.main.CTNonVisualDrawingProps;
 import org.openxmlformats.schemas.drawingml.x2006.main.CTPositiveSize2D;
 import org.openxmlformats.schemas.drawingml.x2006.wordprocessingDrawing.CTInline;
@@ -48,6 +49,7 @@ import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTTcBorders;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTTcPr;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTVMerge;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.STBorder;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.STLineSpacingRule;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.STMerge;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.STNumberFormat;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.STPageOrientation;
@@ -250,10 +252,10 @@ public class DocxToolBox {
     public String openFile(String filePath) {
         Path path = PoiPaths.resolveSafePath(filePath);
         if (!Files.exists(path)) {
-            throw new PoiUserRuntimeException("File not found: " + filePath);
+            throw notFound("File not found: " + filePath);
         }
         if (!Files.isRegularFile(path)) {
-            throw new PoiUserRuntimeException("Not a file: " + filePath);
+            throw notFound("Not a file: " + filePath);
         }
         try (FileInputStream fis = new FileInputStream(path.toFile())) {
             XWPFDocument doc = new XWPFDocument(fis);
@@ -287,7 +289,7 @@ public class DocxToolBox {
     public void save(String docHandle, String filePath) {
         XWPFDocument doc = documents.get(docHandle);
         if (doc == null) {
-            throw new PoiUserRuntimeException("Document not found (invalid handle): " + docHandle);
+            throw notFound("Document not found (invalid handle): " + docHandle);
         }
         Path path = PoiPaths.resolveSafePath(filePath);
         try {
@@ -415,7 +417,7 @@ public class DocxToolBox {
     public Map<String, Object> getParagraphs(String docHandle, boolean includeProps) {
         XWPFDocument doc = documents.get(docHandle);
         if (doc == null) {
-            throw new PoiUserRuntimeException("Document not found (invalid handle): " + docHandle);
+            throw notFound("Document not found (invalid handle): " + docHandle);
         }
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("document", docHandle);
@@ -470,7 +472,7 @@ public class DocxToolBox {
     public String getDocumentText(String docHandle, boolean includeTables, boolean includeSdt) {
         XWPFDocument doc = documents.get(docHandle);
         if (doc == null) {
-            throw new PoiUserRuntimeException("Document not found (invalid handle): " + docHandle);
+            throw notFound("Document not found (invalid handle): " + docHandle);
         }
         if (!includeTables && !includeSdt) {
             StringBuilder sb = new StringBuilder();
@@ -519,7 +521,7 @@ public class DocxToolBox {
     public String createParagraph(String docHandle, String text) {
         XWPFDocument doc = documents.get(docHandle);
         if (doc == null) {
-            throw new PoiUserRuntimeException("Document not found (invalid handle): " + docHandle);
+            throw notFound("Document not found (invalid handle): " + docHandle);
         }
         XWPFParagraph p = doc.createParagraph();
         XWPFRun run = p.createRun();
@@ -531,6 +533,99 @@ public class DocxToolBox {
         runs.put(rh, run);
         runDoc.put(rh, docHandle);
         return ph;
+    }
+
+    /**
+     * Creates a new paragraph at the end of the document and gives it a style in the same call.
+     * <p>
+     * The shortcut for {@link #createParagraph(String, String)} plus
+     * {@link #setParagraphStyle(String, String)} - which is what a heading is: not bold and
+     * bigger, but a paragraph with a style. The style is resolved before the paragraph is
+     * created, so a misspelt style leaves no empty paragraph behind.
+     * </p>
+     * @param docHandle document handle
+     * @param text initial text
+     * @param options {@code style} - style id or name, e.g. {@code "Heading 1"} (see
+     *                {@link #listStyleKeys(String)})
+     * @return paragraph handle
+     */
+    public String createParagraph(String docHandle, String text, Map<String, Object> options) {
+        requireKnownOptions("createParagraph", options, "style");
+        String style = optString("createParagraph", options, "style", null);
+        if (style != null) {
+            resolveStyleId("createParagraph", requireDocument(docHandle), style);
+        }
+        String ph = createParagraph(docHandle, text);
+        if (style != null) {
+            setParagraphStyle(ph, style);
+        }
+        return ph;
+    }
+
+    /**
+     * Appends a list: one paragraph per entry, all carrying the same list definition.
+     * <p>
+     * This is the counterpart of typing "• " or "1." into the text: the bullets/numbers then come
+     * from {@code numbering.xml}, Word renumbers them itself, and
+     * {@link #getParagraphProps(String)} can read the list back ({@code numId}, {@code ilvl},
+     * {@code numFmt}). The definition is allocated once ({@link #ensureNumbering(String)}) and
+     * reused for every entry, so the result is one list and not one list per line.
+     * </p>
+     * @param docHandle document handle
+     * @param items the entries, one paragraph each (an empty string is an empty list item)
+     * @param options {@code type} ({@code bullet}|{@code decimal}|{@code multilevel}, default
+     *                {@code bullet}), {@code level} 0..8 (default 0), optional {@code style}
+     *                applied to every paragraph (e.g. {@code "ListParagraph"})
+     * @return JSON-compatible Map with {@code numId}, {@code ilvl}, {@code type},
+     *         {@code abstractId}, {@code reused}, {@code style}, {@code count} and
+     *         {@code paragraphs} (the paragraph handles in order)
+     */
+    public Map<String, Object> createList(String docHandle, List<String> items,
+                                          Map<String, Object> options) {
+        requireKnownOptions("createList", options, "type", "level", "style");
+        if (items == null || items.isEmpty()) {
+            throw new PoiUserRuntimeException(JsErrorCode.ARGUMENT_INVALID,
+                    "createList: argument 'items' must contain at least one string, but was empty.");
+        }
+        XWPFDocument doc = requireDocument(docHandle);
+        String kind = optString("createList", options, "type", "bullet").toLowerCase(Locale.ROOT);
+        if (!LIST_KINDS.contains(kind)) {
+            throw new PoiUserRuntimeException(JsErrorCode.ARGUMENT_INVALID,
+                    "createList: option 'type' must be one of " + String.join(", ", LIST_KINDS)
+                            + ", but was: '" + kind + "'");
+        }
+        Double levelValue = optNumber("createList", options, "level", 0, 8, 0.0);
+        String style = optString("createList", options, "style", null);
+        if (style != null) {
+            // Resolved before the first paragraph exists: half a list must not survive an error.
+            resolveStyleId("createList", doc, style);
+        }
+        Map<String, Object> numberingOptions = new LinkedHashMap<>();
+        numberingOptions.put("type", kind);
+        numberingOptions.put("level", levelValue);
+        List<String> handles = new ArrayList<>();
+        Map<String, Object> numbering = null;
+        for (String item : items) {
+            if (item == null) {
+                throw new PoiUserRuntimeException(JsErrorCode.ARGUMENT_INVALID,
+                        "createList: argument 'items' must not contain null (use an empty string"
+                                + " for an empty list item).");
+            }
+            String ph = createParagraph(docHandle, item);
+            if (style != null) {
+                setParagraphStyle(ph, style);
+            }
+            numbering = setParagraphNumbering(ph, numberingOptions);
+            handles.add(ph);
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        if (numbering != null) {
+            out.putAll(numbering);
+        }
+        out.put("style", style);
+        out.put("count", handles.size());
+        out.put("paragraphs", handles);
+        return out;
     }
 
     /**
@@ -624,7 +719,7 @@ public class DocxToolBox {
     public void removeRow(String docHandle, int tableIndex, int rowIndex) {
         XWPFDocument doc = documents.get(docHandle);
         if (doc == null) {
-            throw new PoiUserRuntimeException("Document not found (invalid handle): " + docHandle);
+            throw notFound("Document not found (invalid handle): " + docHandle);
         }
         List<XWPFTable> tables = doc.getTables();
         if (tableIndex < 0 || tableIndex >= tables.size()) {
@@ -650,7 +745,7 @@ public class DocxToolBox {
     public void setRowFontColor(String docHandle, int tableIndex, int rowIndex, String hexColor) {
         XWPFDocument doc = documents.get(docHandle);
         if (doc == null) {
-            throw new PoiUserRuntimeException("Document not found (invalid handle): " + docHandle);
+            throw notFound("Document not found (invalid handle): " + docHandle);
         }
         List<XWPFTable> tables = doc.getTables();
         if (tableIndex < 0 || tableIndex >= tables.size()) {
@@ -689,7 +784,7 @@ public class DocxToolBox {
     public void setCellFontColor(String docHandle, int tableIndex, int rowIndex, int colIndex, String hexColor) {
         XWPFDocument doc = documents.get(docHandle);
         if (doc == null) {
-            throw new PoiUserRuntimeException("Document not found (invalid handle): " + docHandle);
+            throw notFound("Document not found (invalid handle): " + docHandle);
         }
         List<XWPFTable> tables = doc.getTables();
         if (tableIndex < 0 || tableIndex >= tables.size()) {
@@ -729,7 +824,7 @@ public class DocxToolBox {
     public String addRun(String paragraphHandle, String text) {
         XWPFParagraph p = paragraphs.get(paragraphHandle);
         if (p == null) {
-            throw new PoiUserRuntimeException("Paragraph not found (invalid handle): " + paragraphHandle);
+            throw notFound("Paragraph not found (invalid handle): " + paragraphHandle);
         }
         XWPFRun run = p.createRun();
         run.setText(text == null ? "" : text);
@@ -747,7 +842,7 @@ public class DocxToolBox {
     public String getParagraphText(String paragraphHandle) {
         XWPFParagraph p = paragraphs.get(paragraphHandle);
         if (p == null) {
-            throw new PoiUserRuntimeException("Paragraph not found (invalid handle): " + paragraphHandle);
+            throw notFound("Paragraph not found (invalid handle): " + paragraphHandle);
         }
         return p.getText();
     }
@@ -899,7 +994,7 @@ public class DocxToolBox {
     public Map<String, Object> getRuns(String paragraphHandle) {
         XWPFParagraph p = paragraphs.get(paragraphHandle);
         if (p == null) {
-            throw new PoiUserRuntimeException("Paragraph not found (invalid handle): " + paragraphHandle);
+            throw notFound("Paragraph not found (invalid handle): " + paragraphHandle);
         }
         List<Map<String, Object>> runsList = new ArrayList<>();
         for (XWPFRun run : p.getRuns()) {
@@ -930,7 +1025,7 @@ public class DocxToolBox {
     public Map<String, Object> getParagraphProps(String paragraphHandle) {
         XWPFParagraph p = paragraphs.get(paragraphHandle);
         if (p == null) {
-            throw new PoiUserRuntimeException("Paragraph not found (invalid handle): " + paragraphHandle);
+            throw notFound("Paragraph not found (invalid handle): " + paragraphHandle);
         }
         String docHandle = paragraphDoc.get(paragraphHandle);
         XWPFDocument doc = docHandle == null ? null : documents.get(docHandle);
@@ -1042,7 +1137,7 @@ public class DocxToolBox {
     public Map<String, Object> getBodyElements(String docHandle) {
         XWPFDocument doc = documents.get(docHandle);
         if (doc == null) {
-            throw new PoiUserRuntimeException("Document not found (invalid handle): " + docHandle);
+            throw notFound("Document not found (invalid handle): " + docHandle);
         }
         var sdtBlocks = doc.getDocument().getBody().getSdtList();
         int sdtSeen = 0;
@@ -1083,16 +1178,22 @@ public class DocxToolBox {
     }
 
     /**
-     * Lists the styles of a document: style id, display name, base style, outline level
-     * and size. Both are needed because LibreOffice and Word disagree about which of
-     * {@code w:styleId} and {@code w:name} carries the readable name.
+     * Lists the styles of a document: style id, display name, base style, outline level, size
+     * and the vertical distance the style carries ({@code beforePt}, {@code afterPt},
+     * {@code line}, {@code lineRule}).
+     * <p>
+     * Id and name are both needed because LibreOffice and Word disagree about which of
+     * {@code w:styleId} and {@code w:name} carries the readable name. The spacing is read from
+     * the style itself - it is the value that separates a heading from the text above it, and it
+     * is where OOXML keeps it (a document from {@code createDocument()} has no defaults at all).
+     * </p>
      * @param docHandle document handle
      * @return JSON-compatible Map with key "styles"
      */
     public Map<String, Object> getStylesInfo(String docHandle) {
         XWPFDocument doc = documents.get(docHandle);
         if (doc == null) {
-            throw new PoiUserRuntimeException("Document not found (invalid handle): " + docHandle);
+            throw notFound("Document not found (invalid handle): " + docHandle);
         }
         List<Map<String, Object>> stylesList = new ArrayList<>();
         var styles = doc.getStyles();
@@ -1110,6 +1211,29 @@ public class DocxToolBox {
                 var sz = rPr == null ? null : firstOf(rPr.getSzList());
                 // w:sz counts half-points, w:spacing/w:ind count twips - two different scales
                 sm.put("fontSizePt", sz == null ? null : halfPointsToPt(intOf(sz.getVal())));
+                // The vertical distances live in the style (see BUILT_IN_STYLES): without them a
+                // heading sits flush on the paragraph above.
+                var spacing = pPr == null ? null : pPr.getSpacing();
+                // An attribute that is NOT in the file reads as its schema default (0, "auto"), so
+                // "0 pt after" and "no w:after at all" would look the same; isSetX() separates
+                // them, and that difference is the answer to "does this style carry the distance
+                // itself or inherit it?".
+                boolean hasSpacing = spacing != null;
+                // w:line is a factor in 240ths with lineRule "auto", and points otherwise
+                Integer line = !hasSpacing || !spacing.isSetLine() ? null : intOf(spacing.getLine());
+                String lineRule = !hasSpacing || !spacing.isSetLineRule()
+                        ? (line == null ? null : "auto") : String.valueOf(spacing.getLineRule());
+                // The attributes have anonymous simple types, so XmlBeans hands them out as
+                // Object - intOf() is the converter for exactly that case.
+                sm.put("beforePt", !hasSpacing || !spacing.isSetBefore()
+                        ? null : pt(intOf(spacing.getBefore())));
+                sm.put("afterPt", !hasSpacing || !spacing.isSetAfter()
+                        ? null : pt(intOf(spacing.getAfter())));
+                sm.put("lineRule", lineRule);
+                sm.put("line", line == null ? null
+                        : ("auto".equalsIgnoreCase(lineRule)
+                        ? Math.round(line / 240.0 * 100.0) / 100.0
+                        : pt(line)));
                 stylesList.add(sm);
             }
         }
@@ -1131,7 +1255,7 @@ public class DocxToolBox {
     public Map<String, Object> getNumberingInfo(String docHandle) {
         XWPFDocument doc = documents.get(docHandle);
         if (doc == null) {
-            throw new PoiUserRuntimeException("Document not found (invalid handle): " + docHandle);
+            throw notFound("Document not found (invalid handle): " + docHandle);
         }
         var numbering = doc.getNumbering();
         List<Map<String, Object>> nums = new ArrayList<>();
@@ -1169,7 +1293,7 @@ public class DocxToolBox {
     public Map<String, Object> getHeadersFooters(String docHandle) {
         XWPFDocument doc = documents.get(docHandle);
         if (doc == null) {
-            throw new PoiUserRuntimeException("Document not found (invalid handle): " + docHandle);
+            throw notFound("Document not found (invalid handle): " + docHandle);
         }
         Map<String, XWPFHeaderFooter> headers = partsByName(doc.getHeaderList(), "header");
         Map<String, XWPFHeaderFooter> footers = partsByName(doc.getFooterList(), "footer");
@@ -1226,7 +1350,7 @@ public class DocxToolBox {
     public Map<String, Object> getPictures(String docHandle) {
         XWPFDocument doc = documents.get(docHandle);
         if (doc == null) {
-            throw new PoiUserRuntimeException("Document not found (invalid handle): " + docHandle);
+            throw notFound("Document not found (invalid handle): " + docHandle);
         }
         List<Map<String, Object>> pics = new ArrayList<>();
         for (var pic : doc.getAllPictures()) {
@@ -1267,7 +1391,7 @@ public class DocxToolBox {
     public Map<String, Object> getHyperlinks(String docHandle) {
         XWPFDocument doc = documents.get(docHandle);
         if (doc == null) {
-            throw new PoiUserRuntimeException("Document not found (invalid handle): " + docHandle);
+            throw notFound("Document not found (invalid handle): " + docHandle);
         }
         Map<String, String> urlById = new LinkedHashMap<>();
         for (var link : doc.getHyperlinks()) {
@@ -1303,7 +1427,7 @@ public class DocxToolBox {
     public Map<String, Object> getDocumentInfo(String docHandle) {
         XWPFDocument doc = documents.get(docHandle);
         if (doc == null) {
-            throw new PoiUserRuntimeException("Document not found (invalid handle): " + docHandle);
+            throw notFound("Document not found (invalid handle): " + docHandle);
         }
         int paragraphs = 0;
         int tables = 0;
@@ -1362,7 +1486,7 @@ public class DocxToolBox {
     public Map<String, Object> getFields(String paragraphHandle) {
         XWPFParagraph p = paragraphs.get(paragraphHandle);
         if (p == null) {
-            throw new PoiUserRuntimeException("Paragraph not found (invalid handle): " + paragraphHandle);
+            throw notFound("Paragraph not found (invalid handle): " + paragraphHandle);
         }
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("paragraph", paragraphHandle);
@@ -2680,8 +2804,14 @@ public class DocxToolBox {
      * Sets the paragraph style of an existing paragraph (D4: id, display name or canonical
      * match). The style must exist - a reference to a missing style renders as "Normal"
      * in Word and would fail silently, so this throws and lists the available styles.
+     * <p>
+     * The keys are the ones the file carries: {@code Heading1}, {@code heading 1} or
+     * {@code "Heading 1"}. A localized label such as Word's "Überschrift 1" is <em>not</em> a key
+     * - OOXML stores the English built-in name in every language ({@code w:name="heading 1"}),
+     * the translation happens only in the user interface.
+     * </p>
      * @param paragraphHandle paragraph handle
-     * @param style style id or name, e.g. "Heading1" or "Überschrift 1"
+     * @param style style id or name, e.g. "Heading1" or "heading 1"
      */
     public void setParagraphStyle(String paragraphHandle, String style) {
         XWPFParagraph p = requireParagraph(paragraphHandle);
@@ -2756,34 +2886,72 @@ public class DocxToolBox {
     /**
      * Lists the styles of a document in the order Word would show them, with the keys that
      * resolve (D4). Errors from the style setters refer to this list.
+     * <p>
+     * A document created by {@code docx.createDocument()} has no {@code styles.xml} yet:
+     * {@link #setParagraphStyle(String, String)} builds it on demand ({@link #ensureStyles(String)}).
+     * Answering with an empty list would read as "this document has no styles" and sends the
+     * caller back to hand-formatted runs - the mistake {@code docs/js/docx.md} §7.2 warns about -
+     * so for such a document the list shows what that first style write would create, each entry
+     * marked {@code pending: true}. Once the part exists the entries carry no {@code pending} key.
+     * </p>
      * @param docHandle document handle
-     * @return list of {@code {styleId, name, canonical}}
+     * @return list of {@code {styleId, name, canonical}} (plus {@code pending: true} for the
+     *         styles a new document would get)
      */
     public List<Map<String, Object>> listStyleKeys(String docHandle) {
         XWPFDocument doc = requireDocument(docHandle);
         List<Map<String, Object>> out = new ArrayList<>();
         var styles = doc.getStyles();
         if (styles == null) {
+            for (BuiltInStyle style : BUILT_IN_STYLES) {
+                out.add(styleKeyEntry(style.id(), style.name(), true));
+            }
+            out.add(styleKeyEntry("TableGrid", "Table Grid", true));
             return out;
         }
         for (var style : styles.getStyles()) {
-            Map<String, Object> sm = new LinkedHashMap<>();
-            sm.put("styleId", style.getStyleId());
-            sm.put("name", style.getName());
-            sm.put("canonical", styleKeys(style.getStyleId()).toString());
-            out.add(sm);
+            out.add(styleKeyEntry(style.getStyleId(), style.getName(), false));
         }
         return out;
+    }
+
+    /**
+     * One entry of {@link #listStyleKeys(String)}.
+     * @param styleId the style id
+     * @param name the stored name
+     * @param pending true if the style does not exist yet and the first style write would create it
+     * @return JSON-compatible Map
+     */
+    private static Map<String, Object> styleKeyEntry(String styleId, String name, boolean pending) {
+        Map<String, Object> sm = new LinkedHashMap<>();
+        sm.put("styleId", styleId);
+        sm.put("name", name);
+        sm.put("canonical", styleKeys(styleId).toString());
+        if (pending) {
+            sm.put("pending", true);
+        }
+        return sm;
     }
 
     // ------------------------------------------------------------------------
     // Table / style helpers
     // ------------------------------------------------------------------------
 
+    /**
+     * A user error of the kind {@link JsErrorCode#NOT_FOUND}: a handle that names nothing, or a
+     * file that is not there. The code lets a caller tell "your handle is stale" from "your
+     * arguments are wrong" without reading the message.
+     * @param message the message for the caller
+     * @return the exception to throw
+     */
+    private static PoiUserRuntimeException notFound(String message) {
+        return new PoiUserRuntimeException(JsErrorCode.NOT_FOUND, message);
+    }
+
     private XWPFDocument requireDocument(String docHandle) {
         XWPFDocument doc = documents.get(docHandle);
         if (doc == null) {
-            throw new PoiUserRuntimeException("Document not found (invalid handle): " + docHandle);
+            throw notFound("Document not found (invalid handle): " + docHandle);
         }
         return doc;
     }
@@ -2791,7 +2959,7 @@ public class DocxToolBox {
     private XWPFParagraph requireParagraph(String paragraphHandle) {
         XWPFParagraph p = paragraphs.get(paragraphHandle);
         if (p == null) {
-            throw new PoiUserRuntimeException("Paragraph not found (invalid handle): " + paragraphHandle);
+            throw notFound("Paragraph not found (invalid handle): " + paragraphHandle);
         }
         return p;
     }
@@ -2813,7 +2981,7 @@ public class DocxToolBox {
     private XWPFTable requireTableByHandle(String tableHandle) {
         XWPFTable table = tables.get(tableHandle);
         if (table == null) {
-            throw new PoiUserRuntimeException("Table not found (invalid handle): " + tableHandle
+            throw notFound("Table not found (invalid handle): " + tableHandle
                     + ". Table handles come from docx.createTable(...) or docx.getTables(...).");
         }
         return table;
@@ -2911,6 +3079,13 @@ public class DocxToolBox {
                 paragraph.removeRun(i);
             }
         }
+        // A cell paragraph inherits the body spacing of Normal (7 pt after, 1.15 line). That is
+        // right for a report paragraph and wrong for a cell: every row would grow by the gap and a
+        // table drawn with three-millimetre rows would stop being one. The reset is direct
+        // formatting on purpose - it is a property of the cell, not of the text style.
+        paragraph.setSpacingBefore(0);
+        paragraph.setSpacingAfter(0);
+        paragraph.setSpacingBetween(1.0);
         paragraph.createRun().setText(safe);
     }
 
@@ -4131,8 +4306,11 @@ public class DocxToolBox {
                 }
             }
         }
-        throw new PoiUserRuntimeException(fn + ": unknown style '" + requested
-                + "'. This document has: " + styleSummary(styles) + ". See docx.getStylesInfo(doc).");
+        throw new PoiUserRuntimeException(JsErrorCode.STYLE_UNKNOWN, fn + ": unknown style '" + requested + "'."
+                + " This document has: " + styleSummary(styles) + ". Use one of those ids or names;"
+                + " a localized label from the UI is not a key - OOXML stores the English built-in"
+                + " name in every language (Word shows 'Überschrift 1', the file says 'heading 1')."
+                + " See docx.listStyleKeys(doc).");
     }
 
     /**
@@ -4268,8 +4446,9 @@ public class DocxToolBox {
         Set<String> allowed = Set.of(known);
         for (String key : options.keySet()) {
             if (!allowed.contains(key)) {
-                throw new PoiUserRuntimeException(fn + ": unknown option '" + key + "' (known: "
-                        + String.join(", ", known) + "). See docx.help().");
+                throw new PoiUserRuntimeException(JsErrorCode.ARGUMENT_INVALID, fn + ": unknown"
+                        + " option '" + key + "' (known: " + String.join(", ", known)
+                        + "). See docx.help().");
             }
         }
     }
@@ -4344,6 +4523,67 @@ public class DocxToolBox {
     public static final List<String> LIST_KINDS = List.of("bullet", "decimal", "multilevel");
 
     /**
+     * A paragraph style of the built-in styles part - the one source of
+     * {@link #ensureStyles(String)} and of the "which keys would resolve" answer of
+     * {@link #listStyleKeys(String)}.
+     * <p>
+     * The names are the <em>English</em> built-in names ({@code heading 1}) because that is what
+     * OOXML stores in {@code w:name} in every language: a German Word shows "Überschrift 1" for
+     * the very same style, the file still says "heading 1" (measured on the German LibreOffice
+     * fixtures, whose style set carries {@code w:name="heading 1"} too). A localized name is
+     * therefore never a key - only the id, the stored name and their canonical forms are.
+     * </p>
+     * @param id the style id ({@code w:styleId})
+     * @param name the stored name ({@code w:name})
+     * @param outlineLvl the outline level, null for a body style
+     * @param sizePt the font size in points
+     * @param bold whether the style is bold
+     * @param keepNext whether the style keeps the following paragraph on the same page
+     * @param italic whether the style is italic
+     * @param basedOn the id of the base style, null for none
+     * @param beforePt space above a paragraph of this style, in points (null: not written, so a
+     *                 base style's value stays in force)
+     * @param afterPt space below, in points (null: not written)
+     * @param lineFactor line spacing as a factor (1.15 = 276/240), null for single/not written
+     */
+    private record BuiltInStyle(String id, String name, Integer outlineLvl, double sizePt,
+                                boolean bold, boolean keepNext, boolean italic, String basedOn,
+                                Double beforePt, Double afterPt, Double lineFactor) { }
+
+    /**
+     * The paragraph styles of the styles part {@link #ensureStyles(String)} builds, in Word's order.
+     * <p>
+     * The vertical distances are part of the styles on purpose: a document from
+     * {@code createDocument()} has no {@code w:docDefaults} and no {@code Normal} spacing, so
+     * without them every heading sits flush on the paragraph above and the sheet looks like a
+     * list of lines. OOXML puts them here as well - Word's own template carries
+     * {@code w:spacing} in {@code Heading 1..9}, not in the defaults (measured: a German
+     * LibreOffice document carries {@code before=240 after=120} on Heading1..3, {@code before=0
+     * after=140 line=276} on BodyText, and {@code Normal} with no spacing at all - the numbers
+     * below are those of that family, rounded to points).
+     * </p>
+     */
+    private static final List<BuiltInStyle> BUILT_IN_STYLES = List.of(
+            new BuiltInStyle("Normal", "Normal", null, 12.0, false, false, false, null,
+                    0.0, 7.0, 1.15),
+            new BuiltInStyle("Heading1", "heading 1", 0, 16.0, true, true, false, "Normal",
+                    12.0, 6.0, null),
+            new BuiltInStyle("Heading2", "heading 2", 1, 14.0, true, true, false, "Normal",
+                    10.0, 6.0, null),
+            new BuiltInStyle("Heading3", "heading 3", 2, 12.0, true, true, false, "Normal",
+                    7.0, 6.0, null),
+            new BuiltInStyle("Title", "Title", null, 28.0, true, false, false, "Normal",
+                    0.0, 6.0, null),
+            new BuiltInStyle("Subtitle", "Subtitle", null, 16.0, false, false, true, "Normal",
+                    0.0, 12.0, null),
+            // no own spacing: ListParagraph is based on Normal and inherits its body spacing,
+            // which is what a list item wants (the paragraph after it gets the gap).
+            new BuiltInStyle("ListParagraph", "List Paragraph", null, 12.0, false, false, false,
+                    "Normal", null, null, null),
+            new BuiltInStyle("Caption", "caption", null, 12.0, false, false, true, "Normal",
+                    6.0, 6.0, null));
+
+    /**
      * Makes sure the document has a styles part with the built-in set: Normal, Heading1-3
      * (with a real {@code w:outlineLvl}, which is what puts them in Word's outline view),
      * Title, Subtitle, ListParagraph, Caption and the table style TableGrid.
@@ -4365,14 +4605,9 @@ public class DocxToolBox {
         boolean created = doc.getStyles() == null;
         var styles = created ? doc.createStyles() : doc.getStyles();
         List<String> added = new ArrayList<>();
-        addParagraphStyle(styles, "Normal", "Normal", null, null, 12.0, false, false, false, added);
-        addParagraphStyle(styles, "Heading1", "heading 1", "Normal", 0, 16.0, true, true, false, added);
-        addParagraphStyle(styles, "Heading2", "heading 2", "Normal", 1, 14.0, true, true, false, added);
-        addParagraphStyle(styles, "Heading3", "heading 3", "Normal", 2, 12.0, true, true, false, added);
-        addParagraphStyle(styles, "Title", "Title", "Normal", null, 28.0, true, false, false, added);
-        addParagraphStyle(styles, "Subtitle", "Subtitle", "Normal", null, 16.0, false, false, true, added);
-        addParagraphStyle(styles, "ListParagraph", "List Paragraph", "Normal", null, 12.0, false, false, false, added);
-        addParagraphStyle(styles, "Caption", "caption", "Normal", null, 12.0, false, false, true, added);
+        for (BuiltInStyle style : BUILT_IN_STYLES) {
+            addParagraphStyle(styles, style, added);
+        }
         addTableGridStyle(styles, added);
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("created", created);
@@ -4382,37 +4617,64 @@ public class DocxToolBox {
         return out;
     }
 
-    private static void addParagraphStyle(XWPFStyles styles, String id, String name, String basedOn,
-                                          Integer outlineLvl, double sizePt, boolean bold,
-                                          boolean keepNext, boolean italic, List<String> added) {
-        if (styles.styleExist(id)) {
+    /**
+     * Adds one paragraph style of the built-in set, including its vertical distances.
+     * <p>
+     * {@code w:spacing} is written into the style (not into the paragraph and not into
+     * {@code w:docDefaults}), so the distance belongs to "Heading 1" wherever that style is used:
+     * a reader who restyles the heading changes the gap with it, and a paragraph that carries the
+     * style needs no direct formatting. {@code before}/{@code after} are twips (1/20 pt);
+     * {@code w:line} counts 240ths of a line when {@code w:lineRule="auto"}.
+     * </p>
+     * @param styles the styles part
+     * @param spec the style definition
+     * @param added collects the ids actually written
+     */
+    private static void addParagraphStyle(XWPFStyles styles, BuiltInStyle spec, List<String> added) {
+        if (styles.styleExist(spec.id())) {
             return;
         }
         CTStyle ct = CTStyle.Factory.newInstance();
         ct.setType(STStyleType.PARAGRAPH);
-        ct.setStyleId(id);
-        ct.addNewName().setVal(name);
-        if (basedOn != null && styles.styleExist(basedOn)) {
-            ct.addNewBasedOn().setVal(basedOn);
+        ct.setStyleId(spec.id());
+        ct.addNewName().setVal(spec.name());
+        if (spec.basedOn() != null && styles.styleExist(spec.basedOn())) {
+            ct.addNewBasedOn().setVal(spec.basedOn());
         }
         ct.addNewQFormat();
+        // w:pPr is a sequence: keepNext < spacing < outlineLvl. XmlBeans sorts a sequence itself,
+        // but the calls are made in schema order anyway - a pPr whose children are out of order is
+        // the one thing Word refuses to open.
         var pPr = ct.addNewPPr();
-        if (keepNext) {
+        if (spec.keepNext()) {
             pPr.addNewKeepNext();
         }
-        if (outlineLvl != null) {
-            pPr.addNewOutlineLvl().setVal(BigInteger.valueOf(outlineLvl));
+        if (spec.beforePt() != null || spec.afterPt() != null || spec.lineFactor() != null) {
+            var spacing = pPr.addNewSpacing();
+            if (spec.beforePt() != null) {
+                spacing.setBefore(BigInteger.valueOf(Math.round(spec.beforePt() * TWIPS_PER_PT)));
+            }
+            if (spec.afterPt() != null) {
+                spacing.setAfter(BigInteger.valueOf(Math.round(spec.afterPt() * TWIPS_PER_PT)));
+            }
+            if (spec.lineFactor() != null) {
+                spacing.setLine(BigInteger.valueOf(Math.round(spec.lineFactor() * 240)));
+                spacing.setLineRule(STLineSpacingRule.AUTO);
+            }
+        }
+        if (spec.outlineLvl() != null) {
+            pPr.addNewOutlineLvl().setVal(BigInteger.valueOf(spec.outlineLvl()));
         }
         var rPr = ct.addNewRPr();
-        if (bold) {
+        if (spec.bold()) {
             rPr.addNewB();
         }
-        if (italic) {
+        if (spec.italic()) {
             rPr.addNewI();
         }
-        rPr.addNewSz().setVal(BigInteger.valueOf(Math.round(sizePt * 2)));   // half-points
+        rPr.addNewSz().setVal(BigInteger.valueOf(Math.round(spec.sizePt() * 2)));   // half-points
         styles.addStyle(new XWPFStyle(ct));
-        added.add(id);
+        added.add(spec.id());
     }
 
     /**
@@ -4730,6 +4992,30 @@ public class DocxToolBox {
                 does NOT throw: if (result.length) therefore skips its body silently (measured:
                 a lost font size). Each reader spells its shape out under Reading / inspection.
 
+                WRITING A REPORT - structure first, look second:
+                  var d = docx.createDocument();
+                  docx.setDocumentMeta(d, {title: "Feedback", author: "..."});   // optional
+                  docx.createParagraph(d, "Feedback", {style: "Title"});         // title
+                  docx.createParagraph(d, "1  fs-Modul", {style: "Heading 1"});  // heading
+                  docx.createParagraph(d, "Das Modul war brauchbar.");           // body text
+                  docx.createList(d, ["erster Punkt", "zweiter Punkt"], {type: "bullet"});
+                  docx.save(d, "bericht.docx");
+                A heading is a paragraph style and a list is paragraph numbering - not a look:
+                  * createParagraph(text, {style}) / setParagraphStyle give Heading1-3 a real
+                    outline level: that is what puts them into Word's navigation pane and into a
+                    table of contents, and what lets a reader restyle the whole report at once.
+                  * createList / setParagraphNumbering write w:numPr, so Word numbers and
+                    renumbers the list itself. "• ", "1." or "1.1 " typed into the text stay text,
+                    are counted as content by every check and can never be renumbered.
+                  * do NOT fake a heading with setRunBold / setRunFontSize / setRunFontColor: it
+                    looks right on screen, breaks the outline and is invisible in a TOC.
+                  * the keys are the ones the file carries: "Heading 1", "Heading1", "heading 1".
+                    A localized label (Word shows "Überschrift 1") is NOT a key - OOXML stores the
+                    English built-in name in every language; only the UI translates it.
+                The read side of both: getParagraphs(doc, {props:true}) reports style, styleName,
+                outlineLvl, numId, ilvl and numFmt - nested under props (p.props.style, not
+                p.style; a missing key reads as undefined, see RETURN SHAPES).
+
                 --- Document operations ---
                 docx.openFile(path)          - Open .docx file, returns docHandle
                 docx.createDocument()        - Create a new empty document, returns docHandle
@@ -4775,7 +5061,8 @@ public class DocxToolBox {
                                       borders, rowHeights, repeatHeaderRows, cantSplitRows,
                                       gridCols, gridColCm}
                   getStylesInfo     -> {document, present, count, styles}
-                                      styles:[{styleId, name, type, basedOn, outlineLvl, fontSizePt}]
+                                      styles:[{styleId, name, type, basedOn, outlineLvl, fontSizePt,
+                                               beforePt, afterPt, line, lineRule}]
                   getHeadersFooters -> {document, count, headersFooters, evenAndOddHeaders}
                                       headersFooters:[{kind, type, part, text, fields, paragraphCount}]
 
@@ -4799,7 +5086,9 @@ public class DocxToolBox {
                 docx.getFields(par)          - Fields of a paragraph, both spellings:
                                                [{instr, cached}] (w:fldChar AND w:fldSimple)
                 docx.getStylesInfo(doc)      - [{styleId, name, type, basedOn, outlineLvl,
-                                               fontSizePt}] - id and name differ per author
+                                               fontSizePt, beforePt, afterPt, line, lineRule}]
+                                               - id and name differ per author; the spacing is the
+                                               one the style carries (not a paragraph value)
                 docx.getNumberingInfo(doc)   - [{numId, abstractId, levels:[{ilvl, numFmt,
                                                lvlText}]}] - ids are taken in foreign files
                 docx.getHeadersFooters(doc)  - [{kind, type, part, text, fields:[...]}] for
@@ -4852,7 +5141,14 @@ public class DocxToolBox {
 
                 --- Writing (paragraphs / runs) ---
                 docx.createParagraph(doc,t)  - Append a paragraph with text, returns paragraphHandle
+                docx.createParagraph(doc, t, {style})
+                                             - the same plus a paragraph style in one call, e.g.
+                                               {style: "Heading 1"} - the shortcut for the pair
+                                               createParagraph + setParagraphStyle (the style is
+                                               resolved BEFORE the paragraph is created)
                 docx.addRun(paraHandle, t)   - Append a run to a paragraph, returns runHandle
+                (the run setters below are for emphasis inside a paragraph - NOT for building a
+                 heading; see WRITING A REPORT at the top)
                 docx.setRunText(run, t)      - Set run text
                 docx.setRunBold(run, b)      - Set bold (true/false)
                 docx.setRunItalic(run, i)    - Set italic (true/false)
@@ -4931,18 +5227,35 @@ public class DocxToolBox {
 
                 --- Writing (paragraph formatting) ---
                 docx.setParagraphStyle(par, style) - style id OR display name ("Heading1",
-                       "heading 2", "Überschrift 1"); resolution per docs/js/docx.md D4.
-                       Unknown style -> error listing the styles of this document. A style
-                       that does not exist is never silently ignored.
+                       "Heading 1", "heading 2"); resolution per docs/js/docx.md D4.
+                       The keys are what the FILE carries: OOXML stores the English built-in
+                       name in every language, so a localized label (Word shows "Überschrift 1")
+                       is not a key. Localized names of LibreOffice's own styles do resolve
+                       (umlauts are folded: "berschrift" = "Überschrift").
+                       Unknown style -> error listing the styles of this document
+                       (and docx.listStyleKeys(doc)). A style that does not exist is never
+                       silently ignored.
                 docx.setParagraphAlignment(par, a) - "left"|"right"|"center"|"both"
                 docx.setParagraphIndent(par, {leftCm, rightCm, firstLineCm, hangingCm})
                 docx.setParagraphSpacing(par, {beforePt, afterPt, line, lineRule})
                        line is a factor with lineRule "auto" (1.0 = single), otherwise points
-                docx.listStyleKeys(doc)        - Which style names would resolve (D4)
+                docx.listStyleKeys(doc)        - Which style names would resolve (D4), i.e.
+                       [{styleId, name, canonical}]. On a document without styles.xml it lists
+                       the styles that would be CREATED on the first style write, each with
+                       pending: true - an empty list would read as "no styles available".
                 docx.ensureStyles(doc)         - Build the styles part of a new document
                        (Normal, Heading1-3 with outlineLvl, Title, Subtitle, ListParagraph,
                        Caption, TableGrid). Existing styles are never overwritten.
                        setParagraphStyle calls it automatically when styles.xml is missing.
+                       The paragraph styles carry their VERTICAL DISTANCE with them: Heading1
+                       12/6 pt, Heading2 10/6, Heading3 7/6, Title 0/6, Subtitle 0/12,
+                       Caption 6/6, Normal line 1.15 and 7 pt after. A document from
+                       createDocument() has no w:docDefaults and no Normal spacing, so a style
+                       without w:spacing puts every heading flush on the paragraph above - the
+                       distance belongs to the style, not to the paragraph.
+                       Table cells are the exception: setCellText writes 0 before/after and a
+                       single line, so a 3 mm row stays 3 mm (otherwise every row would grow by
+                       the body gap). Cell texts also need no Body/List style of their own.
                 docx.ensureNumbering(doc)      - {lists: {bullet: {numId, abstractId, reused},
                        decimal: {...}, multilevel: {...}}} - reuses a fitting definition of a
                        foreign document, otherwise allocates the first FREE numId (D3: Ribbeck
@@ -4950,6 +5263,12 @@ public class DocxToolBox {
                 docx.setParagraphNumbering(par, {type, level}) -> {numId, ilvl, type, abstractId, reused}
                        type: "bullet"|"decimal"|"multilevel", level 0..8; returns the ids it
                        used, so a list can be found again after reopening
+                docx.createList(doc, items, {type, level, style}) -> {numId, ilvl, type,
+                       abstractId, reused, style, count, paragraphs}
+                       One paragraph per entry, all with the SAME list definition - the one-call
+                       form of setParagraphNumbering for a whole list. items: array of strings;
+                       type: "bullet" (default)|"decimal"|"multilevel"; style: optional style
+                       for every item (e.g. "ListParagraph"). Nothing is numbered by hand.
                 docx.removeParagraphNumbering(par) - writes w:numId 0 (LibreOffice's form),
                        which also switches off a numbering that comes from the style
 
@@ -4994,6 +5313,16 @@ public class DocxToolBox {
                 3. var ph = paras.paragraphs[2].h;
                 4. docx.addRun(ph, "Neu");                        // or edit an existing run
                 5. docx.save(doc, "out.docx");
+
+                Typical workflow (write a new document):
+                1. var lk = docx.listStyleKeys(doc);              // what may I use? (pending: true
+                                                                  // on a fresh document)
+                2. docx.createParagraph(doc, "Titel", {style: "Title"});
+                3. docx.createParagraph(doc, "1  Befund", {style: "Heading 1"});
+                4. docx.createList(doc, ["a", "b"], {type: "bullet"});
+                5. docx.save(doc, "bericht.docx");
+                   // check: getParagraphs(doc,{props:true}) -> props.style, props.outlineLvl,
+                   //        props.numId, props.numFmt
 
                 Not yet available (planned, see docs/js/docx.md): headers/footers and their
                 margins (setPageSetup can already write pgMar), section breaks and page breaks,
@@ -5353,7 +5682,7 @@ public class DocxToolBox {
         if (node != null) {
             return node.owner;
         }
-        throw new PoiUserRuntimeException("Drawing not found (invalid handle): " + handle
+        throw notFound("Drawing not found (invalid handle): " + handle
                 + ". Drawing handles come from docx.createDrawing(...)/docx.createShapes(...),"
                 + " group and shape handles from docx.addShape(...)/docx.addShapeGroup(...).");
     }
@@ -5977,7 +6306,7 @@ public class DocxToolBox {
     private XWPFRun getRun(String runHandle) {
         XWPFRun run = runs.get(runHandle);
         if (run == null) {
-            throw new PoiUserRuntimeException("Run not found (invalid handle): " + runHandle);
+            throw notFound("Run not found (invalid handle): " + runHandle);
         }
         return run;
     }

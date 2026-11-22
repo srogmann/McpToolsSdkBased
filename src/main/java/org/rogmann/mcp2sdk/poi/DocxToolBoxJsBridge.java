@@ -146,9 +146,21 @@ public class DocxToolBoxJsBridge implements JsModuleInterface {
 
         // --- writing: paragraphs and runs ---
         methods.put("createParagraph", (ProxyExecutable) args -> {
-            String docHandle = stringArg("createParagraph", "docHandle", arg(args, 0));
-            String text = optionalString("createParagraph", "text", arg(args, 1));
-            return box.createParagraph(docHandle, text);
+            String fn = "createParagraph";
+            String docHandle = stringArg(fn, "docHandle", arg(args, 0));
+            String text = optionalString(fn, "text", arg(args, 1));
+            Value options = arg(args, 2);
+            if (options == null || options.isNull()) {
+                return box.createParagraph(docHandle, text);
+            }
+            return box.createParagraph(docHandle, text, optionsArg(fn, options));
+        });
+        methods.put("createList", (ProxyExecutable) args -> {
+            String fn = "createList";
+            String docHandle = stringArg(fn, "docHandle", arg(args, 0));
+            String[] items = stringArrayArg(fn, "items", arg(args, 1));
+            return GraalProxies.toProxyObject(box.createList(docHandle, List.of(items),
+                    optionsArg(fn, arg(args, 2))));
         });
         methods.put("addRun", (ProxyExecutable) args -> {
             String paragraphHandle = stringArg("addRun", "paragraphHandle", arg(args, 0));

@@ -1,6 +1,7 @@
 package org.rogmann.mcp2sdk.poi;
 
 import org.graalvm.polyglot.Value;
+import org.rogmann.mcp2sdk.js.JsErrorCode;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -110,15 +111,16 @@ public final class PoiJsArgs {
 
     /** The error every failed conversion throws - one text for all three namespaces. */
     public PoiUserRuntimeException badArg(String fn, String name, Value value, String expected) {
-        return new PoiUserRuntimeException(namespace + "." + fn + ": argument '" + name
-                + "' must be " + expected + ", but was: " + describe(value)
+        return new PoiUserRuntimeException(JsErrorCode.ARGUMENT_INVALID, namespace + "." + fn
+                + ": argument '" + name + "' must be " + expected + ", but was: " + describe(value)
                 + ". See " + helpCall() + ".");
     }
 
     /** Error for an argument the caller did not pass at all (arity check). */
     public PoiUserRuntimeException missingArg(String fn, String name, String expected) {
-        return new PoiUserRuntimeException(namespace + "." + fn + ": missing argument '" + name
-                + "' (expected " + expected + "). See " + helpCall() + ".");
+        return new PoiUserRuntimeException(JsErrorCode.ARGUMENT_INVALID, namespace + "." + fn
+                + ": missing argument '" + name + "' (expected " + expected + "). See "
+                + helpCall() + ".");
     }
 
     /**
@@ -340,8 +342,9 @@ public final class PoiJsArgs {
     private void requireKnownKeys(String fn, Value options, Set<String> knownKeys) {
         for (String member : options.getMemberKeys()) {
             if (!knownKeys.contains(member)) {
-                throw new PoiUserRuntimeException(namespace + "." + fn + ": unknown option '" + member
-                        + "' (known: " + new TreeSet<>(knownKeys) + "). See " + helpCall() + ".");
+                throw new PoiUserRuntimeException(JsErrorCode.ARGUMENT_INVALID, namespace + "." + fn
+                        + ": unknown option '" + member + "' (known: " + new TreeSet<>(knownKeys)
+                        + "). See " + helpCall() + ".");
             }
         }
     }
@@ -407,8 +410,9 @@ public final class PoiJsArgs {
             }
             return list;
         }
-        throw new PoiUserRuntimeException("Options may hold strings, numbers, booleans and arrays"
-                + " of them, but was: " + describe(value));
+        throw new PoiUserRuntimeException(JsErrorCode.ARGUMENT_INVALID,
+                "Options may hold strings, numbers, booleans and arrays of them, but was: "
+                        + describe(value));
     }
 
     // ========================================================================
