@@ -52,8 +52,10 @@ public final class JsRag {
                 rag - semantic search in the RAG sources of this server
 
                 The query is embedded once and compared with the chunk vectors of the
-                registered sources (cosine similarity). A source is addressed by its
-                topic (the shelf, e.g. "News") and its name (e.g. "DLF-News").
+                registered sources. The score is the dot product of the unit query vector
+                and the chunk vector - the cosine for sources with normalized embeddings.
+                A source is addressed by its topic (the shelf, e.g. "News") and its name
+                (e.g. "DLF-News").
 
                 Entry points
                   rag.help()
@@ -69,8 +71,10 @@ public final class JsRag {
                       {enabled, embeddingModelConfigured, limits, sources}
 
                   rag.search(query[, options])
-                      { hits: [{provider, title, source, score, textStatus, text,
-                               startOffset, endOffset, numberTokens, metadata}],
+                      { hits: [{provider, referenceId, title, source, score,
+                               textStatus, text, startOffset, endOffset,
+                               numberTokens, metadata}],
+                        model, elapsedMillis,
                         counts: {providersSearched, chunksScanned, hits},
                         warnings: [] }
                       options:
@@ -79,7 +83,7 @@ public final class JsRag {
                         n              number of hits (default %d, max %d)
                         maxPerSource   largest contribution of one source
                                        (default 0 = unlimited)
-                        minScore       drop hits below this cosine, e.g. 0.6
+                        minScore       drop hits below this score, e.g. 0.6
                         maxChars       longest text per hit (default %d)
                         withText       false: do not resolve missing texts
                                        (no network access of the sources)
@@ -245,6 +249,8 @@ public final class JsRag {
 
         Map<String, Object> map = new LinkedHashMap<>();
         map.put("hits", hits);
+        map.put("model", result.model());
+        map.put("elapsedMillis", result.elapsedMillis());
         map.put("counts", counts);
         map.put("warnings", result.warnings());
         return map;

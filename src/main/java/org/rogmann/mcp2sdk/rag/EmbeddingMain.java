@@ -6,17 +6,12 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.Locale;
 import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
@@ -55,42 +50,17 @@ public class EmbeddingMain {
     /** Default format if not specified. */
     private static final String DEFAULT_FORMAT = "F32";
 
-    /** The underlying embedding client for database operations. */
+    /** The underlying embedding client: database operations and the one embedding call. */
     private final EmbeddingClient client;
 
-    /** URL of the embedding API (needed for standalone stdin mode). */
-    private final String url;
-
-    /** Model name (needed for standalone stdin mode). */
-    private final String model;
-
-    /** Shared HTTP client for standalone API calls (stdin mode). */
-    private final HttpClient httpClient;
-
-    /** Pattern for extracting prompt_tokens from JSON responses. */
-    private static final Pattern PATTERN_PROMPT_TOKENS =
-            Pattern.compile("\"prompt_tokens\":\\s*(\\d+)");
-
-    /** Pattern for extracting total_tokens from JSON responses. */
-    private static final Pattern PATTERN_TOTAL_TOKENS =
-            Pattern.compile("\"total_tokens\":\\s*(\\d+)");
-
-    /** Pattern for extracting embedding arrays from JSON responses. */
-    private static final Pattern PATTERN_EMBEDDING =
-            Pattern.compile("\"embedding\":\\s*\\[(.*?)\\]");
-
     /**
-     * Constructs an EmbeddingMain with the given client, URL, and model.
+     * Constructs an EmbeddingMain for the given client. The client carries URL and model,
+     * so the CLI has no second copy of the embedding call to keep in sync.
      *
-     * @param client the embedding client to use for database operations
-     * @param url    the URL of the embedding API
-     * @param model  the model name
+     * @param client the embedding client to use
      */
-    public EmbeddingMain(EmbeddingClient client, String url, String model) {
+    public EmbeddingMain(EmbeddingClient client) {
         this.client = client;
-        this.url = url;
-        this.model = model;
-        this.httpClient = HttpClient.newHttpClient();
     }
 
     /**
@@ -200,19 +170,24 @@ public class EmbeddingMain {
             return;
         }
 
-        // Create and configure the client.
+        // Create and configure the client. The chunk parameters are one object
+        // (ChunkOptions): defaults and -Dmcp.rag.chunk.* first, the CLI flags win.
         EmbeddingClient client = new EmbeddingClient(url, model);
-        if (chunkSize != null) {
-            client.setChunkSize(chunkSize);
-        }
-        if (overlapSize != null) {
-            client.setOverlapSize(overlapSize);
-        }
-        if (lookback != null) {
-            client.setLookback(lookback);
+        try {
+            ChunkOptions fromProperties = ChunkOptions.from(System::getProperty);
+            ChunkOptions options = new ChunkOptions(
+                    chunkSize != null ? chunkSize : fromProperties.maxChars(),
+                    overlapSize != null ? overlapSize : fromProperties.overlap(),
+                    lookback != null ? lookback : fromProperties.lookback());
+            client.setChunkOptions(options);
+            client.setMaxInputChars(options.maxChars());
+        } catch (IllegalArgumentException e) {
+            System.err.println("Error: " + e.getMessage());
+            System.exit(2);
+            return;
         }
 
-        EmbeddingMain app = new EmbeddingMain(client, url, model);
+        EmbeddingMain app = new EmbeddingMain(client);
 
         try {
             if (searchMode) {
@@ -282,7 +257,7 @@ public class EmbeddingMain {
      */
     private void handleStdin() throws IOException {
         String input = readStdinContent();
-        EmbeddingResult emb = computeEmbedding(input);
+        EmbeddingClient.EmbeddingResult emb = client.computeEmbedding(input);
 
         float[] vector = emb.embedding();
         System.out.println("Prompt tokens: " + emb.promptTokens()
@@ -298,118 +273,6 @@ public class EmbeddingMain {
             System.out.print(vector[i] + (i < vector.length - 1 ? ", " : ""));
         }
         System.out.println();
-    }
-
-    /**
-     * Internal record holding the result of a single embedding API call.
-     *
-     * @param promptTokens number of prompt tokens used
-     * @param totalTokens  total number of tokens
-     * @param embedding    the embedding vector as a float array
-     */
-    private record EmbeddingResult(int promptTokens, int totalTokens, float[] embedding) {
-    }
-
-    /**
-     * Computes an embedding vector for the given text by calling the OpenAI-compatible API.
-     * This is used for the standalone stdin mode (without the database).
-     *
-     * @param text the input text to embed
-     * @return the embedding result containing token counts and the vector
-     * @throws IOException if an I/O error occurs during the API call
-     */
-    private EmbeddingResult computeEmbedding(String text) throws IOException {
-        String jsonBody = String.format(
-                "{\"input\": \"%s\", \"model\": \"%s\", \"encoding_format\": \"float\"}",
-                escapeJson(text),
-                escapeJson(model));
-
-        try {
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .header("Content-Type", "application/json")
-                    .header("Authorization", "Bearer no-key")
-                    .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
-                    .build();
-
-            HttpResponse<String> response = httpClient.send(request,
-                    HttpResponse.BodyHandlers.ofString());
-
-            if (response.statusCode() != 200) {
-                LOG.error("Embedding API returned HTTP {}: {}", response.statusCode(), response.body());
-                throw new IOException("Failed to compute embedding: HTTP " + response.statusCode());
-            }
-
-            String body = response.body();
-
-            int promptTokens = parseInteger(body, PATTERN_PROMPT_TOKENS);
-            int totalTokens = parseInteger(body, PATTERN_TOTAL_TOKENS);
-            float[] embedding = parseEmbedding(body);
-
-            LOG.debug("Computed embedding: promptTokens={}, totalTokens={}, vectorSize={}",
-                    promptTokens, totalTokens, embedding.length);
-
-            return new EmbeddingResult(promptTokens, totalTokens, embedding);
-
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Embedding API call was interrupted", e);
-        }
-    }
-
-    /**
-     * Parses an integer value from a JSON response using the given pattern.
-     *
-     * @param json    the JSON response string
-     * @param pattern the compiled regex pattern with a single capturing group
-     * @return the parsed integer, or 0 if not found
-     */
-    private static int parseInteger(String json, Pattern pattern) {
-        Matcher matcher = pattern.matcher(json);
-        if (matcher.find()) {
-            return Integer.parseInt(matcher.group(1));
-        }
-        return 0;
-    }
-
-    /**
-     * Parses a float array from a JSON embedding response.
-     *
-     * @param json the JSON response string containing an {@code "embedding"} array
-     * @return the parsed float array
-     * @throws IOException if the embedding data cannot be found or parsed
-     */
-    private static float[] parseEmbedding(String json) throws IOException {
-        Matcher matcher = PATTERN_EMBEDDING.matcher(json);
-        if (matcher.find()) {
-            String content = matcher.group(1);
-            String[] parts = content.split(",");
-            float[] embedding = new float[parts.length];
-            for (int i = 0; i < parts.length; i++) {
-                embedding[i] = Float.parseFloat(parts[i].trim());
-            }
-            return embedding;
-        }
-        throw new IOException("Embedding data not found in API response");
-    }
-
-    /**
-     * Escapes a string for safe inclusion in JSON.
-     *
-     * @param input the input string
-     * @return the escaped string
-     */
-    private static String escapeJson(String input) {
-        if (input == null) {
-            return "";
-        }
-        return input.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\b", "\\b")
-                .replace("\f", "\\f")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t");
     }
 
     // ---- Embed mode ----
@@ -458,25 +321,37 @@ public class EmbeddingMain {
      */
     private void handleSearch(File dbFile, String content, String sourceName, String resultsFile)
             throws IOException {
-        client.load(dbFile);
-
-        List<EmbeddingClient.SearchResult> results = client.search(content, DEFAULT_MAX_HITS);
+        // The CLI is one source over a local CSV file: it uses the same provider and the same
+        // search as the rag module, so a CLI result and a tool result cannot drift apart.
+        RAGProviderCSV provider = new RAGProviderCSV(dbFile.toPath(), "cli", dbFile.getName(),
+                "Local CSV embedding database", client.model());
+        EmbeddingDb db = new EmbeddingDb(List.of(provider), client, RagLimits.defaults());
+        // maxChars 0: the CLI prints the whole chunk (the tool's per-hit limit is a context
+        // budget, not a file length).
+        RAGResult result = db.search(content, RAGScope.ALL,
+                RAGOptions.defaults(DEFAULT_MAX_HITS, 0));
+        List<RAGHit> hits = result.hits();
 
         System.out.println("Top " + DEFAULT_MAX_HITS + " matches for " + sourceName + ":");
-        for (int i = 0; i < results.size(); i++) {
-            EmbeddingClient.SearchResult res = results.get(i);
+        for (int i = 0; i < hits.size(); i++) {
+            RAGHit hit = hits.get(i);
             String location;
-            if (res.startOffset() >= 0 && res.endOffset() >= res.startOffset()) {
-                location = ", Start-Offset (0-based): " + res.startOffset()
-                        + ", End-Offset (exclusive): " + res.endOffset();
+            if (hit.startOffset() >= 0 && hit.endOffset() >= hit.startOffset()) {
+                location = ", Start-Offset (0-based): " + hit.startOffset()
+                        + ", End-Offset (exclusive): " + hit.endOffset();
             } else {
                 location = ", Start-Offset: -, End-Offset: -";
             }
-            System.out.println((i + 1) + ". " + res.key() + " (Score: " + String.format("%.4f", res.score()) + location + ")");
+            System.out.println((i + 1) + ". " + hit.referenceId()
+                    + " (Score: " + String.format(Locale.ROOT, "%.4f", hit.score())
+                    + location + ")");
+        }
+        for (String warning : result.warnings()) {
+            System.out.println("Warning: " + warning);
         }
 
         if (resultsFile != null) {
-            writeResultsToFile(resultsFile, results);
+            writeResultsToFile(resultsFile, hits);
         }
     }
 
@@ -484,11 +359,10 @@ public class EmbeddingMain {
      * Writes search results to a Markdown file with detailed excerpts.
      *
      * @param resultsFile path to the output Markdown file
-     * @param results     the search results to write
+     * @param hits        the search hits to write
      * @throws IOException if an I/O error occurs
      */
-    private void writeResultsToFile(String resultsFile, List<EmbeddingClient.SearchResult> results)
-            throws IOException {
+    private void writeResultsToFile(String resultsFile, List<RAGHit> hits) throws IOException {
         try (PrintWriter pw = new PrintWriter(new FileWriter(resultsFile, StandardCharsets.UTF_8))) {
             pw.println("# Search Results");
             pw.println();
@@ -498,17 +372,18 @@ public class EmbeddingMain {
 
             List<ResultDetail> details = new ArrayList<>();
 
-            for (int i = 0; i < Math.min(20, results.size()); i++) {
-                EmbeddingClient.SearchResult res = results.get(i);
-                File file = new File(res.key());
+            for (int i = 0; i < Math.min(20, hits.size()); i++) {
+                RAGHit hit = hits.get(i);
+                File file = new File(hit.referenceId());
                 if (!file.exists()) {
-                    pw.println("| " + res.key() + " | " + String.format("%.4f", res.score()) + " | Not Found |");
+                    pw.println("| " + hit.referenceId() + " | "
+                            + String.format(Locale.ROOT, "%.4f", hit.score()) + " | Not Found |");
                     continue;
                 }
                 String fileContent = Files.readString(file.toPath(), StandardCharsets.UTF_8);
 
-                int start = res.startOffset();
-                int end = res.endOffset();
+                int start = hit.startOffset();
+                int end = hit.endOffset();
                 if (start <= 0 && end <= 0) {
                     start = 0;
                     end = fileContent.length();
@@ -517,11 +392,16 @@ public class EmbeddingMain {
                 int startLine = getLineNumber(fileContent, start);
                 int endLine = getLineNumber(fileContent, end);
 
-                pw.println("| " + res.key() + " | " + String.format("%.4f", res.score())
+                pw.println("| " + hit.referenceId() + " | "
+                        + String.format(Locale.ROOT, "%.4f", hit.score())
                         + " | " + startLine + ".." + endLine + " |");
 
-                String chunk = fileContent.substring(start, Math.min(end, fileContent.length()));
-                details.add(new ResultDetail(res.key(), startLine, endLine, chunk));
+                // The provider resolved the text; the offsets are only the fallback when it
+                // could not (e.g. the file changed since the index was built).
+                String chunk = hit.text() != null
+                        ? hit.text()
+                        : fileContent.substring(start, Math.min(end, fileContent.length()));
+                details.add(new ResultDetail(hit.referenceId(), startLine, endLine, chunk));
             }
 
             pw.println();

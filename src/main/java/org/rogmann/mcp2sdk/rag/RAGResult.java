@@ -14,10 +14,12 @@ import java.util.List;
  * @param hits              the hits, best first
  * @param providersSearched number of sources the scope matched
  * @param chunksScanned     number of chunks compared
+ * @param model             the embedding model of the query (the model the scores belong to)
+ * @param elapsedMillis     wall-clock time of the whole search
  * @param warnings          problems collected on the way (capped)
  */
 public record RAGResult(List<RAGHit> hits, int providersSearched, long chunksScanned,
-                        List<String> warnings) {
+                        String model, long elapsedMillis, List<String> warnings) {
 
     /**
      * Compact canonical constructor: makes the lists immutable.

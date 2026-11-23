@@ -103,6 +103,23 @@ public interface RAGProvider extends AutoCloseable {
      * with {@link TextStatus#UNAVAILABLE}.
      * </p>
      * <p>
+     * <b>Semantics of the result</b> (the difference matters to a caller):
+     * </p>
+     * <ul>
+     *   <li>{@code null} - the text is <em>not resolvable</em>: the source is missing, the
+     *       offsets do not fit, the fetch failed. The hit stays, without text, with
+     *       {@link TextStatus#UNAVAILABLE}.</li>
+     *   <li>{@code ""} - the text is <em>present and empty</em>: the chunk covers an empty
+     *       range ({@code offsetStart == offsetEnd}). This is not an error and yields
+     *       {@link TextStatus#AVAILABLE}.</li>
+     *   <li>anything else - the text, possibly truncated later by the caller.</li>
+     * </ul>
+     * <p>
+     * An inconsistent interval ({@code offsetStart > offsetEnd}, or an offset below 0 when
+     * the source cannot say where the text is) counts as "not resolvable" and returns
+     * {@code null} - a guess would hide a broken index.
+     * </p>
+     * <p>
      * The default returns the text materialized in the chunk, so a provider whose
      * chunks carry their text needs no implementation.
      * </p>

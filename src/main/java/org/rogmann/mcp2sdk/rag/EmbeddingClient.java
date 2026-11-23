@@ -1,31 +1,24 @@
 package org.rogmann.mcp2sdk.rag;
 
-import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileReader;
-import java.io.FileWriter;
 import java.io.IOException;
-import java.io.PrintWriter;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Base64;
-import java.util.Collections;
-import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
+import tools.jackson.databind.node.ObjectNode;
 
 /**
  * Client for managing text embeddings with support for F32 and Q8_0 quantization formats.
@@ -34,6 +27,10 @@ import org.slf4j.LoggerFactory;
  * embedding API, store them in a CSV-based database, and perform similarity searches against
  * the stored embeddings. Embeddings can be stored either as full-precision 32-bit floats (F32)
  * or in the Q8_0 quantized format (8-bit with block-wise float16 scale factors).
+ *
+ * <p>The CSV format is owned by {@link CsvEmbeddingStore} (reading and writing go through
+ * the same code); this class keeps the legacy CLI methods {@code load}/{@code save} on top of
+ * it. The search of this project is {@link EmbeddingDb} - there is no second one here.</p>
  *
  * <p>The CSV database format uses the following columns:
  * <ul>
@@ -61,7 +58,7 @@ public class EmbeddingClient implements EmbeddingModel {
     private static final Logger LOG = LoggerFactory.getLogger(EmbeddingClient.class);
 
     /** Map of keys to embedding entries, preserving insertion order. */
-    private final Map<String, Entry> entries = new LinkedHashMap<>();
+    private final Map<String, CsvEmbeddingStore.Entry> entries = new LinkedHashMap<>();
 
     /** URL of the OpenAI-compatible embedding API endpoint. */
     private final String url;
@@ -78,26 +75,22 @@ public class EmbeddingClient implements EmbeddingModel {
     /** Shared HTTP client for API calls. */
     private final HttpClient httpClient;
 
-    /** Maximum chunk size in characters for splitting large files. */
-    private int chunkSize = 6000;
+    /**
+     * The chunking parameters - the only place they live (see {@link ChunkOptions}); the
+     * chunker itself is {@link TextChunker}, so indexing has no second implementation.
+     */
+    private ChunkOptions chunkOptions = ChunkOptions.defaults();
 
-    /** Overlap size in characters between consecutive chunks. */
-    private int overlapSize = 480;
+    /**
+     * Largest accepted input of one embedding call; {@code Integer.MAX_VALUE} means "no
+     * guard of its own". The query path sets it to {@code mcp.rag.maxQueryChars}, the
+     * indexing path to the chunk size - a too long input is refused, never truncated
+     * silently.
+     */
+    private int maxInputChars = Integer.MAX_VALUE;
 
-    /** Lookback window in characters for finding clean split points. */
-    private int lookback = 240;
-
-    /** Pattern for extracting prompt_tokens from JSON responses. */
-    private static final Pattern PATTERN_PROMPT_TOKENS =
-            Pattern.compile("\"prompt_tokens\":\\s*(\\d+)");
-
-    /** Pattern for extracting total_tokens from JSON responses. */
-    private static final Pattern PATTERN_TOTAL_TOKENS =
-            Pattern.compile("\"total_tokens\":\\s*(\\d+)");
-
-    /** Pattern for extracting embedding arrays from JSON responses. */
-    private static final Pattern PATTERN_EMBEDDING =
-            Pattern.compile("\"embedding\":\\s*\\[(.*?)\\]");
+    /** JSON mapper for the request body and the response of the embedding endpoint. */
+    private static final JsonMapper MAPPER = JsonMapper.builder().build();
 
     /**
      * Constructs a new EmbeddingClient with the specified API endpoint and model.
@@ -133,55 +126,40 @@ public class EmbeddingClient implements EmbeddingModel {
                 .build();
     }
 
-    /**
-     * Returns the loaded entries of the database, in insertion (file) order.
-     * <p>
-     * Package-private read access for {@link RAGProviderCSV}, so that a CSV source does
-     * not have to duplicate the line parser of this class.
-     * </p>
-     *
-     * @return an unmodifiable view of the entries
-     */
-    Map<String, Entry> entries() {
-        return Collections.unmodifiableMap(new LinkedHashMap<>(entries));
-    }
-
-    // ---- Configuration of chunking parameters ----
+    // ---- Configuration ----
 
     /**
-     * Sets the maximum chunk size in characters for splitting large files.
+     * Sets the chunking parameters (the one place they live, see {@link ChunkOptions}).
      *
-     * @param chunkSize maximum chunk size in characters (must be positive)
+     * @param options the validated chunk options
      */
-    public void setChunkSize(int chunkSize) {
-        if (chunkSize <= 0) {
-            throw new IllegalArgumentException("chunkSize must be positive, got: " + chunkSize);
+    public void setChunkOptions(ChunkOptions options) {
+        if (options == null) {
+            throw new IllegalArgumentException("setChunkOptions: options must not be null");
         }
-        this.chunkSize = chunkSize;
+        this.chunkOptions = options;
     }
 
     /**
-     * Sets the overlap size in characters between consecutive chunks.
+     * Returns the chunking parameters of this client.
      *
-     * @param overlapSize overlap size in characters (must be non-negative)
+     * @return the options
      */
-    public void setOverlapSize(int overlapSize) {
-        if (overlapSize < 0) {
-            throw new IllegalArgumentException("overlapSize must be non-negative, got: " + overlapSize);
-        }
-        this.overlapSize = overlapSize;
+    public ChunkOptions chunkOptions() {
+        return chunkOptions;
     }
 
     /**
-     * Sets the lookback window in characters for finding clean split points (sentence boundaries).
+     * Sets the largest accepted input of one embedding call.
      *
-     * @param lookback lookback window in characters (must be non-negative)
+     * @param maxInputChars the limit in characters, {@code Integer.MAX_VALUE} for none
      */
-    public void setLookback(int lookback) {
-        if (lookback < 0) {
-            throw new IllegalArgumentException("lookback must be non-negative, got: " + lookback);
+    public void setMaxInputChars(int maxInputChars) {
+        if (maxInputChars <= 0) {
+            throw new IllegalArgumentException(
+                    "maxInputChars must be positive, got: " + maxInputChars);
         }
-        this.lookback = lookback;
+        this.maxInputChars = maxInputChars;
     }
 
     // ---- Public API ----
@@ -191,9 +169,11 @@ public class EmbeddingClient implements EmbeddingModel {
      *
      * <p>Existing entries in this client are replaced with the data from the file.
      * If the file does not exist, this method returns without loading anything.
+     * The format itself lives in {@link CsvEmbeddingStore}, which is strict: a malformed
+     * line aborts with file and line number instead of being skipped.
      *
      * @param embedCsv the CSV file containing embedding data
-     * @throws IOException if an I/O error occurs while reading the file
+     * @throws IOException if an I/O error occurs while reading the file, or a line is malformed
      */
     public void load(File embedCsv) throws IOException {
         if (!embedCsv.exists()) {
@@ -202,26 +182,13 @@ public class EmbeddingClient implements EmbeddingModel {
         }
 
         entries.clear();
-        int lineCount = 0;
-
-        try (BufferedReader br = new BufferedReader(new FileReader(embedCsv, StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = br.readLine()) != null) {
-                line = line.trim();
-                if (line.isEmpty()) {
-                    continue;
-                }
-                Entry entry = parseCsvLine(line);
-                if (entry != null) {
-                    entries.put(entry.key(), entry);
-                    lineCount++;
-                } else {
-                    LOG.warn("Skipping malformed CSV line: {}", line);
-                }
-            }
+        // The format lives in CsvEmbeddingStore - one code path for reading and writing,
+        // strict on a malformed line (file and line number) instead of skipping it.
+        for (CsvEmbeddingStore.Entry entry : CsvEmbeddingStore.read(embedCsv.toPath())) {
+            entries.put(entry.key(), entry);
         }
-
-        LOG.info("Loaded {} embedding entries from CSV file: {}", lineCount, embedCsv.getAbsolutePath());
+        LOG.info("Loaded {} embedding entries from CSV file: {}", entries.size(),
+                embedCsv.getAbsolutePath());
     }
 
     /**
@@ -235,44 +202,10 @@ public class EmbeddingClient implements EmbeddingModel {
      * @throws IOException if an I/O error occurs while writing the file
      */
     public void save(File embedCsv, boolean useQ8) throws IOException {
-        final String format = useQ8 ? "Q8_0" : "F32";
-        int entryCount = 0;
-
-        try (PrintWriter pw = new PrintWriter(new FileWriter(embedCsv, StandardCharsets.UTF_8))) {
-            for (Entry entry : entries.values()) {
-                StringBuilder sb = new StringBuilder(512);
-                sb.append(escapeCsvField(entry.key())).append(';');
-                sb.append(entry.modTs()).append(';');
-                sb.append(entry.size()).append(';');
-                sb.append(entry.promptTokens()).append(';');
-                sb.append(entry.totalTokens()).append(';');
-                sb.append(format).append(';');
-                sb.append(entry.embeddings().size()).append(';');
-
-                for (int i = 0; i < entry.embeddings().size(); i++) {
-                    if (i > 0) {
-                        sb.append(';');
-                    }
-                    int[] interval = i < entry.intervals().size()
-                            ? entry.intervals().get(i)
-                            : new int[]{0, 0};
-                    sb.append(interval[0]).append(';');
-                    sb.append(interval[1]).append(';');
-
-                    float[] vector = entry.embeddings().get(i);
-                    if (useQ8) {
-                        sb.append(floatArrayToBase64Q8(vector));
-                    } else {
-                        sb.append(floatArrayToBase64(vector));
-                    }
-                }
-                pw.println(sb.toString());
-                entryCount++;
-            }
-        }
-
+        VectorCodec.Format format = useQ8 ? VectorCodec.Format.Q8_0 : VectorCodec.Format.F32;
+        CsvEmbeddingStore.write(embedCsv.toPath(), entries.values(), format);
         LOG.info("Saved {} embedding entries to CSV file (format={}): {}",
-                entryCount, format, embedCsv.getAbsolutePath());
+                entries.size(), format, embedCsv.getAbsolutePath());
     }
 
     /**
@@ -299,7 +232,7 @@ public class EmbeddingClient implements EmbeddingModel {
         long size = data.length();
 
         // Check if an up-to-date entry already exists.
-        Entry existing = entries.get(key);
+        CsvEmbeddingStore.Entry existing = entries.get(key);
         if (existing != null && existing.modTs() == modTs && existing.size() == size) {
             LOG.info("Entry '{}' is up to date (modTs={}, size={}), skipping.", key, modTs, size);
             return;
@@ -313,40 +246,16 @@ public class EmbeddingClient implements EmbeddingModel {
         int promptTokensSum = 0;
         int totalTokensSum = 0;
 
-        int pos = 0;
-        while (pos < content.length()) {
-            int idealEnd = pos + chunkSize;
-            int endPos = Math.min(idealEnd, content.length());
-
-            // Find a clean split point near the end of the chunk.
-            if (endPos < content.length()) {
-                endPos = findGoodSplitPoint(content, endPos, lookback);
-            }
-
-            String chunk = content.substring(pos, endPos);
-            EmbeddingResult emb = computeEmbedding(chunk);
+        for (TextChunker.Span span : chunker().split(content)) {
+            EmbeddingResult emb = computeEmbedding(span.text(content));
             embeddings.add(emb.embedding());
-            intervals.add(new int[]{pos, endPos});
+            intervals.add(new int[]{span.start(), span.end()});
             promptTokensSum += emb.promptTokens();
             totalTokensSum += emb.totalTokens();
-
-            // If we have reached the end of the file, stop.
-            if (endPos >= content.length()) {
-                break;
-            }
-
-            // Find the start position for the next chunk with overlap.
-            int idealStart = endPos - overlapSize;
-            if (idealStart <= pos) {
-                pos = endPos;
-            } else {
-                int nextStart = findGoodSplitPoint(content, idealStart, lookback);
-                pos = Math.max(pos + 1, nextStart);
-            }
         }
 
-        Entry newEntry = new Entry(key, modTs, size, promptTokensSum, totalTokensSum,
-                List.copyOf(embeddings), List.copyOf(intervals));
+        CsvEmbeddingStore.Entry newEntry = new CsvEmbeddingStore.Entry(key, modTs, size,
+                promptTokensSum, totalTokensSum, List.copyOf(embeddings), List.copyOf(intervals));
         entries.put(key, newEntry);
 
         LOG.info("Added entry '{}': {} chunks, {} prompt tokens, {} total tokens, vector size={}",
@@ -355,94 +264,44 @@ public class EmbeddingClient implements EmbeddingModel {
     }
 
     /**
-     * Searches the embedding database for entries most similar to the given query text.
+     * Splits a text with this client's {@link ChunkOptions} and embeds every chunk - the
+     * indexing path of a RAG source.
+     * <p>
+     * Each chunk gets the real character offsets of its span (UTF-16 code units of the
+     * decoded text) and the token count of its own embedding call, so that a hit can be
+     * resolved and budgeted later. The chunking itself is {@link TextChunker}: a caller must
+     * not split on its own, or two indexes of the same text would disagree.
+     * </p>
      *
-     * <p>The query text is first embedded using the configured API. Then, cosine similarity
-     * (via dot product of normalized vectors) is computed against all stored embeddings.
-     * For each database entry, the best-matching chunk is returned.
-     *
-     * @param content the query text to search for
-     * @param maxHits the maximum number of search results to return
-     * @return a list of {@link SearchResult} entries, sorted by descending score
-     * @throws IOException if an I/O error occurs while calling the embedding API
+     * @param id   the reference id of the text (e.g. the file path); carried by all chunks
+     * @param text the text to split and embed
+     * @return the chunks in reading order
+     * @throws IOException if an embedding call fails
      */
-    public List<SearchResult> search(String content, int maxHits) throws IOException {
-        // Truncate query to chunk size for embedding.
-        String queryText = content.substring(0, Math.min(content.length(), chunkSize));
-        EmbeddingResult queryEmb = computeEmbedding(queryText);
-        float[] queryVector = queryEmb.embedding();
-
-        List<SearchResult> results = new ArrayList<>();
-
-        for (Entry entry : entries.values()) {
-            float bestScore = Float.NEGATIVE_INFINITY;
-            int bestStart = -1;
-            int bestEnd = -1;
-            int bestChunkIndex = -1;
-
-            for (int i = 0; i < entry.embeddings().size(); i++) {
-                float[] vector = entry.embeddings().get(i);
-                float score = dotProduct(queryVector, vector);
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestChunkIndex = i;
-                    int[] interval = i < entry.intervals().size()
-                            ? entry.intervals().get(i)
-                            : new int[]{0, 0};
-                    bestStart = interval[0];
-                    bestEnd = interval[1];
-                }
-            }
-
-            results.add(new SearchResult(entry.key(), bestScore, bestStart, bestEnd, bestChunkIndex));
+    public List<EmbeddingChunk> computeChunks(String id, String text) throws IOException {
+        if (id == null || id.isBlank()) {
+            throw new IllegalArgumentException("computeChunks: id must not be null or blank");
         }
-
-        results.sort(Comparator.comparingDouble(SearchResult::score).reversed());
-
-        // Limit to maxHits.
-        if (results.size() > maxHits) {
-            results = results.subList(0, maxHits);
+        String content = text == null ? "" : text;
+        List<EmbeddingChunk> chunks = new ArrayList<>();
+        for (TextChunker.Span span : chunker().split(content)) {
+            EmbeddingResult emb = computeEmbedding(span.text(content));
+            chunks.add(new EmbeddingChunk(id, span.start(), span.end(), emb.promptTokens(), model,
+                    emb.embedding(), null, Map.of()));
         }
+        return List.copyOf(chunks);
+    }
 
-        LOG.debug("Search returned {} results for query ({} chars).", results.size(), content.length());
-        return results;
+    /**
+     * Returns a chunker for the current options.
+     *
+     * @return a chunker (cheap; it only holds the options)
+     */
+    private TextChunker chunker() {
+        return new TextChunker(chunkOptions);
     }
 
     // ---- Internal helpers ----
-
-    /**
-     * Finds a good split point in the text by searching backwards from {@code maxPos}
-     * within the {@code lookback} window. Prioritizes sentence endings (., !, ?) followed
-     * by whitespace, then line breaks, and finally falls back to {@code maxPos}.
-     *
-     * @param text     the full text
-     * @param maxPos   the maximum position (exclusive) for the split
-     * @param lookback the number of characters to look back from {@code maxPos}
-     * @return a character index suitable for splitting the text
-     */
-    private static int findGoodSplitPoint(String text, int maxPos, int lookback) {
-        int startPos = Math.max(0, maxPos - lookback);
-        String searchRegion = text.substring(startPos, maxPos);
-
-        // Search backwards for sentence endings.
-        for (int i = searchRegion.length() - 1; i >= 0; i--) {
-            char c = searchRegion.charAt(i);
-            if (c == '.' || c == '!' || c == '?') {
-                if (i + 1 >= searchRegion.length() || Character.isWhitespace(searchRegion.charAt(i + 1))) {
-                    return startPos + i + 1;
-                }
-            }
-        }
-
-        // Search backwards for line breaks.
-        for (int i = searchRegion.length() - 1; i >= 0; i--) {
-            if (searchRegion.charAt(i) == '\n' || searchRegion.charAt(i) == '\r') {
-                return startPos + i + 1;
-            }
-        }
-
-        return maxPos;
-    }
 
     /**
      * Computes the embedding of a text and packages it as a chunk.
@@ -456,6 +315,16 @@ public class EmbeddingClient implements EmbeddingModel {
      * @return the chunk with the vector, the model name and the prompt token count
      * @throws IOException if an I/O error occurs during the API call
      */
+    /**
+     * Returns the model this client embeds with.
+     *
+     * @return the model name
+     */
+    @Override
+    public String model() {
+        return model;
+    }
+
     @Override
     public EmbeddingChunk computeEmbedding(String id, String text) throws IOException {
         String chunkId = (id == null || id.isBlank()) ? "embedding" : id;
@@ -467,16 +336,31 @@ public class EmbeddingClient implements EmbeddingModel {
 
     /**
      * Computes an embedding vector for the given text by calling the OpenAI-compatible API.
+     * <p>
+     * This is the method the indexing path ({@code addFile}, the CLI's stdin mode) uses when
+     * it needs both token counts of the call. The request body and the response are handled
+     * with Jackson: a text containing quotes, control characters or a newline is escaped by
+     * the mapper, and a response with a nested structure ({@code data[0].embedding}) is
+     * parsed instead of matched by a regular expression.
+     * </p>
      *
      * @param text the input text to embed
      * @return the embedding result containing token counts and the vector
      * @throws IOException if an I/O error occurs during the API call
      */
-    private EmbeddingResult computeEmbedding(String text) throws IOException {
-        String jsonBody = String.format(
-                "{\"input\": \"%s\", \"model\": \"%s\", \"encoding_format\": \"float\"}",
-                escapeJson(text),
-                escapeJson(model));
+    public EmbeddingResult computeEmbedding(String text) throws IOException {
+        String content = text == null ? "" : text;
+        if (content.length() > maxInputChars) {
+            // No silent truncation: a cut text would be embedded as if it were complete.
+            throw new IllegalArgumentException("embedding input has " + content.length()
+                    + " characters, the limit is " + maxInputChars
+                    + " (see setMaxInputChars, mcp.rag.maxQueryChars, mcp.rag.chunk.maxChars)");
+        }
+        ObjectNode requestBody = MAPPER.createObjectNode();
+        requestBody.put("input", content);
+        requestBody.put("model", model);
+        requestBody.put("encoding_format", "float");
+        String jsonBody = MAPPER.writeValueAsString(requestBody);
 
         try {
             HttpRequest request = HttpRequest.newBuilder()
@@ -495,16 +379,12 @@ public class EmbeddingClient implements EmbeddingModel {
                 throw new IOException("Failed to compute embedding: HTTP " + response.statusCode());
             }
 
-            String body = response.body();
-
-            int promptTokens = parseInteger(body, PATTERN_PROMPT_TOKENS);
-            int totalTokens = parseInteger(body, PATTERN_TOTAL_TOKENS);
-            float[] embedding = parseEmbedding(body);
+            EmbeddingResult result = parseResponse(response.body());
 
             LOG.debug("Computed embedding: promptTokens={}, totalTokens={}, vectorSize={}",
-                    promptTokens, totalTokens, embedding.length);
+                    result.promptTokens(), result.totalTokens(), result.embedding().length);
 
-            return new EmbeddingResult(promptTokens, totalTokens, embedding);
+            return result;
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -513,289 +393,41 @@ public class EmbeddingClient implements EmbeddingModel {
     }
 
     /**
-     * Parses an integer value from a JSON response using the given pattern.
+     * Parses the response of an OpenAI-compatible embedding endpoint.
      *
-     * @param json    the JSON response string
-     * @param pattern the compiled regex pattern with a single capturing group
-     * @return the parsed integer, or 0 if not found
+     * @param body the JSON response
+     * @return the embedding result
+     * @throws IOException if the response carries no usable embedding
      */
-    private static int parseInteger(String json, Pattern pattern) {
-        Matcher matcher = pattern.matcher(json);
-        if (matcher.find()) {
-            return Integer.parseInt(matcher.group(1));
-        }
-        return 0;
-    }
-
-    /**
-     * Parses a float array from a JSON embedding response.
-     *
-     * @param json the JSON response string containing an {@code "embedding"} array
-     * @return the parsed float array
-     * @throws IOException if the embedding data cannot be found or parsed
-     */
-    private static float[] parseEmbedding(String json) throws IOException {
-        Matcher matcher = PATTERN_EMBEDDING.matcher(json);
-        if (matcher.find()) {
-            String content = matcher.group(1);
-            String[] parts = content.split(",");
-            float[] embedding = new float[parts.length];
-            for (int i = 0; i < parts.length; i++) {
-                embedding[i] = Float.parseFloat(parts[i].trim());
-            }
-            return embedding;
-        }
-        throw new IOException("Embedding data not found in API response");
-    }
-
-    /**
-     * Escapes a string for safe inclusion in JSON.
-     *
-     * @param input the input string
-     * @return the escaped string
-     */
-    private static String escapeJson(String input) {
-        if (input == null) {
-            return "";
-        }
-        return input.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\b", "\\b")
-                .replace("\f", "\\f")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t");
-    }
-
-    /**
-     * Escapes a CSV field value. If the value contains a semicolon, it is wrapped in quotes.
-     *
-     * @param value the field value
-     * @return the escaped field value
-     */
-    private static String escapeCsvField(String value) {
-        if (value == null) {
-            return "";
-        }
-        if (value.contains(";") || value.contains("\"") || value.contains("\n")) {
-            return "\"" + value.replace("\"", "\"\"") + "\"";
-        }
-        return value;
-    }
-
-    /**
-     * Computes the dot product of two float vectors.
-     *
-     * @param v1 the first vector
-     * @param v2 the second vector
-     * @return the dot product
-     */
-    private static float dotProduct(float[] v1, float[] v2) {
-        float sum = 0f;
-        for (int i = 0; i < v1.length; i++) {
-            sum += v1[i] * v2[i];
-        }
-        return sum;
-    }
-
-    // ---- Base64 encoding / decoding for F32 ----
-
-    /**
-     * Encodes a float array to a Base64 string (4 bytes per float, big-endian).
-     *
-     * @param floats the float array
-     * @return the Base64-encoded string
-     */
-    private static String floatArrayToBase64(float[] floats) {
-        ByteBuffer buffer = ByteBuffer.allocate(floats.length * 4);
-        for (float f : floats) {
-            buffer.putFloat(f);
-        }
-        return Base64.getEncoder().encodeToString(buffer.array());
-    }
-
-    /**
-     * Decodes a Base64 string to a float array (4 bytes per float, big-endian).
-     *
-     * @param base64 the Base64-encoded string
-     * @return the decoded float array
-     */
-    private static float[] base64ToFloatArray(String base64) {
-        byte[] bytes = Base64.getDecoder().decode(base64);
-        ByteBuffer buffer = ByteBuffer.wrap(bytes);
-        float[] floats = new float[bytes.length / 4];
-        for (int i = 0; i < floats.length; i++) {
-            floats[i] = buffer.getFloat();
-        }
-        return floats;
-    }
-
-    // ---- Base64 encoding / decoding for Q8_0 ----
-
-    /**
-     * Encodes a float array to a Base64 string using Q8_0 quantization.
-     *
-     * @param floats the float array to quantize
-     * @return the Base64-encoded Q8_0 quantized data
-     */
-    private static String floatArrayToBase64Q8(float[] floats) {
-        byte[] q8bytes = Q8_0Vector.writeVectorToBytes(floats);
-        return Base64.getEncoder().encodeToString(q8bytes);
-    }
-
-    // ---- CSV parsing ----
-
-    /**
-     * Parses a single CSV line into an {@link Entry}.
-     *
-     * <p>The expected format is:
-     * <pre>
-     * Key;modTs;size;promptTokens;totalTokens;Format;numEmbeddings;start1;end1;embedding1;start2;end2;embedding2;...
-     * </pre>
-     *
-     * @param line the CSV line to parse
-     * @return the parsed entry, or {@code null} if the line is malformed
-     */
-    private Entry parseCsvLine(String line) {
-        // Use a simple split-based parser; quoted fields are handled by unescapeCsvField.
-        // For simplicity, we split by ';' and handle quoted values.
-        List<String> fields = splitCsvLine(line);
-        if (fields.size() < 7) {
-            LOG.warn("CSV line has fewer than 7 fields: {}", line);
-            return null;
-        }
-
+    private static EmbeddingResult parseResponse(String body) throws IOException {
+        JsonNode root;
         try {
-            String key = fields.get(0);
-            long modTs = Long.parseLong(fields.get(1));
-            long size = Long.parseLong(fields.get(2));
-            int promptTokens = Integer.parseInt(fields.get(3));
-            int totalTokens = Integer.parseInt(fields.get(4));
-            String format = fields.get(5);
-            int numEmbeddings = Integer.parseInt(fields.get(6));
-
-            // Check if we have enough fields for the embeddings.
-            int expectedFields = 7 + numEmbeddings * 3; // start, end, data for each embedding
-            if (fields.size() < expectedFields) {
-                LOG.warn("CSV line has {} fields but expected {} for {} embeddings: {}",
-                        fields.size(), expectedFields, numEmbeddings, line);
-                return null;
-            }
-
-            List<float[]> embeddings = new ArrayList<>(numEmbeddings);
-            List<int[]> intervals = new ArrayList<>(numEmbeddings);
-
-            int idx = 7;
-            for (int i = 0; i < numEmbeddings; i++) {
-                int start = Integer.parseInt(fields.get(idx++));
-                int end = Integer.parseInt(fields.get(idx++));
-                String data = fields.get(idx++);
-
-                float[] vector;
-                if ("Q8_0".equals(format)) {
-                    // Determine the vector size from the Q8_0 byte data.
-                    // Each Q8_0 block encodes 32 floats in 34 bytes (2 scale + 32 values).
-                    byte[] q8bytes = Base64.getDecoder().decode(data);
-                    int vectorSize = (q8bytes.length / Q8_0Vector.BLOCK_BYTES) * Q8_0Vector.BLOCK_SIZE;
-                    vector = Q8_0Vector.readVectorFromBytes(q8bytes, vectorSize);
-                } else {
-                    // F32 format
-                    vector = base64ToFloatArray(data);
-                }
-
-                embeddings.add(vector);
-                intervals.add(new int[]{start, end});
-            }
-
-            return new Entry(key, modTs, size, promptTokens, totalTokens,
-                    List.copyOf(embeddings), List.copyOf(intervals));
-
-        } catch (NumberFormatException e) {
-            LOG.warn("Failed to parse numeric field in CSV line: {}", line, e);
-            return null;
+            root = MAPPER.readTree(body);
+        } catch (RuntimeException e) {
+            throw new IOException("Embedding API answered with invalid JSON: " + e.getMessage(), e);
         }
-    }
-
-    /**
-     * Splits a CSV line into fields, respecting quoted values.
-     *
-     * @param line the CSV line
-     * @return a list of field values
-     */
-    private static List<String> splitCsvLine(String line) {
-        List<String> fields = new ArrayList<>();
-        StringBuilder current = new StringBuilder();
-        boolean inQuotes = false;
-
-        for (int i = 0; i < line.length(); i++) {
-            char c = line.charAt(i);
-            if (c == '"') {
-                if (inQuotes && i + 1 < line.length() && line.charAt(i + 1) == '"') {
-                    // Escaped quote.
-                    current.append('"');
-                    i++;
-                } else {
-                    inQuotes = !inQuotes;
-                }
-            } else if (c == ';' && !inQuotes) {
-                fields.add(current.toString());
-                current.setLength(0);
-            } else {
-                current.append(c);
-            }
+        JsonNode data = root.path("data");
+        if (!data.isArray() || data.size() == 0) {
+            throw new IOException("Embedding API response has no 'data' array");
         }
-        fields.add(current.toString());
-
-        return fields;
+        JsonNode vectorNode = data.get(0).path("embedding");
+        if (!vectorNode.isArray() || vectorNode.size() == 0) {
+            throw new IOException("Embedding API response has no 'embedding' array");
+        }
+        float[] embedding = new float[vectorNode.size()];
+        for (int i = 0; i < embedding.length; i++) {
+            JsonNode value = vectorNode.get(i);
+            if (!value.isNumber()) {
+                throw new IOException("Embedding API response has a non-numeric value at index " + i);
+            }
+            embedding[i] = (float) value.asDouble();
+        }
+        JsonNode usage = root.path("usage");
+        return new EmbeddingResult(usage.path("prompt_tokens").asInt(0),
+                usage.path("total_tokens").asInt(0), embedding);
     }
 
     // ---- Inner types ----
-
-    /**
-     * Represents a single embedding entry in the database.
-     *
-     * @param key           the unique key (e.g. file path)
-     * @param modTs         last modification timestamp of the source file
-     * @param size          file size in bytes
-     * @param promptTokens  total prompt tokens used for all chunks
-     * @param totalTokens   total tokens (prompt + completion) for all chunks
-     * @param embeddings    list of embedding vectors (one per chunk)
-     * @param intervals     list of character offset intervals (one per chunk), each as {@code [start, end]}
-     */
-    public record Entry(String key, long modTs, long size, int promptTokens, int totalTokens,
-                        List<float[]> embeddings, List<int[]> intervals) {
-
-        /**
-         * Compact canonical constructor that creates defensive copies of the lists.
-         */
-        public Entry {
-            embeddings = List.copyOf(embeddings);
-            intervals = List.copyOf(intervals);
-        }
-    }
-
-    /**
-     * Represents the result of a similarity search.
-     *
-     * @param key          the key of the matching entry
-     * @param score        the similarity score (dot product)
-     * @param startOffset  the start character offset of the best-matching chunk (0-based)
-     * @param endOffset    the end character offset of the best-matching chunk (exclusive)
-     * @param chunkIndex   the index of the best-matching chunk within the entry
-     */
-    public record SearchResult(String key, float score, int startOffset, int endOffset, int chunkIndex) {
-
-        /**
-         * Returns a string representation of this search result.
-         *
-         * @return a formatted string
-         */
-        @Override
-        public String toString() {
-            return String.format("SearchResult{key='%s', score=%.4f, offsets=[%d..%d], chunk=%d}",
-                    key, score, startOffset, endOffset, chunkIndex);
-        }
-    }
 
     /**
      * Internal record holding the result of a single embedding API call.
@@ -804,6 +436,6 @@ public class EmbeddingClient implements EmbeddingModel {
      * @param totalTokens   total number of tokens
      * @param embedding     the embedding vector as a float array
      */
-    private record EmbeddingResult(int promptTokens, int totalTokens, float[] embedding) {
+    public record EmbeddingResult(int promptTokens, int totalTokens, float[] embedding) {
     }
 }

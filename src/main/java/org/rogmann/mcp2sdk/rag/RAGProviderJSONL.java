@@ -291,7 +291,9 @@ public class RAGProviderJSONL implements RAGProvider {
         }
         float[] vector;
         try {
-            vector = VectorCodec.decode(vectorBase64, format);
+            // A chunk may spell its own format ("Q8:<base64>"); it has to agree with the
+            // header, which stays authoritative.
+            vector = VectorCodec.decodeAuto(vectorBase64, format);
         } catch (IllegalArgumentException e) {
             throw new IOException(where + ": chunk '" + referenceId + "': " + e.getMessage(), e);
         }

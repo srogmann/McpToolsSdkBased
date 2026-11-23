@@ -5,8 +5,10 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -59,6 +61,12 @@ public final class EmbeddingDb {
 
     /** The effective limits. */
     private final RagLimits limits;
+
+    /**
+     * Sources whose vectors were already checked for unit length: the check is a pass over
+     * every vector, so it runs once per source and not once per search.
+     */
+    private final Set<RAGProvider> checkedProviders = ConcurrentHashMap.newKeySet();
 
     /**
      * Creates the search over the given sources.
@@ -120,7 +128,7 @@ public final class EmbeddingDb {
                         + "' has dimension " + chunk.dimension() + ", query has "
                         + queryVector.length + " - the source was built with another model");
             }
-            scored.add(new ScoredChunk(chunk, VectorCodec.cosine(queryVector, chunk.embeddingVector())));
+            scored.add(new ScoredChunk(chunk, VectorCodec.dot(queryVector, chunk.embeddingVector())));
         }
         scored.sort(ScoredChunk.BEST_FIRST);
         if (scored.size() > maxHits) {
@@ -146,6 +154,13 @@ public final class EmbeddingDb {
         if (query == null || query.isBlank()) {
             throw new IllegalArgumentException("search: query must not be null or blank");
         }
+        if (query.length() > limits.maxQueryChars()) {
+            // Refused, not truncated: a cut query is embedded as if it were complete, and the
+            // caller would never learn that half of it was ignored (M4).
+            throw new IllegalArgumentException("rag: query has " + query.length()
+                    + " characters, the limit is " + limits.maxQueryChars()
+                    + " (" + RagLimits.PROP_MAX_QUERY_CHARS + ") - shorten the query");
+        }
         RAGScope effectiveScope = scope != null ? scope : RAGScope.ALL;
         RAGOptions effectiveOptions = options != null
                 ? options
@@ -161,7 +176,9 @@ public final class EmbeddingDb {
         } catch (IOException e) {
             throw new RagEmbeddingException("query embedding failed: " + e.getMessage(), e);
         }
-        float[] queryVector = queryEmbedding.embeddingVector();
+        requireSameModelAsQuery(embedder.model() != null ? embedder.model() : queryEmbedding.model(),
+                selected, effectiveScope);
+        float[] queryVector = normalizeQuery(queryEmbedding.embeddingVector());
 
         List<String> warnings = new ArrayList<>();
         List<Candidate> candidates = new ArrayList<>();
@@ -173,6 +190,7 @@ public final class EmbeddingDb {
         for (RAGProvider provider : selected) {
             List<EmbeddingChunk> chunks = provider.embeddings();
             warnings.addAll(provider.warnings());
+            checkNormalization(provider, chunks, warnings);
             chunksScanned += chunks.size();
             List<ScoredChunk> best = search(queryVector, chunks, perSource);
             for (ScoredChunk scored : best) {
@@ -193,10 +211,12 @@ public final class EmbeddingDb {
         }
 
         List<String> cappedWarnings = capWarnings(warnings);
+        long elapsedMillis = (System.nanoTime() - started) / 1_000_000L;
         LOG.debug("RAG search '{}' in {}: {} sources, {} chunks, {} hits, {} ms",
                 abbreviate(query), effectiveScope.describe(), selected.size(), chunksScanned,
-                result.size(), (System.nanoTime() - started) / 1_000_000L);
-        return new RAGResult(result, selected.size(), chunksScanned, cappedWarnings);
+                result.size(), elapsedMillis);
+        return new RAGResult(result, selected.size(), chunksScanned, queryEmbedding.model(),
+                elapsedMillis, cappedWarnings);
     }
 
     /**
@@ -240,6 +260,105 @@ public final class EmbeddingDb {
                         + "' (" + provider.name() + ") - narrow the scope or rebuild the source");
             }
         }
+    }
+
+    /**
+     * Refuses a query that was embedded with another model than the selected sources.
+     * <p>
+     * Two models of equal dimension produce vectors that can be compared arithmetically and
+     * are still meaningless to compare - the score would look plausible and be wrong.
+     * </p>
+     *
+     * @param queryModel the model of the query, or {@code null} if it does not say
+     * @param selected   the selected sources
+     * @param scope      the scope, for the error message
+     */
+    private static void requireSameModelAsQuery(String queryModel, List<RAGProvider> selected,
+                                                RAGScope scope) {
+        if (queryModel == null || queryModel.isBlank()) {
+            return;
+        }
+        for (RAGProvider provider : selected) {
+            if (!queryModel.equalsIgnoreCase(provider.model())) {
+                throw new IllegalArgumentException("rag: the query was embedded with '" + queryModel
+                        + "', the source '" + provider.name() + "' (" + scope.describe()
+                        + ") was built with '" + provider.model()
+                        + "' - check mcp.rag.embedding.model");
+            }
+        }
+    }
+
+    /**
+     * Normalizes the query vector once per search.
+     *
+     * @param queryVector the query vector
+     * @return the unit vector
+     * @throws IllegalArgumentException if the query vector has length 0
+     */
+    private static float[] normalizeQuery(float[] queryVector) {
+        float[] unit = VectorCodec.normalize(queryVector);
+        if (unit == null) {
+            throw new IllegalArgumentException("rag: the query embedding is a zero vector");
+        }
+        return unit;
+    }
+
+    /**
+     * Checks a source once for unit-length vectors.
+     * <p>
+     * The ranking is a dot product (M12): with unit vectors it equals the cosine. A source
+     * whose vectors are not normalized is reported once - silently normalizing it would hide
+     * a broken embedding endpoint, and ignoring it would skew the ranking. The check runs
+     * once per source and is cached, not once per search.
+     * </p>
+     *
+     * @param provider the source
+     * @param chunks   its chunks
+     * @param warnings collector for the finding
+     */
+    private void checkNormalization(RAGProvider provider, List<EmbeddingChunk> chunks,
+                                    List<String> warnings) {
+        if (!limits.checkNormalized() || chunks.isEmpty() || !checkedProviders.add(provider)) {
+            return;
+        }
+        int offenders = 0;
+        double worst = 0;
+        for (EmbeddingChunk chunk : chunks) {
+            double deviation = Math.abs(VectorCodec.norm(chunk.embeddingVector()) - 1.0);
+            if (deviation > VectorCodec.NORMALIZATION_TOLERANCE) {
+                offenders++;
+                worst = Math.max(worst, deviation);
+            }
+        }
+        if (offenders == 0) {
+            return;
+        }
+        if (limits.normalizeOnLoad()) {
+            int normalized = 0;
+            for (EmbeddingChunk chunk : chunks) {
+                if (VectorCodec.normalizeInPlace(chunk.embeddingVector())) {
+                    normalized++;
+                }
+            }
+            warnings.add("normalized " + normalized + " of " + chunks.size() + " vectors of '"
+                    + provider.name() + "' in memory (mcp.rag.normalizeOnLoad=true, max deviation "
+                    + formatDeviation(worst) + ")");
+            return;
+        }
+        warnings.add(offenders + " of " + chunks.size() + " vectors of '" + provider.name()
+                + "' are not normalized (max |‖v‖-1| = " + formatDeviation(worst)
+                + "); the ranking uses the dot product - set mcp.rag.normalizeOnLoad=true"
+                + " or rebuild the source");
+    }
+
+    /**
+     * Formats a deviation for a warning.
+     *
+     * @param deviation the deviation
+     * @return a representation with three significant digits
+     */
+    private static String formatDeviation(double deviation) {
+        return String.format(Locale.ROOT, "%.3g", deviation);
     }
 
     /**
@@ -323,6 +442,7 @@ public final class EmbeddingDb {
         }
         long timeout = Math.min(remainingMillis, limits.textTimeoutMillis());
         Future<String> future = TEXT_EXECUTOR.submit(() -> provider.text(chunk));
+        boolean isOk = false;
         try {
             String text = future.get(timeout, TimeUnit.MILLISECONDS);
             if (text == null) {
@@ -330,9 +450,9 @@ public final class EmbeddingDb {
                 warnings.add("source unavailable: no text for '" + chunk.referenceId()
                         + "' (" + provider.name() + ")");
             }
+            isOk = true;
             return text;
         } catch (TimeoutException e) {
-            future.cancel(true);
             warnings.add("source unavailable: text of '" + chunk.referenceId() + "' ("
                     + provider.name() + ") not delivered within " + timeout + " ms");
             return null;
@@ -343,8 +463,13 @@ public final class EmbeddingDb {
             return null;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            future.cancel(true);
             return null;
+        } finally {
+            if (!isOk) {
+                // Every path that did not return a text leaves the resolver behind: cancel it,
+                // so a slow source does not keep a pool thread busy for the next search.
+                future.cancel(true);
+            }
         }
     }
 
@@ -403,7 +528,8 @@ public final class EmbeddingDb {
      * A chunk with its similarity score.
      *
      * @param chunk the chunk
-     * @param score the cosine similarity
+     * @param score the score: the dot product of the normalized query vector and the chunk
+     *              vector, i.e. the cosine for sources built with normalized embeddings
      */
     public record ScoredChunk(EmbeddingChunk chunk, double score) {
 
@@ -419,7 +545,7 @@ public final class EmbeddingDb {
      *
      * @param provider the source
      * @param chunk    the chunk
-     * @param score    the cosine similarity
+     * @param score    the dot product of the unit query vector and the chunk vector
      */
     private record Candidate(RAGProvider provider, EmbeddingChunk chunk, double score) {
 

@@ -1,6 +1,7 @@
 package org.rogmann.mcp2sdk.rag;
 
 import java.io.IOException;
+import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -16,18 +17,19 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * A RAG source read from the semicolon-separated CSV database written by
- * {@link EmbeddingClient#save(java.io.File, boolean)}.
+ * A RAG source read from the semicolon-separated CSV database of
+ * {@link CsvEmbeddingStore}.
  * <p>
- * The CSV stores one line per indexed file (key = file path, chunk intervals and the
- * Base64-encoded vectors), but no text. The text is therefore resolved on demand from
- * the referenced file ({@link #text(EmbeddingChunk)}), which is exactly what
- * {@code EmbeddingMain} did before printing its results.
+ * The database stores vectors and character intervals, but no text: the text is
+ * resolved on demand from the referenced file ({@link #text(EmbeddingChunk)}), and only
+ * for the hits that are actually returned. The read is streamed to the requested range,
+ * so a hit in a large document costs the range, not the document.
  * </p>
  * <p>
- * The CSV carries no model name: the model the database was built with has to be
- * given at registration, otherwise a search would silently compare vectors of two
- * different embedding models.
+ * Reading is strict ({@link CsvEmbeddingStore#read(Path)}): a malformed line or a
+ * missing file aborts with file and line number. The CSV carries no model name, so the
+ * model the database was built with has to be given at registration - otherwise a
+ * search would silently compare vectors of two different embedding models.
  * </p>
  */
 public class RAGProviderCSV implements RAGProvider {
@@ -55,9 +57,6 @@ public class RAGProviderCSV implements RAGProvider {
 
     /** Guards the one-time load. */
     private final ReentrantLock loadLock = new ReentrantLock();
-
-    /** Warnings collected while loading. */
-    private final AtomicReference<List<String>> warningRef = new AtomicReference<>(List.of());
 
     /**
      * Creates a provider for a CSV embedding database.
@@ -133,6 +132,15 @@ public class RAGProviderCSV implements RAGProvider {
         }
     }
 
+    /**
+     * Resolves the text of a chunk from the referenced file.
+     * <p>
+     * The offsets are character offsets (UTF-16 code units) of the decoded UTF-8 text, so
+     * the file is decoded up to {@code offsetStart} and only the range itself is kept in
+     * memory.
+     * </p>
+     * {@inheritDoc}
+     */
     @Override
     public String text(EmbeddingChunk chunk) throws IOException {
         // A database variant may carry the texts itself (e.g. a glossary): then there is
@@ -140,58 +148,85 @@ public class RAGProviderCSV implements RAGProvider {
         if (chunk.text() != null) {
             return chunk.text();
         }
+        int start = chunk.offsetStart();
+        int end = chunk.offsetEnd();
+        if (start < 0 || end < 0 || start > end) {
+            // Offsets unknown or contradictory: the source cannot say where the text is.
+            return null;
+        }
+        if (start == end) {
+            // A valid, empty span - different from "not resolvable".
+            return "";
+        }
         Path source = Path.of(chunk.referenceId());
         if (!Files.isRegularFile(source)) {
             return null;
         }
-        String content = Files.readString(source, StandardCharsets.UTF_8);
-        int start = Math.max(0, chunk.offsetStart());
-        int end = chunk.offsetEnd() < 0 ? content.length() : Math.min(chunk.offsetEnd(), content.length());
-        if (start >= end) {
-            return chunk.offsetStart() < 0 ? content : "";
-        }
-        return content.substring(start, end);
+        return readRange(source, start, end);
     }
 
-    @Override
-    public List<String> warnings() {
-        return warningRef.get();
+    /**
+     * Reads a character range of a UTF-8 file without holding the whole file.
+     *
+     * @param source the file
+     * @param start  the start offset (UTF-16 code units of the decoded text)
+     * @param end    the end offset (exclusive)
+     * @return the text, or {@code null} if the file ends before {@code end} (the index no
+     *         longer matches the source)
+     * @throws IOException if the file cannot be read
+     */
+    private static String readRange(Path source, int start, int end) throws IOException {
+        try (Reader reader = Files.newBufferedReader(source, StandardCharsets.UTF_8)) {
+            long remaining = start;
+            while (remaining > 0) {
+                long skipped = reader.skip(remaining);
+                if (skipped <= 0) {
+                    // skip() may return 0 at the end of the file; a single read tells.
+                    if (reader.read() < 0) {
+                        return null;
+                    }
+                    remaining--;
+                } else {
+                    remaining -= skipped;
+                }
+            }
+            char[] buffer = new char[end - start];
+            int filled = 0;
+            while (filled < buffer.length) {
+                int read = reader.read(buffer, filled, buffer.length - filled);
+                if (read < 0) {
+                    // The file is shorter than the index says: the chunk is stale.
+                    return null;
+                }
+                filled += read;
+            }
+            return new String(buffer);
+        }
     }
 
     /**
      * Loads the CSV database and converts its entries into chunks.
      *
      * @return the chunks
-     * @throws IOException if the CSV cannot be read
+     * @throws IOException if the CSV cannot be read or is malformed
      */
     private List<EmbeddingChunk> load() throws IOException {
         long started = System.nanoTime();
-        EmbeddingClient client = new EmbeddingClient("unused://no-embedding-call", model);
-        client.load(file.toFile());
-
         List<EmbeddingChunk> chunks = new ArrayList<>();
-        List<String> warnings = new ArrayList<>();
-        for (Map.Entry<String, EmbeddingClient.Entry> entry : client.entries().entrySet()) {
-            String key = entry.getKey();
-            EmbeddingClient.Entry value = entry.getValue();
-            List<float[]> vectors = value.embeddings();
-            List<int[]> intervals = value.intervals();
-            if (vectors.size() != intervals.size()) {
-                warnings.add("entry '" + key + "' has " + vectors.size() + " vectors but "
-                        + intervals.size() + " intervals - the entry is skipped");
-                continue;
-            }
-            Map<String, String> chunkMetadata = new LinkedHashMap<>();
-            chunkMetadata.put(EmbeddingChunk.META_TITLE, fileNameOf(key));
-            chunkMetadata.put(EmbeddingChunk.META_SOURCE, key);
+
+        for (CsvEmbeddingStore.Entry entry : CsvEmbeddingStore.read(file)) {
+            Map<String, String> chunkMetadata = new LinkedHashMap<>(4);
+            chunkMetadata.put(EmbeddingChunk.META_TITLE, fileNameOf(entry.key()));
+            chunkMetadata.put(EmbeddingChunk.META_SOURCE, entry.key());
+            List<float[]> vectors = entry.embeddings();
+            List<int[]> intervals = entry.intervals();
             for (int i = 0; i < vectors.size(); i++) {
                 int[] interval = intervals.get(i);
-                chunks.add(new EmbeddingChunk(key, interval[0], interval[1], 0, model,
+                chunks.add(new EmbeddingChunk(entry.key(), interval[0], interval[1], 0, model,
                         vectors.get(i), null, chunkMetadata));
             }
         }
 
-        warningRef.set(capWarnings(warnings));
         LOG.info("Loaded RAG source '{}' ({}): {} chunks from CSV {} in {} ms",
                 name, topic, chunks.size(), file, (System.nanoTime() - started) / 1_000_000L);
         return Collections.unmodifiableList(chunks);
@@ -211,25 +246,6 @@ public class RAGProviderCSV implements RAGProvider {
         } catch (RuntimeException e) {
             return key;
         }
-    }
-
-    /**
-     * Caps a warning list at {@link RagLimits#maxWarnings()} entries.
-     *
-     * @param warnings the warnings
-     * @return the capped, immutable list
-     */
-    private static List<String> capWarnings(List<String> warnings) {
-        int max = RagLimits.current().maxWarnings();
-        if (max <= 0) {
-            return List.of();
-        }
-        if (warnings.size() <= max) {
-            return List.copyOf(warnings);
-        }
-        List<String> capped = new ArrayList<>(warnings.subList(0, max));
-        capped.add("... and " + (warnings.size() - max) + " more warnings");
-        return List.copyOf(capped);
     }
 
     /**

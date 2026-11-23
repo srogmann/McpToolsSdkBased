@@ -1,6 +1,7 @@
 package org.rogmann.mcp2sdk.rag;
 
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
 /**
@@ -20,9 +21,17 @@ import java.util.function.Function;
  * @param maxHits            largest accepted number of hits per search
  * @param maxCharsPerHit     longest text returned per hit
  * @param maxWarnings        largest number of warnings reported per search
+ * @param maxSourceBytes     largest accepted size of one source file (guards the load)
+ * @param maxQueryChars      largest accepted query length; a longer query is refused, never
+ *                           truncated silently (M4)
+ * @param checkNormalized    whether a source is checked once for unit-length vectors, with a
+ *                           warning per source (the ranking uses the dot product)
+ * @param normalizeOnLoad    whether such vectors are normalized in memory instead of only
+ *                           reported; {@code false} keeps the source as it is
  */
 public record RagLimits(long embedTimeoutMillis, long textTimeoutMillis, long textBudgetMillis,
-                        int maxHits, int maxCharsPerHit, int maxWarnings) {
+                        int maxHits, int maxCharsPerHit, int maxWarnings, long maxSourceBytes,
+                        int maxQueryChars, boolean checkNormalized, boolean normalizeOnLoad) {
 
     /** HTTP timeout of the query embedding call. */
     public static final String PROP_EMBED_TIMEOUT = "mcp.rag.embedTimeoutMillis";
@@ -36,19 +45,34 @@ public record RagLimits(long embedTimeoutMillis, long textTimeoutMillis, long te
     public static final String PROP_MAX_CHARS = "mcp.rag.maxCharsPerHit";
     /** Largest number of warnings reported per search. */
     public static final String PROP_MAX_WARNINGS = "mcp.rag.maxWarnings";
+    /** Largest accepted size of one source file. */
+    public static final String PROP_MAX_SOURCE_BYTES = "mcp.rag.maxSourceBytes";
+    /** Largest accepted query length in characters. */
+    public static final String PROP_MAX_QUERY_CHARS = "mcp.rag.maxQueryChars";
+    /** Whether a source is checked once for unit-length vectors. */
+    public static final String PROP_CHECK_NORMALIZED = "mcp.rag.checkNormalized";
+    /** Whether non-normalized source vectors are normalized in memory. */
+    public static final String PROP_NORMALIZE_ON_LOAD = "mcp.rag.normalizeOnLoad";
 
-    /** The limits in effect (set once at start-up by McpConfig). */
-    private static volatile RagLimits current = defaults();
+    /**
+     * The limits in effect (set once at start-up by McpConfig). An {@link AtomicReference}
+     * rather than a volatile field: the record is immutable, and the publish is a plain
+     * atomic set - the same pattern the rest of the project uses for shared state.
+     */
+    private static final AtomicReference<RagLimits> CURRENT =
+            new AtomicReference<>(defaults());
 
     /**
      * Returns the built-in limits: 20 s embedding timeout, 5 s per text, 20 s text
      * budget (well below the 60 s script timeout of the JavaScript tool), 50 hits,
-     * 2000 characters per hit, 10 warnings.
+     * 2000 characters per hit, 10 warnings, 512 MiB per source file, 8000 characters
+     * per query, normalization checked but not applied.
      *
      * @return the default limits
      */
     public static RagLimits defaults() {
-        return new RagLimits(20000, 5000, 20000, 50, 2000, 10);
+        return new RagLimits(20000, 5000, 20000, 50, 2000, 10, 512L * 1024 * 1024, 8000,
+                true, false);
     }
 
     /**
@@ -72,7 +96,37 @@ public record RagLimits(long embedTimeoutMillis, long textTimeoutMillis, long te
                 (int) longProperty(get, PROP_MAX_CHARS, defaults.maxCharsPerHit(), 1, 1000000,
                         "a whole number of characters"),
                 (int) longProperty(get, PROP_MAX_WARNINGS, defaults.maxWarnings(), 0, 100,
-                        "a whole number of warnings"));
+                        "a whole number of warnings"),
+                longProperty(get, PROP_MAX_SOURCE_BYTES, defaults.maxSourceBytes(), 1024,
+                        16L * 1024 * 1024 * 1024, "a whole number of bytes"),
+                (int) longProperty(get, PROP_MAX_QUERY_CHARS, defaults.maxQueryChars(), 1, 1000000,
+                        "a whole number of characters"),
+                booleanProperty(get, PROP_CHECK_NORMALIZED, defaults.checkNormalized()),
+                booleanProperty(get, PROP_NORMALIZE_ON_LOAD, defaults.normalizeOnLoad()));
+    }
+
+    /**
+     * Reads one boolean property strictly ({@code true} or {@code false}).
+     *
+     * @param get      property getter
+     * @param key      property name
+     * @param fallback value used when the property is absent
+     * @return the value
+     * @throws IllegalArgumentException if the value is neither {@code true} nor {@code false}
+     */
+    private static boolean booleanProperty(Function<String, String> get, String key,
+                                           boolean fallback) {
+        String value = get.apply(key);
+        if (value == null || value.isBlank()) {
+            return fallback;
+        }
+        if ("true".equalsIgnoreCase(value.trim())) {
+            return true;
+        }
+        if ("false".equalsIgnoreCase(value.trim())) {
+            return false;
+        }
+        throw invalidProperty(key, value, "true or false");
     }
 
     /**
@@ -81,7 +135,7 @@ public record RagLimits(long embedTimeoutMillis, long textTimeoutMillis, long te
      * @return the current limits (the defaults when nobody initialised them)
      */
     public static RagLimits current() {
-        return current;
+        return CURRENT.get();
     }
 
     /**
@@ -90,7 +144,7 @@ public record RagLimits(long embedTimeoutMillis, long textTimeoutMillis, long te
      * @param limits the validated limits, {@code null} restores the defaults
      */
     public static void setCurrent(RagLimits limits) {
-        current = limits != null ? limits : defaults();
+        CURRENT.set(limits != null ? limits : defaults());
     }
 
     /**

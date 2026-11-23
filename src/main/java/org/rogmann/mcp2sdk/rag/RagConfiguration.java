@@ -121,8 +121,11 @@ public final class RagConfiguration {
 
         if (url != null) {
             String apiKey = trimToNull(get.apply(PROP_EMBEDDING_API_KEY));
-            RAGRegistry.get().setEmbeddingModel(new EmbeddingClient(url, model, apiKey,
-                    Duration.ofMillis(limits.embedTimeoutMillis())));
+            EmbeddingClient client = new EmbeddingClient(url, model, apiKey,
+                    Duration.ofMillis(limits.embedTimeoutMillis()));
+            // The query path may only send what the search accepts (M4): one limit, one place.
+            client.setMaxInputChars(limits.maxQueryChars());
+            RAGRegistry.get().setEmbeddingModel(client);
         } else {
             LOG.info("RAG: no embedding endpoint configured ({} / {}) - rag.search() will"
                     + " report that a model is missing", PROP_EMBEDDING_URL, PROP_EMBEDDING_MODEL);

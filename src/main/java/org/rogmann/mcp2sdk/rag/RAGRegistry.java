@@ -12,6 +12,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 
 import org.slf4j.Logger;
@@ -48,11 +49,11 @@ public final class RAGRegistry {
     /** The registered sources, in registration order. */
     private final CopyOnWriteArrayList<RAGProvider> providers = new CopyOnWriteArrayList<>();
 
-    /** The model that embeds the query, or {@code null} until configured. */
-    private volatile EmbeddingModel embedder;
+    /** The model that embeds the query, empty until configured. */
+    private final AtomicReference<EmbeddingModel> embedder = new AtomicReference<>();
 
-    /** The cached search, or {@code null} when it has to be rebuilt. */
-    private volatile EmbeddingDb db;
+    /** The cached search, empty when it has to be rebuilt. */
+    private final AtomicReference<EmbeddingDb> db = new AtomicReference<>();
 
     /** Guards the rebuild of {@link #db}. */
     private final ReentrantLock dbLock = new ReentrantLock();
@@ -84,7 +85,7 @@ public final class RAGRegistry {
             }
         }
         providers.add(provider);
-        db = null;
+        db.set(null);
         LOG.info("Registered RAG source '{}' ({}), model={}, dimension={}",
                 provider.name(), provider.topic(), provider.model(), provider.dimension());
     }
@@ -99,12 +100,19 @@ public final class RAGRegistry {
     }
 
     /**
-     * Removes all sources and the cached search (for tests and for a configuration
-     * reload).
+     * Removes all sources, the configured embedding model and the cached search (for
+     * tests and for a configuration reload).
+     * <p>
+     * The model is part of the configuration, not of the sources: a reload that keeps a
+     * stale model would answer searches for a corpus that is no longer registered - and
+     * a test that only clears the sources would silently inherit the model of the test
+     * before.
+     * </p>
      */
     public void clear() {
         providers.clear();
-        db = null;
+        embedder.set(null);
+        db.set(null);
     }
 
     /**
@@ -113,8 +121,8 @@ public final class RAGRegistry {
      * @param model the model, or {@code null} to clear it
      */
     public void setEmbeddingModel(EmbeddingModel model) {
-        this.embedder = model;
-        this.db = null;
+        embedder.set(model);
+        db.set(null);
     }
 
     /**
@@ -123,7 +131,7 @@ public final class RAGRegistry {
      * @return true if a search can embed its query
      */
     public boolean hasEmbeddingModel() {
-        return embedder != null;
+        return embedder.get() != null;
     }
 
     /**
@@ -133,21 +141,21 @@ public final class RAGRegistry {
      * @throws IllegalStateException if no embedding model is configured
      */
     public EmbeddingDb db() {
-        EmbeddingDb current = db;
+        EmbeddingDb current = db.get();
         if (current != null) {
             return current;
         }
         dbLock.lock();
         try {
-            current = db;
+            current = db.get();
             if (current == null) {
-                EmbeddingModel model = embedder;
+                EmbeddingModel model = embedder.get();
                 if (model == null) {
                     throw new IllegalStateException("rag: no embedding model configured"
                             + " - set mcp.rag.embedding.url and mcp.rag.embedding.model");
                 }
                 current = new EmbeddingDb(providers(), model, RagLimits.current());
-                db = current;
+                db.set(current);
             }
             return current;
         } finally {

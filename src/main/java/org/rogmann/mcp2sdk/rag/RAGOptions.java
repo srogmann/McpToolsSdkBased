@@ -6,7 +6,8 @@ package org.rogmann.mcp2sdk.rag;
  * @param maxHits      number of hits returned in total (at least 1)
  * @param maxPerSource largest number of hits one source may contribute before the merge;
  *                     {@code 0} means "no per-source limit" (the total {@code maxHits} still applies)
- * @param minScore     hits below this cosine score are dropped; {@code Double.NEGATIVE_INFINITY}
+ * @param minScore     hits below this score are dropped (the score is the dot product of the
+ *                     unit query vector and the chunk vector); {@code Double.NEGATIVE_INFINITY}
  *                     keeps everything
  * @param maxChars     longest text returned per hit; longer texts are cut and marked
  *                     {@link TextStatus#TRUNCATED}

@@ -16,7 +16,8 @@ import java.util.Map;
  * @param referenceId identifier of the referenced document (unique together with the offset)
  * @param title       document/section title (from {@link EmbeddingChunk#META_TITLE}), or {@code ""}
  * @param source      URL or path of the original source (from {@link EmbeddingChunk#META_SOURCE}), or {@code ""}
- * @param score       similarity (cosine, higher is better)
+ * @param score       similarity, higher is better: the dot product of the unit query vector
+ *                    and the chunk vector (the cosine for normalized sources)
  * @param startOffset start offset of the chunk, or {@code -1}
  * @param endOffset   end offset (exclusive), or {@code -1}
  * @param numberTokens token count of the chunk (context budget), {@code 0} if unknown

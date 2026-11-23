@@ -18,6 +18,21 @@ import java.io.IOException;
 public interface EmbeddingModel {
 
     /**
+     * Returns the embedding model whose vectors this implementation computes.
+     * <p>
+     * The search compares it with the model of the sources: vectors of two models are not
+     * comparable, and equal dimensions do not make them comparable. The default is
+     * {@code null} ("the implementation does not say"), which skips the check - a test
+     * double needs no model name.
+     * </p>
+     *
+     * @return the model name, or {@code null} if unknown
+     */
+    default String model() {
+        return null;
+    }
+
+    /**
      * Computes the embedding of a text.
      *
      * @param id   a caller-defined identifier of the text, carried into the returned chunk
