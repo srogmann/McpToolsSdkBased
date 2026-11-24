@@ -22,6 +22,7 @@ import org.rogmann.mcp2sdk.js.JsAgentBoardBridge;
 import org.rogmann.mcp2sdk.js.JsArchiveBridge;
 import org.rogmann.mcp2sdk.js.JsCryptoBridge;
 import org.rogmann.mcp2sdk.js.JsDiffBridge;
+import org.rogmann.mcp2sdk.js.JsErrorCode;
 import org.rogmann.mcp2sdk.js.JsFileSystem;
 import org.rogmann.mcp2sdk.js.JsFileSystemBridge;
 import org.rogmann.mcp2sdk.js.JsGitBridge;
@@ -163,18 +164,28 @@ public class JavaScriptTool {
     private final ToolState state;
 
     /** The available JS-modules (namespace -&gt; module), wired into the JavaScript context on each call. */
-    private final LinkedHashMap<String, JsModuleInterface> modules;
+    private final Map<String, JsModuleInterface> modules;
 
-    private JavaScriptTool(LinkedHashMap<String, JsModuleInterface> modules) {
+    /** The catalog the modules come from - it holds the runtime switches (Web UI, /tools). */
+    private final JsModuleCatalog catalog;
+
+    private JavaScriptTool(Map<String, JsModuleInterface> modules) {
         this.modules = modules;
+        this.catalog = JsModuleCatalog.getInstance();
         this.state = new ToolState();
     }
 
     /**
      * Creates the set of available JS-modules in a deterministic (insertion) order.
+     * <p>
+     * Called once by {@link JsModuleCatalog}, which keeps the returned map and adds the runtime
+     * switches: the modules are stateless bridges, so one set per process is enough. A second set
+     * would be a second answer to "is this module enabled" and a second connection for the modules
+     * whose constructor reads one ({@code mcp} asks the MCP server for its tool names).
+     * </p>
      * @return module map
      */
-    private static LinkedHashMap<String, JsModuleInterface> createModules() {
+    static Map<String, JsModuleInterface> createModules() {
         LinkedHashMap<String, JsModuleInterface> modules = new LinkedHashMap<>();
         modules.put("fs", new JsFileSystemBridge());
         modules.put("crypto", new JsCryptoBridge());
@@ -224,7 +235,7 @@ public class JavaScriptTool {
         modules.put("image", new JsImageBridge());
         // Semantic search in the RAG sources registered on the server (docs/js/rag.md):
         // the query is embedded once, the chunks of the sources of a topic (or of one named
-        // source) are scored by cosine similarity, and the best n hits are returned with
+        // source) are scored by the dot product of the unit query vector, and the best n hits are returned with
         // their provenance (provider, title, source URL) and text. Registered sources are a
         // server-side configuration (mcp.rag.sources, mcp.rag.embedding.*) - the sandbox
         // itself opens no connection, the module only calls the endpoints the server names.
@@ -240,34 +251,110 @@ public class JavaScriptTool {
         return modules;
     }
 
-    /** One JS module as the ACP chat's {@code /modules} command lists it. */
+    /**
+     * One JS module as the ACP chat's {@code /modules} command and the Web UI's {@code /tools}
+     * page list it.
+     *
+     * @param namespace the bound namespace ({@code fs}), or {@code "shipped"} for the block of
+     *        libraries that ship inside the server's jar
+     * @param summary the module's summary (the text the tool description is built from)
+     * @param advertised whether the summary appears in the MCP tool description
+     * @param enabled whether the module is bound <em>right now</em>: offered by the configuration
+     *        and not switched off at runtime
+     * @param kind {@code "namespace"} for a bound namespace, {@code "shipped"} for the block
+     */
     public record JsModuleListing(String namespace, String summary, boolean advertised,
                                   boolean enabled, String kind) {
     }
 
     /**
      * The JS modules of this tool, in the tool's own insertion order — the {@code /modules}
-     * command of the ACP chat lists them. Cheap to call: the modules are stateless bridge
-     * objects, built exactly the way {@link #createToolInstance()} builds them.
+     * command of the ACP chat and the {@code /tools} page of the Web UI list them. Cheap to call:
+     * the modules are the stateless bridge objects of the one catalog, built once per process.
      * <p>
-     * The libraries that ship inside the jar follow as {@code kind = "shipped"}: they are not
-     * bound namespaces (there is no global {@code pdftext}), so the list must say which of the two
-     * a name is.
+     * A module the <em>configuration</em> switched off ({@link JsModuleInterface#isEnabled()},
+     * e.g. {@code -Dmcp2sdk.module.git.enabled=false}) is not listed: it is not a switch, it is
+     * absent. What the {@code enabled} flag reports instead is the runtime switch
+     * ({@link #setModuleEnabled(String, boolean)}).
      * </p>
-     * @return one entry per module and per shipped library, insertion-ordered
+     * <p>
+     * The libraries that ship inside the jar follow as one entry of {@code kind = "shipped"}: they
+     * are not bound namespaces (there is no global {@code pdftext}), and they are switched as one
+     * block because they load each other.
+     * </p>
+     * @return one entry per switchable module plus the shipped block, insertion-ordered
      */
     public static List<JsModuleListing> moduleListing() {
+        JsModuleCatalog catalog = JsModuleCatalog.getInstance();
         List<JsModuleListing> listing = new ArrayList<>();
-        for (Map.Entry<String, JsModuleInterface> entry : createModules().entrySet()) {
+        for (Map.Entry<String, JsModuleInterface> entry : catalog.modules().entrySet()) {
             JsModuleInterface module = entry.getValue();
+            if (!module.isEnabled()) {
+                // Absent by configuration - not a switch, so the UI does not offer it.
+                continue;
+            }
             listing.add(new JsModuleListing(entry.getKey(), module.getSummary(),
-                    module.isAdvertised(), module.isEnabled(), "namespace"));
+                    module.isAdvertised(), catalog.isSwitchedOn(entry.getKey()), "namespace"));
         }
-        for (ShippedJsModules.Entry shipped : ShippedJsModules.byName().values()) {
-            listing.add(new JsModuleListing(shipped.name(), shipped.summary(), true, true,
-                    "shipped"));
+        if (!ShippedJsModules.byName().isEmpty()) {
+            listing.add(new JsModuleListing(JsModuleCatalog.SHIPPED, shippedBlockSummary(), true,
+                    catalog.isShippedSwitchedOn(), "shipped"));
         }
         return listing;
+    }
+
+    /**
+     * Whether a JS module is bound right now, i.e. offered by the configuration and not switched
+     * off at runtime.
+     * @param name a namespace ({@code fs}) or {@code "shipped"} for the block of shipped libraries
+     * @return true if the next script call would bind it
+     * @throws IllegalArgumentException if the name is not switchable
+     */
+    public static boolean isModuleEnabled(String name) {
+        return JsModuleCatalog.getInstance().isBound(name);
+    }
+
+    /**
+     * Switches a JS module on or off at runtime, for <em>all</em> callers of this server (one
+     * {@code javascript} tool, one sandbox policy - there is no per-session module set).
+     * <p>
+     * The switch takes effect from the next tool call: the modules are wired per call, so a script
+     * that is already running keeps the modules it was started with. The tool description is
+     * <em>not</em> rebuilt - it is one text built at start-up and travels in every request; a
+     * module that is off answers a {@code require()} with {@code Cannot find module}, and that
+     * message names the modules that are bound.
+     * </p>
+     * <p>
+     * Switching on is refused for a module the configuration denies (see
+     * {@link JsModuleInterface#isEnabled()}) - a runtime switch must not overrule the operator.
+     * </p>
+     * @param name a namespace ({@code fs}) or {@code "shipped"} for the block of shipped libraries
+     * @param enabled the desired state
+     * @return true if the switch changed, false if it already had that state
+     * @throws IllegalArgumentException if the name is not switchable or the configuration denies it
+     */
+    public static boolean setModuleEnabled(String name, boolean enabled) {
+        return JsModuleCatalog.getInstance().setEnabled(name, enabled);
+    }
+
+    /**
+     * The one-line summary of the shipped block for the listings - the block is a name of its own,
+     * so the entry has to say what is behind it.
+     * @return the summary
+     */
+    private static String shippedBlockSummary() {
+        StringBuilder sb = new StringBuilder("`loadShipped(name)` loads a library that ships with"
+                + " the server inside its jar, switched as one block because they load each other:"
+                + " ");
+        boolean first = true;
+        for (ShippedJsModules.Entry entry : ShippedJsModules.byName().values()) {
+            if (!first) {
+                sb.append(", ");
+            }
+            sb.append(entry.name());
+            first = false;
+        }
+        return sb.append(" - each one answers help()").toString();
     }
 
     /**
@@ -286,7 +373,7 @@ public class JavaScriptTool {
      * @param modules available modules
      * @return description text
      */
-    private static String buildDescription(LinkedHashMap<String, JsModuleInterface> modules) {
+    private static String buildDescription(Map<String, JsModuleInterface> modules) {
         StringBuilder sb = new StringBuilder(
                 "Use this tool to write and execute small scripts in JavaScript to do calculations.");
         boolean first = true;
@@ -316,6 +403,9 @@ public class JavaScriptTool {
             }
             sb.append(".");
         }
+        sb.append(" The modules can be switched off at runtime (Web UI, /tools); a module that is"
+                + " off is not bound, and a require() error names the modules that currently are."
+                + " The libraries that ship with the server are switched together as one block.");
         sb.append(" Scripts run with an execution timeout (default ")
           .append(EFFECTIVE_DEFAULT_TIMEOUT_SECONDS)
           .append(" s, override with 'timeoutSeconds'); a script exceeding it is cancelled and the")
@@ -343,7 +433,7 @@ public class JavaScriptTool {
      * @return the tool specification and its state
      */
     public static ToolSpecWithState createToolInstance() {
-        LinkedHashMap<String, JsModuleInterface> modules = createModules();
+        Map<String, JsModuleInterface> modules = JsModuleCatalog.getInstance().modules();
         String description = buildDescription(modules);
 
         // Define Input Schema properties
@@ -550,7 +640,7 @@ public class JavaScriptTool {
      * Executes JavaScript source code in the sandboxed GraalVM JS context, enforcing an execution
      * timeout.
      * <p>
-     * All modes of {@code javascript_tool} - inline {@code script}, file {@code path}, or the
+     * All modes of {@code javascript}-tool - inline {@code script}, file {@code path}, or the
      * combined {@code script}+{@code path} concatenation - delegate here, so every execution
      * uses the exact same sandbox, module wiring, console capture and error formatting. This is
      * what guarantees that a JavaScript file is executed under precisely the same restrictions
@@ -817,7 +907,11 @@ public class JavaScriptTool {
             Map<String, Value> requireTargets = new HashMap<>();
             for (JsModuleInterface m : modules.values()) {
                 if (!m.isEnabled()) {
-                    LOGGER.info("Module '{}' disabled, skipped", m.getNamespace());
+                    LOGGER.info("Module '{}' disabled by the configuration, skipped", m.getNamespace());
+                    continue;
+                }
+                if (!catalog.isSwitchedOn(m.getNamespace())) {
+                    LOGGER.info("Module '{}' switched off at runtime, skipped", m.getNamespace());
                     continue;
                 }
                 AutoCloseable resource = m.wireApi(jsBindings);
@@ -899,6 +993,14 @@ public class JavaScriptTool {
             // loadShipped('pdftext') names a module from js/tools/modules.json; the manifest is
             // the whole list, so the sandbox never sees the jar as a file tree.
             ProxyExecutable loadShippedFunc = (cArgs) -> {
+                if (!catalog.isShippedSwitchedOn()) {
+                    throw new IllegalArgumentException("loadShipped(name): the shipped libraries"
+                            + " are switched off at runtime (Web UI, /tools, switch '"
+                            + JsModuleCatalog.SHIPPED + "'); this server ships "
+                            + ModuleLoader.shippedNames() + " (declared in "
+                            + ShippedJsModules.MANIFEST + ") - switch the block on to load one of"
+                            + " them.");
+                }
                 if (cArgs == null || cArgs.length < 1 || cArgs[0].isNull()) {
                     throw new IllegalArgumentException(
                             "loadShipped(name) requires a module name, e.g. loadShipped('"
@@ -1349,7 +1451,7 @@ public class JavaScriptTool {
     private String buildHint(String message) {
         List<String> tips = new ArrayList<>();
         for (JsModuleInterface m : modules.values()) {
-            if (!m.isEnabled() || !m.hasRequireAlias()) {
+            if (!m.isEnabled() || !catalog.isSwitchedOn(m.getNamespace()) || !m.hasRequireAlias()) {
                 continue;
             }
             if (message != null && message.contains(m.getNamespace() + ".")) {

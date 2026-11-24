@@ -11,6 +11,8 @@
         tr:nth-child(even) { background-color: #f9f9f9; }
         .active { color: green; font-weight: bold; }
         .inactive { color: red; }
+        .note { max-width: 800px; color: #555; font-size: 0.9em; }
+        .message { max-width: 800px; padding: 8px; border: 1px solid #c8a; background: #fdf3f6; }
     </style>
 </head>
 <body>
@@ -37,6 +39,45 @@
         <td th:text="${entry.key}">Name</td>
         <td th:text="${entry.value.spec().tool().description()}">Description</td>
         <td th:text="${entry.value.state().callCount().get()}">0</td>
+    </tr>
+    </tbody>
+</table>
+
+<h1 id="js-modules">JS modules of the <code>javascript</code> tool</h1>
+<p class="note">
+    A module is bound for one script call, so a switch takes effect from the next call - a script
+    that is already running keeps its modules. The switch is process-wide (one
+    <code>javascript</code> tool, one sandbox policy). The tool description is built at start-up and
+    is not rewritten: a switched-off module answers <code>require('x')</code> with
+    "Cannot find module", and that message names the modules that are bound.
+    Modules switched off by the configuration (e.g. <code>-Dmcp2sdk.module.git.enabled=false</code>)
+    are not listed here - they are absent, not off, and cannot be switched on at runtime.
+    <code>shipped</code> is one block: the libraries of <code>js/tools/modules.json</code> load each
+    other.
+</p>
+<div class="message" th:if="${moduleMessage}" th:text="${moduleMessage}">message</div>
+<table>
+    <thead>
+    <tr>
+        <th>is switched on</th>
+        <th>Name</th>
+        <th>Kind</th>
+        <th>Summary</th>
+    </tr>
+    </thead>
+    <tbody>
+    <tr th:each="jsModule : ${jsModules}">
+        <td>
+            <form th:action="@{/tools/module/toggle}" method="post" style="margin:0;">
+                <input type="hidden" name="name" th:value="${jsModule.namespace()}"/>
+                <input type="checkbox"
+                       th:checked="${jsModule.enabled()}"
+                       onclick="this.form.submit()"/>
+            </form>
+        </td>
+        <td th:text="${jsModule.namespace()}">Name</td>
+        <td th:text="${jsModule.kind()}">namespace</td>
+        <td th:text="${#strings.abbreviate(jsModule.summary(), 200)}">Summary</td>
     </tr>
     </tbody>
 </table>

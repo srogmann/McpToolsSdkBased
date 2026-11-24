@@ -24,7 +24,7 @@ import java.util.function.Supplier;
  *
  * <p><b>Who sees it.</b> Two conditions, deliberately different (decision D3): the system property
  * {@value #PROP_ENABLED} decides whether the module is <em>named</em> in the description of
- * {@code javascript_tool} at all - off by default, and off means the word "board" appears nowhere a
+ * {@code javascript} at all - off by default, and off means the word "board" appears nowhere a
  * model reads it. And {@link ForkCallers#current()} decides whether it is <em>bound</em> in this
  * call: outside a thread of a fork there is nothing to bind, and {@code require('board')} then falls
  * back to the plain list of available modules rather than pretending a board exists.</p>
